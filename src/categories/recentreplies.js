@@ -1,6 +1,7 @@
 
 'use strict';
 
+const winston = require('winston');
 const _ = require('lodash');
 
 const db = require('../database');
@@ -9,13 +10,17 @@ const topics = require('../topics');
 const privileges = require('../privileges');
 const plugins = require('../plugins');
 const batch = require('../batch');
+const utils = require('../utils');
 
 module.exports = function (Categories) {
-	Categories.getRecentReplies = async function (cid, uid, count) {
-		if (!parseInt(count, 10)) {
-			return [];
+	Categories.getRecentReplies = async function (cid, uid, start, stop) {
+		// backwards compatibility, treat start as count
+		if (stop === undefined && start > 0) {
+			winston.warn('[Categories.getRecentReplies] 3 params deprecated please use Categories.getRecentReplies(cid, uid, start, stop)');
+			stop = start - 1;
+			start = 0;
 		}
-		let pids = await db.getSortedSetRevRange(`cid:${cid}:pids`, 0, count - 1);
+		let pids = await db.getSortedSetRevRange(`cid:${cid}:pids`, start, stop);
 		pids = await privileges.posts.filter('topics:read', pids, uid);
 		return await posts.getPostSummaryByPids(pids, uid, { stripTags: true });
 	};
@@ -23,7 +28,7 @@ module.exports = function (Categories) {
 	Categories.updateRecentTid = async function (cid, tid) {
 		const [count, numRecentReplies] = await Promise.all([
 			db.sortedSetCard(`cid:${cid}:recent_tids`),
-			db.getObjectField(`category:${cid}`, 'numRecentReplies'),
+			db.getObjectField(`${utils.isNumber(cid) ? 'category' : 'categoryRemote'}:${cid}`, 'numRecentReplies'),
 		]);
 
 		if (count >= numRecentReplies) {
@@ -67,7 +72,7 @@ module.exports = function (Categories) {
 			return;
 		}
 		const categoriesToLoad = categoryData.filter(c => c && c.numRecentReplies && parseInt(c.numRecentReplies, 10) > 0);
-		let keys = [];
+		let keys;
 		if (plugins.hooks.hasListeners('filter:categories.getRecentTopicReplies')) {
 			const result = await plugins.hooks.fire('filter:categories.getRecentTopicReplies', {
 				categories: categoriesToLoad,
@@ -91,10 +96,14 @@ module.exports = function (Categories) {
 	};
 
 	async function getTopics(tids, uid) {
-		const topicData = await topics.getTopicsFields(
-			tids,
-			['tid', 'mainPid', 'slug', 'title', 'teaserPid', 'cid', 'postcount']
-		);
+		const [topicData, crossposts] = await Promise.all([
+			topics.getTopicsFields(
+				tids,
+				['tid', 'uid', 'mainPid', 'slug', 'title', 'teaserPid', 'cid', 'postcount']
+			),
+			topics.crossposts.get(tids, uid),
+		]);
+
 		topicData.forEach((topic) => {
 			if (topic) {
 				topic.teaserPid = topic.teaserPid || topic.mainPid;
@@ -112,12 +121,14 @@ module.exports = function (Categories) {
 			if (teaser) {
 				teaser.cid = topicData[index].cid;
 				teaser.parentCids = cidToRoot[teaser.cid];
-				teaser.tid = undefined;
-				teaser.uid = undefined;
+				teaser.tid = topicData[index].tid;
+				teaser.uid = topicData[index].uid;
 				teaser.topic = {
+					tid: topicData[index].tid,
 					slug: topicData[index].slug,
 					title: topicData[index].title,
 				};
+				teaser.crossposts = crossposts[index];
 			}
 		});
 		return teasers.filter(Boolean);
@@ -126,12 +137,21 @@ module.exports = function (Categories) {
 	function assignTopicsToCategories(categories, topics) {
 		categories.forEach((category) => {
 			if (category) {
-				category.posts = topics.filter(t => t.cid && (t.cid === category.cid || t.parentCids.includes(category.cid)))
-					.sort((a, b) => b.pid - a.pid)
+				const categoryCid = String(category.cid);
+				category.posts = topics.filter(t =>
+					t.cid &&
+					(String(t.cid) === categoryCid ||
+						(t.parentCids && t.parentCids.includes(categoryCid)) ||
+						(t.crossposts.some(({ cid }) => String(cid) === categoryCid))
+					))
+					.sort((a, b) => b.timestamp - a.timestamp)
 					.slice(0, parseInt(category.numRecentReplies, 10));
 			}
 		});
-		topics.forEach((t) => { t.parentCids = undefined; });
+		topics.forEach((t) => {
+			t.parentCids = undefined;
+			t.crossposts = undefined;
+		});
 	}
 
 	function bubbleUpChildrenPosts(categoryData) {
@@ -143,7 +163,7 @@ module.exports = function (Categories) {
 				const posts = [];
 				getPostsRecursive(category, posts);
 
-				posts.sort((a, b) => b.pid - a.pid);
+				posts.sort((a, b) => b.timestamp - a.timestamp);
 				if (posts.length) {
 					category.posts = [posts[0]];
 				}
@@ -153,7 +173,7 @@ module.exports = function (Categories) {
 
 	function getPostsRecursive(category, posts) {
 		if (Array.isArray(category.posts)) {
-			category.posts.forEach(p =>	posts.push(p));
+			category.posts.forEach(p => posts.push(p));
 		}
 
 		category.children.forEach(child => getPostsRecursive(child, posts));
@@ -161,7 +181,6 @@ module.exports = function (Categories) {
 
 	// terrible name, should be topics.moveTopicPosts
 	Categories.moveRecentReplies = async function (tid, oldCid, cid) {
-		await updatePostCount(tid, oldCid, cid);
 		const [pids, topicDeleted] = await Promise.all([
 			topics.getPids(tid),
 			topics.getTopicField(tid, 'deleted'),
@@ -172,11 +191,16 @@ module.exports = function (Categories) {
 
 			const bulkRemove = [];
 			const bulkAdd = [];
+			const bulkIncr = [];
 			postData.forEach((post) => {
 				bulkRemove.push([`cid:${oldCid}:uid:${post.uid}:pids`, post.pid]);
 				bulkRemove.push([`cid:${oldCid}:uid:${post.uid}:pids:votes`, post.pid]);
 				bulkAdd.push([`cid:${cid}:uid:${post.uid}:pids`, post.timestamp, post.pid]);
-				if (post.votes > 0) {
+				bulkIncr.push(
+					[`uid:${post.uid}:cids`, -1, oldCid],
+					[`uid:${post.uid}:cids`, 1, cid],
+				);
+				if (post.votes > 0 || post.votes < 0) {
 					bulkAdd.push([`cid:${cid}:uid:${post.uid}:pids:votes`, post.votes, post.pid]);
 				}
 			});
@@ -188,19 +212,8 @@ module.exports = function (Categories) {
 				db.sortedSetAdd(`cid:${cid}:pids`, timestamps, postsToReAdd.map(p => p.pid)),
 				db.sortedSetRemoveBulk(bulkRemove),
 				db.sortedSetAddBulk(bulkAdd),
+				db.sortedSetIncrByBulk(bulkIncr),
 			]);
 		}, { batch: 500 });
 	};
-
-	async function updatePostCount(tid, oldCid, newCid) {
-		const postCount = await topics.getTopicField(tid, 'postcount');
-		if (!postCount) {
-			return;
-		}
-
-		await Promise.all([
-			db.incrObjectFieldBy(`category:${oldCid}`, 'post_count', -postCount),
-			db.incrObjectFieldBy(`category:${newCid}`, 'post_count', postCount),
-		]);
-	}
 };

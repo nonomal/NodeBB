@@ -1,603 +1,578 @@
-'use strict';
+import {
+	Chart,
+	LineController,
+	DoughnutController,
+	CategoryScale,
+	LinearScale,
+	LineElement,
+	PointElement,
+	ArcElement,
+	Tooltip,
+	Filler,
+	Legend,
+} from 'chart.js';
 
+import * as modals from '../modules/modals';
+import * as alerts from '../modules/alerts';
+import * as translator from '../modules/translator';
+import * as Benchpress from 'benchpressjs';
+import { formattedNumber, escape } from '../modules/helpers';
 
-define('admin/dashboard', ['Chart', 'translator', 'benchpress'], function (Chart, translator, Benchpress) {
-	var	Admin = {};
-	var	intervals = {
-		rooms: false,
-		graphs: false,
-	};
-	var	isMobile = false;
-	var	graphData = {
-		rooms: {},
-		traffic: {},
-	};
-	var	currentGraph = {
-		units: 'hours',
-		until: undefined,
-	};
+import { setupFullscreen } from './modules/fullscreen';
 
-	var DEFAULTS = {
-		roomInterval: 10000,
-		graphInterval: 15000,
-		realtimeInterval: 1500,
-	};
+Chart.register(
+	LineController,
+	DoughnutController,
+	CategoryScale,
+	LinearScale,
+	LineElement,
+	PointElement,
+	ArcElement,
+	Tooltip,
+	Filler,
+	Legend
+);
 
-	var	usedTopicColors = [];
+const intervals = {
+	rooms: false,
+	graphs: false,
+};
+let isMobile = false;
+const graphData = {
+	rooms: {},
+	traffic: {},
+};
+const currentGraph = {
+	units: 'hours',
+	until: undefined,
+};
 
-	$(window).on('action:ajaxify.start', function () {
-		clearInterval(intervals.rooms);
-		clearInterval(intervals.graphs);
+const DEFAULTS = {
+	roomInterval: 10000,
+	graphInterval: 15000,
+	realtimeInterval: 1500,
+};
 
-		intervals.rooms = null;
-		intervals.graphs = null;
-		graphData.rooms = null;
-		graphData.traffic = null;
-		usedTopicColors.length = 0;
+const usedTopicColors = [];
+
+$(window).on('action:ajaxify.start', function () {
+	clearInterval(intervals.rooms);
+	clearInterval(intervals.graphs);
+
+	intervals.rooms = null;
+	intervals.graphs = null;
+	graphData.rooms = null;
+	graphData.traffic = null;
+	usedTopicColors.length = 0;
+});
+
+export function init() {
+	app.enterRoom('admin');
+
+	isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
+	setupDarkModeButton();
+	setupRealtimeButton();
+	setupGraphs(function () {
+		socket.emit('admin.rooms.getAll', updateRoomUsage);
+		initiateDashboard();
 	});
+	setupFullscreen($('#expand-analytics'), $('#analytics-panel'));
+}
 
-	Admin.init = function () {
-		app.enterRoom('admin');
-
-		isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-
-		$('[data-toggle="tooltip"]').tooltip();
-
-		setupRealtimeButton();
-		setupGraphs(function () {
-			socket.emit('admin.rooms.getAll', Admin.updateRoomUsage);
-			initiateDashboard();
-		});
-		setupFullscreen();
-	};
-
-	Admin.updateRoomUsage = function (err, data) {
-		if (err) {
-			return app.alertError(err.message);
-		}
-
-		if (JSON.stringify(graphData.rooms) === JSON.stringify(data)) {
-			return;
-		}
-
-		graphData.rooms = data;
-
-		var html = '<div class="text-center pull-left">' +
-						'<span class="formatted-number">' + data.onlineRegisteredCount + '</span>' +
-						'<div class="stat">[[admin/dashboard:active-users.users]]</div>' +
-					'</div>' +
-					'<div class="text-center pull-left">' +
-						'<span class="formatted-number">' + data.onlineGuestCount + '</span>' +
-						'<div class="stat">[[admin/dashboard:active-users.guests]]</div>' +
-					'</div>' +
-					'<div class="text-center pull-left">' +
-						'<span class="formatted-number">' + (data.onlineRegisteredCount + data.onlineGuestCount) + '</span>' +
-						'<div class="stat">[[admin/dashboard:active-users.total]]</div>' +
-					'</div>' +
-					'<div class="text-center pull-left">' +
-						'<span class="formatted-number">' + data.socketCount + '</span>' +
-						'<div class="stat">[[admin/dashboard:active-users.connections]]</div>' +
-					'</div>';
-
-		updateRegisteredGraph(data.onlineRegisteredCount, data.onlineGuestCount);
-		updatePresenceGraph(data.users);
-		updateTopicsGraph(data.topTenTopics);
-
-		$('#active-users').translateHtml(html);
-	};
-
-	var graphs = {
-		traffic: null,
-		registered: null,
-		presence: null,
-		topics: null,
-	};
-
-	var topicColors = ['#bf616a', '#5B90BF', '#d08770', '#ebcb8b', '#a3be8c', '#96b5b4', '#8fa1b3', '#b48ead', '#ab7967', '#46BFBD'];
-
-	/* eslint-disable */
-	// from chartjs.org
-	function lighten(col, amt) {
-		var usePound = false;
-
-		if (col[0] === '#') {
-			col = col.slice(1);
-			usePound = true;
-		}
-
-		var num = parseInt(col, 16);
-
-		var r = (num >> 16) + amt;
-
-		if (r > 255) r = 255;
-		else if (r < 0) r = 0;
-
-		var b = ((num >> 8) & 0x00FF) + amt;
-
-		if (b > 255) b = 255;
-		else if (b < 0) b = 0;
-
-		var g = (num & 0x0000FF) + amt;
-
-		if (g > 255) g = 255;
-		else if (g < 0) g = 0;
-
-		return (usePound ? '#' : '') + (g | (b << 8) | (r << 16)).toString(16);
+function updateRoomUsage(err, data) {
+	if (err) {
+		return alerts.error(err);
 	}
-	/* eslint-enable */
 
-	function setupGraphs(callback) {
-		callback = callback || function () {};
-		var trafficCanvas = document.getElementById('analytics-traffic');
-		var registeredCanvas = document.getElementById('analytics-registered');
-		var presenceCanvas = document.getElementById('analytics-presence');
-		var topicsCanvas = document.getElementById('analytics-topics');
-		var trafficCtx = trafficCanvas.getContext('2d');
-		var registeredCtx = registeredCanvas.getContext('2d');
-		var presenceCtx = presenceCanvas.getContext('2d');
-		var topicsCtx = topicsCanvas.getContext('2d');
-		var trafficLabels = utils.getHoursArray();
+	if (JSON.stringify(graphData.rooms) === JSON.stringify(data)) {
+		return;
+	}
 
-		if (isMobile) {
-			Chart.defaults.global.tooltips.enabled = false;
-		}
+	graphData.rooms = data;
 
-		var t = translator.Translator.create();
-		Promise.all([
-			t.translateKey('admin/dashboard:graphs.page-views', []),
-			t.translateKey('admin/dashboard:graphs.page-views-registered', []),
-			t.translateKey('admin/dashboard:graphs.page-views-guest', []),
-			t.translateKey('admin/dashboard:graphs.page-views-bot', []),
-			t.translateKey('admin/dashboard:graphs.unique-visitors', []),
-			t.translateKey('admin/dashboard:graphs.registered-users', []),
-			t.translateKey('admin/dashboard:graphs.anonymous-users', []),
-			t.translateKey('admin/dashboard:on-categories', []),
-			t.translateKey('admin/dashboard:reading-posts', []),
-			t.translateKey('admin/dashboard:browsing-topics', []),
-			t.translateKey('admin/dashboard:recent', []),
-			t.translateKey('admin/dashboard:unread', []),
-		]).then(function (translations) {
-			var data = {
-				labels: trafficLabels,
-				datasets: [
-					{
-						label: translations[0],
-						backgroundColor: 'rgba(220,220,220,0.2)',
-						borderColor: 'rgba(220,220,220,1)',
-						pointBackgroundColor: 'rgba(220,220,220,1)',
-						pointHoverBackgroundColor: '#fff',
-						pointBorderColor: '#fff',
-						pointHoverBorderColor: 'rgba(220,220,220,1)',
-						data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-					},
-					{
-						label: translations[1],
-						backgroundColor: '#ab464233',
-						borderColor: '#ab4642',
-						pointBackgroundColor: '#ab4642',
-						pointHoverBackgroundColor: '#ab4642',
-						pointBorderColor: '#fff',
-						pointHoverBorderColor: '#ab4642',
-						data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-					},
-					{
-						label: translations[2],
-						backgroundColor: '#ba8baf33',
-						borderColor: '#ba8baf',
-						pointBackgroundColor: '#ba8baf',
-						pointHoverBackgroundColor: '#ba8baf',
-						pointBorderColor: '#fff',
-						pointHoverBorderColor: '#ba8baf',
-						data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-					},
-					{
-						label: translations[3],
-						backgroundColor: '#f7ca8833',
-						borderColor: '#f7ca88',
-						pointBackgroundColor: '#f7ca88',
-						pointHoverBackgroundColor: '#f7ca88',
-						pointBorderColor: '#fff',
-						pointHoverBorderColor: '#f7ca88',
-						data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-					},
-					{
-						label: translations[4],
-						backgroundColor: 'rgba(151,187,205,0.2)',
-						borderColor: 'rgba(151,187,205,1)',
-						pointBackgroundColor: 'rgba(151,187,205,1)',
-						pointHoverBackgroundColor: 'rgba(151,187,205,1)',
-						pointBorderColor: '#fff',
-						pointHoverBorderColor: 'rgba(151,187,205,1)',
-						data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-					},
-				],
-			};
+	updateRegisteredGraph(data.onlineRegisteredCount, data.onlineGuestCount);
+	updatePresenceGraph(data.users);
+	updateTopicsGraph(data.topTenTopics);
 
-			trafficCanvas.width = $(trafficCanvas).parent().width();
+	$('#active-users-loggedin').text(formattedNumber(data.onlineRegisteredCount));
+	$('#active-users-guests').text(formattedNumber(data.onlineGuestCount));
+	$('#active-users-total').text(formattedNumber(data.onlineRegisteredCount + data.onlineGuestCount));
+	$('#active-users-connections').text(formattedNumber(data.socketCount));
+}
 
-			data.datasets[0].yAxisID = 'left-y-axis';
-			data.datasets[1].yAxisID = 'left-y-axis';
-			data.datasets[2].yAxisID = 'left-y-axis';
-			data.datasets[3].yAxisID = 'left-y-axis';
-			data.datasets[4].yAxisID = 'right-y-axis';
+const graphs = {
+	traffic: null,
+	registered: null,
+	presence: null,
+	topics: null,
+};
 
-			graphs.traffic = new Chart(trafficCtx, {
-				type: 'line',
-				data: data,
-				options: {
-					responsive: true,
-					legend: {
-						display: true,
-					},
-					scales: {
-						yAxes: [{
-							id: 'left-y-axis',
-							ticks: {
-								beginAtZero: true,
-								precision: 0,
-							},
-							type: 'linear',
-							position: 'left',
-							scaleLabel: {
-								display: true,
-								labelString: translations[0],
-							},
-						}, {
-							id: 'right-y-axis',
-							ticks: {
-								beginAtZero: true,
-								suggestedMax: 10,
-								precision: 0,
-							},
-							type: 'linear',
-							position: 'right',
-							scaleLabel: {
-								display: true,
-								labelString: translations[4],
-							},
-						}],
-					},
-					tooltips: {
-						mode: 'x',
-					},
+const topicColors = [
+	'#bf616a', '#5B90BF', '#d08770', '#ebcb8b',
+	'#a3be8c', '#96b5b4', '#8fa1b3', '#b48ead',
+	'#ab7967', '#46BFBD',
+];
+
+/* eslint-disable */
+// from chartjs.org
+function lighten(col, amt) {
+	let usePound = false;
+
+	if (col[0] === '#') {
+		col = col.slice(1);
+		usePound = true;
+	}
+
+	const num = parseInt(col, 16);
+
+	let r = (num >> 16) + amt;
+
+	if (r > 255) r = 255;
+	else if (r < 0) r = 0;
+
+	let b = ((num >> 8) & 0x00FF) + amt;
+
+	if (b > 255) b = 255;
+	else if (b < 0) b = 0;
+
+	let g = (num & 0x0000FF) + amt;
+
+	if (g > 255) g = 255;
+	else if (g < 0) g = 0;
+
+	return (usePound ? '#' : '') + (g | (b << 8) | (r << 16)).toString(16);
+}
+/* eslint-enable */
+
+function setupGraphs(callback) {
+	callback = callback || function () {};
+	const trafficCanvas = document.getElementById('analytics-traffic');
+	const registeredCanvas = document.getElementById('analytics-registered');
+	const presenceCanvas = document.getElementById('analytics-presence');
+	const topicsCanvas = document.getElementById('analytics-topics');
+	const trafficCtx = trafficCanvas.getContext('2d');
+	const registeredCtx = registeredCanvas.getContext('2d');
+	const presenceCtx = presenceCanvas.getContext('2d');
+	const topicsCtx = topicsCanvas.getContext('2d');
+	const trafficLabels = utils.getHoursArray();
+
+	if (isMobile) {
+		Chart.defaults.plugins.tooltip.enabled = false;
+	}
+
+	const keys = [
+		'[[admin/dashboard:graphs.page-views]]',
+		'[[admin/dashboard:graphs.page-views-registered]]',
+		'[[admin/dashboard:graphs.page-views-guest]]',
+		'[[admin/dashboard:graphs.page-views-bot]]',
+		'[[admin/dashboard:graphs.page-views-ap]]',
+		'[[admin/dashboard:graphs.unique-visitors]]',
+		'[[admin/dashboard:graphs.registered-users]]',
+		'[[admin/dashboard:graphs.guest-users]]',
+		'[[admin/dashboard:on-categories]]',
+		'[[admin/dashboard:reading-posts]]',
+		'[[admin/dashboard:browsing-topics]]',
+		'[[admin/dashboard:recent]]',
+		'[[admin/dashboard:unread]]',
+	];
+	const graphLabels = {};
+	translator.translateKeys(keys, config.acpLang).then(function (translations) {
+		keys.forEach(function (key, index) {
+			graphLabels[key.split(':')[1].slice(0, -2)] = translations[index];
+		});
+
+		const tension = 0.25;
+		const data = {
+			labels: trafficLabels,
+			datasets: [
+				{
+					label: graphLabels['graphs.page-views'],
+					fill: 'origin',
+					tension: tension,
+					backgroundColor: 'rgba(220,220,220,0.2)',
+					borderColor: 'rgba(220,220,220,1)',
+					pointBackgroundColor: 'rgba(220,220,220,1)',
+					pointHoverBackgroundColor: '#fff',
+					pointBorderColor: '#fff',
+					pointHoverBorderColor: 'rgba(220,220,220,1)',
+					data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 				},
-			});
-
-			graphs.registered = new Chart(registeredCtx, {
-				type: 'doughnut',
-				data: {
-					labels: translations.slice(5, 7),
-					datasets: [{
-						data: [1, 1],
-						backgroundColor: ['#F7464A', '#46BFBD'],
-						hoverBackgroundColor: ['#FF5A5E', '#5AD3D1'],
-					}],
+				{
+					label: graphLabels['graphs.page-views-registered'],
+					fill: 'origin',
+					tension: tension,
+					backgroundColor: '#ab464233',
+					borderColor: '#ab4642',
+					pointBackgroundColor: '#ab4642',
+					pointHoverBackgroundColor: '#ab4642',
+					pointBorderColor: '#fff',
+					pointHoverBorderColor: '#ab4642',
+					data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 				},
-				options: {
-					responsive: true,
-					legend: {
-						display: false,
-					},
+				{
+					label: graphLabels['graphs.page-views-guest'],
+					fill: 'origin',
+					tension: tension,
+					backgroundColor: '#ba8baf33',
+					borderColor: '#ba8baf',
+					pointBackgroundColor: '#ba8baf',
+					pointHoverBackgroundColor: '#ba8baf',
+					pointBorderColor: '#fff',
+					pointHoverBorderColor: '#ba8baf',
+					data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 				},
-			});
-
-			graphs.presence = new Chart(presenceCtx, {
-				type: 'doughnut',
-				data: {
-					labels: translations.slice(7, 12),
-					datasets: [{
-						data: [1, 1, 1, 1, 1],
-						backgroundColor: ['#F7464A', '#46BFBD', '#FDB45C', '#949FB1', '#9FB194'],
-						hoverBackgroundColor: ['#FF5A5E', '#5AD3D1', '#FFC870', '#A8B3C5', '#A8B3C5'],
-					}],
+				{
+					label: graphLabels['graphs.page-views-bot'],
+					fill: 'origin',
+					tension: tension,
+					backgroundColor: '#f7ca8833',
+					borderColor: '#f7ca88',
+					pointBackgroundColor: '#f7ca88',
+					pointHoverBackgroundColor: '#f7ca88',
+					pointBorderColor: '#fff',
+					pointHoverBorderColor: '#f7ca88',
+					data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 				},
-				options: {
-					responsive: true,
-					legend: {
-						display: false,
-					},
+				{
+					label: graphLabels['graphs.page-views-ap'],
+					fill: 'origin',
+					tension: tension,
+					backgroundColor: 'rgba(151,187,205,0.2)',
+					borderColor: 'rgba(110, 187, 132, 1)',
+					pointBackgroundColor: 'rgba(110, 187, 132, 1)',
+					pointHoverBackgroundColor: 'rgba(110, 187, 132, 1)',
+					pointBorderColor: '#fff',
+					pointHoverBorderColor: 'rgba(110, 187, 132, 1)',
+					data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 				},
-			});
-
-			graphs.topics = new Chart(topicsCtx, {
-				type: 'doughnut',
-				data: {
-					labels: [],
-					datasets: [{
-						data: [],
-						backgroundColor: [],
-						hoverBackgroundColor: [],
-					}],
+				{
+					label: graphLabels['graphs.unique-visitors'],
+					fill: 'origin',
+					tension: tension,
+					backgroundColor: 'rgba(151,187,205,0.2)',
+					borderColor: 'rgba(151,187,205,1)',
+					pointBackgroundColor: 'rgba(151,187,205,1)',
+					pointHoverBackgroundColor: 'rgba(151,187,205,1)',
+					pointBorderColor: '#fff',
+					pointHoverBorderColor: 'rgba(151,187,205,1)',
+					data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 				},
-				options: {
-					responsive: true,
-					legend: {
-						display: false,
-					},
-				},
-			});
+			],
+		};
 
-			updateTrafficGraph();
+		trafficCanvas.width = $(trafficCanvas).parent().width();
 
-			$(window).on('resize', adjustPieCharts);
-			adjustPieCharts();
+		data.datasets[0].yAxisID = 'left-y-axis';
+		data.datasets[1].yAxisID = 'left-y-axis';
+		data.datasets[2].yAxisID = 'left-y-axis';
+		data.datasets[3].yAxisID = 'left-y-axis';
+		data.datasets[4].yAxisID = 'left-y-axis';
+		data.datasets[5].yAxisID = 'left-y-axis';
 
-			$('[data-action="updateGraph"]:not([data-units="custom"])').on('click', function () {
-				var until = new Date();
-				var amount = $(this).attr('data-amount');
-				if ($(this).attr('data-units') === 'days') {
-					until.setHours(0, 0, 0, 0);
-				}
-				until = until.getTime();
-				updateTrafficGraph($(this).attr('data-units'), until, amount);
-
-				require(['translator'], function (translator) {
-					translator.translate('[[admin/dashboard:page-views-custom]]', function (translated) {
-						$('[data-action="updateGraph"][data-units="custom"]').text(translated);
-					});
-				});
-			});
-
-			$('[data-action="updateGraph"][data-units="custom"]').on('click', function () {
-				var targetEl = $(this);
-
-				Benchpress.render('admin/partials/pageviews-range-select', {}).then(function (html) {
-					var modal = bootbox.dialog({
-						title: '[[admin/dashboard:page-views-custom]]',
-						message: html,
-						buttons: {
-							submit: {
-								label: '[[global:search]]',
-								className: 'btn-primary',
-								callback: submit,
-							},
+		graphs.traffic = new Chart(trafficCtx, {
+			type: 'line',
+			data: data,
+			options: {
+				responsive: true,
+				maintainAspectRatio: false,
+				scales: {
+					'left-y-axis': {
+						position: 'left',
+						type: 'linear',
+						title: {
+							display: false,
+							text: graphLabels['graphs.page-views'],
 						},
-					}).on('shown.bs.modal', function () {
-						var date = new Date();
-						var today = date.toISOString().substr(0, 10);
-						date.setDate(date.getDate() - 1);
-						var yesterday = date.toISOString().substr(0, 10);
+						beginAtZero: true,
+					},
 
-						modal.find('#startRange').val(targetEl.attr('data-startRange') || yesterday);
-						modal.find('#endRange').val(targetEl.attr('data-endRange') || today);
-					});
-
-					function submit() {
-						// NEED TO ADD VALIDATION HERE FOR YYYY-MM-DD
-						var formData = modal.find('form').serializeObject();
-						var validRegexp = /\d{4}-\d{2}-\d{2}/;
-
-						// Input validation
-						if (!formData.startRange && !formData.endRange) {
-							// No range? Assume last 30 days
-							updateTrafficGraph('days');
-							return;
-						} else if (!validRegexp.test(formData.startRange) || !validRegexp.test(formData.endRange)) {
-							// Invalid Input
-							modal.find('.alert-danger').removeClass('hidden');
-							return false;
-						}
-
-						var until = new Date(formData.endRange);
-						until.setDate(until.getDate() + 1);
-						until = until.getTime();
-						var amount = (until - new Date(formData.startRange).getTime()) / (1000 * 60 * 60 * 24);
-
-						updateTrafficGraph('days', until, amount);
-
-						// Update "custom range" label
-						targetEl.attr('data-startRange', formData.startRange);
-						targetEl.attr('data-endRange', formData.endRange);
-						targetEl.html(formData.startRange + ' &ndash; ' + formData.endRange);
-					}
-				});
-			});
-
-			socket.emit('admin.rooms.getAll', Admin.updateRoomUsage);
-			initiateDashboard();
-			callback();
+				},
+				plugins: {
+					legend: {
+						position: 'bottom',
+					},
+				},
+				interaction: {
+					intersect: false,
+					mode: 'index',
+				},
+			},
 		});
-	}
 
-	function adjustPieCharts() {
-		$('.pie-chart.legend-up').each(function () {
-			var $this = $(this);
-
-			if ($this.width() < 320) {
-				$this.addClass('compact');
-			} else {
-				$this.removeClass('compact');
-			}
+		const doughnutOpts = {
+			responsive: true,
+			plugins: {
+				legend: {
+					display: false,
+				},
+			},
+		};
+		graphs.registered = new Chart(registeredCtx, {
+			type: 'doughnut',
+			data: {
+				labels: [graphLabels['graphs.registered-users'], graphLabels['graphs.guest-users']],
+				datasets: [{
+					data: [1, 1],
+					backgroundColor: ['#F7464A', '#46BFBD'],
+					hoverBackgroundColor: ['#FF5A5E', '#5AD3D1'],
+				}],
+			},
+			options: doughnutOpts,
 		});
-	}
 
-	function updateTrafficGraph(units, until, amount) {
-		// until and amount are optional
+		graphs.presence = new Chart(presenceCtx, {
+			type: 'doughnut',
+			data: {
+				labels: [
+					graphLabels['on-categories'], graphLabels['reading-posts'], graphLabels['browsing-topics'], graphLabels['recent'], graphLabels['unread'],
+				],
+				datasets: [{
+					data: [1, 1, 1, 1, 1],
+					backgroundColor: ['#F7464A', '#46BFBD', '#FDB45C', '#949FB1', '#9FB194'],
+					hoverBackgroundColor: ['#FF5A5E', '#5AD3D1', '#FFC870', '#A8B3C5', '#A8B3C5'],
+				}],
+			},
+			options: doughnutOpts,
+		});
 
-		if (!app.isFocused) {
-			return;
-		}
+		graphs.topics = new Chart(topicsCtx, {
+			type: 'doughnut',
+			data: {
+				labels: [],
+				datasets: [{
+					data: [],
+					backgroundColor: [],
+					hoverBackgroundColor: [],
+				}],
+			},
+			options: doughnutOpts,
+		});
 
-		socket.emit('admin.analytics.get', {
-			graph: 'traffic',
-			units: units || 'hours',
-			until: until,
-			amount: amount,
-		}, function (err, data) {
-			if (err) {
-				return app.alertError(err.message);
-			}
-			if (JSON.stringify(graphData.traffic) === JSON.stringify(data)) {
+		updateTrafficGraph();
+
+		$('[data-action="updateGraph"]').on('change', function () {
+			let amount = $(this).val();
+			if (amount === 'custom') {
+				throwCustomRangeSelector($(this));
 				return;
 			}
-
-			graphData.traffic = data;
-
-			if (units === 'days') {
-				graphs.traffic.data.xLabels = utils.getDaysArray(until, amount);
-			} else {
-				graphs.traffic.data.xLabels = utils.getHoursArray();
-
-				$('#pageViewsThirty').html(data.summary.thirty);
-				$('#pageViewsSeven').html(data.summary.seven);
-				$('#pageViewsPastDay').html(data.pastDay);
-				utils.addCommasToNumbers($('#pageViewsThirty'));
-				utils.addCommasToNumbers($('#pageViewsSeven'));
-				utils.addCommasToNumbers($('#pageViewsPastDay'));
+			const units = amount === '1' ? 'hours' : 'days';
+			if (amount === '1') { // change 1 day to 24 hours
+				amount = '24';
 			}
-
-			graphs.traffic.data.datasets[0].data = data.pageviews;
-			graphs.traffic.data.datasets[1].data = data.pageviewsRegistered;
-			graphs.traffic.data.datasets[2].data = data.pageviewsGuest;
-			graphs.traffic.data.datasets[3].data = data.pageviewsBot;
-			graphs.traffic.data.datasets[4].data = data.uniqueVisitors;
-			graphs.traffic.data.labels = graphs.traffic.data.xLabels;
-
-			graphs.traffic.update();
-			currentGraph.units = units;
-			currentGraph.until = until;
-			currentGraph.amount = amount;
-
-			// Update the View as JSON button url
-			var apiEl = $('#view-as-json');
-			var newHref = $.param({
-				units: units || 'hours',
-				until: until,
-				count: amount,
-			});
-			apiEl.attr('href', config.relative_path + '/api/admin/analytics?' + newHref);
+			updateTrafficGraph(units, new Date().getTime(), amount);
+			$('[data-action="updateGraph"] option[value="range"]').addClass('hidden');
 		});
-	}
 
-	function updateRegisteredGraph(registered, anonymous) {
-		$('#analytics-legend .registered').parent().find('.count').text(registered);
-		$('#analytics-legend .anonymous').parent().find('.count').text(anonymous);
-		graphs.registered.data.datasets[0].data[0] = registered;
-		graphs.registered.data.datasets[0].data[1] = anonymous;
-		graphs.registered.update();
-	}
-
-	function updatePresenceGraph(users) {
-		$('#analytics-presence-legend .on-categories').parent().find('.count').text(users.categories);
-		$('#analytics-presence-legend .reading-posts').parent().find('.count').text(users.topics);
-		$('#analytics-presence-legend .browsing-topics').parent().find('.count').text(users.category);
-		$('#analytics-presence-legend .recent').parent().find('.count').text(users.recent);
-		$('#analytics-presence-legend .unread').parent().find('.count').text(users.unread);
-		graphs.presence.data.datasets[0].data[0] = users.categories;
-		graphs.presence.data.datasets[0].data[1] = users.topics;
-		graphs.presence.data.datasets[0].data[2] = users.category;
-		graphs.presence.data.datasets[0].data[3] = users.recent;
-		graphs.presence.data.datasets[0].data[4] = users.unread;
-
-		graphs.presence.update();
-	}
-
-	function updateTopicsGraph(topics) {
-		if (!topics.length) {
-			translator.translate('[[admin/dashboard:no-users-browsing]]', function (translated) {
-				topics = [{
-					title: translated,
-					count: 1,
-				}];
-				updateTopicsGraph(topics);
+		async function throwCustomRangeSelector(targetEl) {
+			const html = await Benchpress.render('admin/partials/pageviews-range-select', {});
+			const modal = await modals.dialog({
+				title: '[[admin/dashboard:page-views-custom]]',
+				message: html,
+				buttons: {
+					submit: {
+						label: '[[global:search]]',
+						className: 'btn-primary',
+						callback: submit,
+					},
+				},
 			});
+			modal.on('shown.bs.modal', function () {
+				const date = new Date();
+				const today = date.toISOString().slice(0, 10);
+				date.setDate(date.getDate() - 1);
+				const yesterday = date.toISOString().slice(0, 10);
+
+				modal.find('#startRange').val(targetEl.attr('data-startRange') || yesterday);
+				modal.find('#endRange').val(targetEl.attr('data-endRange') || today);
+			});
+
+			function submit() {
+				// NEED TO ADD VALIDATION HERE FOR YYYY-MM-DD
+				const formData = modal.find('form').serializeObject();
+				const validRegexp = /\d{4}-\d{2}-\d{2}/;
+
+				// Input validation
+				if (!formData.startRange && !formData.endRange) {
+					// No range? Assume last 30 days
+					updateTrafficGraph('days');
+					return;
+				} else if (!validRegexp.test(formData.startRange) || !validRegexp.test(formData.endRange)) {
+					// Invalid Input
+					modal.find('.alert-danger').removeClass('hidden');
+					return false;
+				}
+
+				let until = new Date(formData.endRange);
+				until.setDate(until.getDate() + 1);
+				until = until.getTime();
+				const amount = (until - new Date(formData.startRange).getTime()) / (1000 * 60 * 60 * 24);
+
+				updateTrafficGraph('days', until, amount);
+
+				// Update "custom range" label
+				targetEl.attr('data-startRange', formData.startRange);
+				targetEl.attr('data-endRange', formData.endRange);
+				targetEl.find('option[value="range"]').text(formData.startRange + ' - ' + formData.endRange);
+				targetEl.val('range');
+			}
+		}
+
+		callback();
+	});
+}
+
+function updateTrafficGraph(units, until, amount) {
+	// until and amount are optional
+
+	if (!app.isFocused) {
+		return;
+	}
+
+	socket.emit('admin.analytics.get', {
+		graph: 'traffic',
+		units: units || 'hours',
+		until: until,
+		amount: amount,
+	}, function (err, data) {
+		if (err) {
+			return alerts.error(err);
+		}
+		if (JSON.stringify(graphData.traffic) === JSON.stringify(data)) {
 			return;
 		}
 
-		graphs.topics.data.labels = [];
-		graphs.topics.data.datasets[0].data = [];
-		graphs.topics.data.datasets[0].backgroundColor = [];
-		graphs.topics.data.datasets[0].hoverBackgroundColor = [];
+		graphData.traffic = data;
 
-		topics.forEach(function (topic, i) {
-			graphs.topics.data.labels.push(topic.title);
-			graphs.topics.data.datasets[0].data.push(topic.count);
-			graphs.topics.data.datasets[0].backgroundColor.push(topicColors[i]);
-			graphs.topics.data.datasets[0].hoverBackgroundColor.push(lighten(topicColors[i], 10));
+		if (units === 'days') {
+			graphs.traffic.data.xLabels = utils.getDaysArray(until, amount);
+		} else {
+			graphs.traffic.data.xLabels = utils.getHoursArray();
+		}
+
+		graphs.traffic.data.datasets[0].data = data.pageviews;
+		graphs.traffic.data.datasets[1].data = data.pageviewsRegistered;
+		graphs.traffic.data.datasets[2].data = data.pageviewsGuest;
+		graphs.traffic.data.datasets[3].data = data.pageviewsBot;
+		graphs.traffic.data.datasets[4].data = data.appageviews;
+		graphs.traffic.data.datasets[5].data = data.uniqueVisitors;
+		graphs.traffic.data.labels = graphs.traffic.data.xLabels;
+
+		graphs.traffic.update();
+		currentGraph.units = units;
+		currentGraph.until = until;
+		currentGraph.amount = amount;
+
+		// Update the View as JSON button url
+		const apiEl = $('#view-as-json');
+		const newHref = $.param({
+			units: units || 'hours',
+			until: until,
+			count: amount,
 		});
+		apiEl.attr('href', config.relative_path + '/api/admin/analytics?' + newHref);
+	});
+}
 
-		function buildTopicsLegend() {
-			var html = '';
-			topics.forEach(function (t, i) {
-				var link = t.tid ? '<a title="' + t.title + '"href="' + config.relative_path + '/topic/' + t.tid + '" target="_blank"> ' + t.title + '</a>' : t.title;
-				var	label = t.count === '0' ? t.title : link;
+function updateRegisteredGraph(registered, guest) {
+	$('#analytics-legend .registered').parent().find('.count').text(registered);
+	$('#analytics-legend .guest').parent().find('.count').text(guest);
+	graphs.registered.data.datasets[0].data[0] = registered;
+	graphs.registered.data.datasets[0].data[1] = guest;
+	graphs.registered.update();
+}
 
-				html += '<li>' +
-					'<div style="background-color: ' + topicColors[i] + ';"></div>' +
-					'<span> (' + t.count + ') ' + label + '</span>' +
-					'</li>';
-			});
-			$('#topics-legend').translateHtml(html);
-		}
+function updatePresenceGraph(users) {
+	$('#analytics-presence-legend .on-categories').parent().find('.count').text(users.categories);
+	$('#analytics-presence-legend .reading-posts').parent().find('.count').text(users.topics);
+	$('#analytics-presence-legend .browsing-topics').parent().find('.count').text(users.category);
+	$('#analytics-presence-legend .recent').parent().find('.count').text(users.recent);
+	$('#analytics-presence-legend .unread').parent().find('.count').text(users.unread);
+	graphs.presence.data.datasets[0].data[0] = users.categories;
+	graphs.presence.data.datasets[0].data[1] = users.topics;
+	graphs.presence.data.datasets[0].data[2] = users.category;
+	graphs.presence.data.datasets[0].data[3] = users.recent;
+	graphs.presence.data.datasets[0].data[4] = users.unread;
 
-		buildTopicsLegend();
-		graphs.topics.update();
-	}
+	graphs.presence.update();
+}
 
-	function setupRealtimeButton() {
-		$('#toggle-realtime .fa').on('click', function () {
-			var $this = $(this);
-			if ($this.hasClass('fa-toggle-on')) {
-				$this.removeClass('fa-toggle-on').addClass('fa-toggle-off');
-				$this.parent().find('strong').html('OFF');
-				initiateDashboard(false);
-			} else {
-				$this.removeClass('fa-toggle-off').addClass('fa-toggle-on');
-				$this.parent().find('strong').html('ON');
-				initiateDashboard(true);
-			}
+function updateTopicsGraph(topics) {
+	if (!topics.length) {
+		translator.translateKey('[[admin/dashboard:no-users-browsing]]', function (translated) {
+			topics = [{
+				title: translated,
+				count: 1,
+			}];
+			updateTopicsGraph(topics);
 		});
+		return;
 	}
 
-	function initiateDashboard(realtime) {
-		clearInterval(intervals.rooms);
-		clearInterval(intervals.graphs);
+	graphs.topics.data.labels = [];
+	graphs.topics.data.datasets[0].data = [];
+	graphs.topics.data.datasets[0].backgroundColor = [];
+	graphs.topics.data.datasets[0].hoverBackgroundColor = [];
 
-		intervals.rooms = setInterval(function () {
-			if (app.isFocused && socket.connected) {
-				socket.emit('admin.rooms.getAll', Admin.updateRoomUsage);
-			}
-		}, realtime ? DEFAULTS.realtimeInterval : DEFAULTS.roomInterval);
+	topics.forEach(function (topic, i) {
+		graphs.topics.data.labels.push(topic.title);
+		graphs.topics.data.datasets[0].data.push(topic.count);
+		graphs.topics.data.datasets[0].backgroundColor.push(topicColors[i]);
+		graphs.topics.data.datasets[0].hoverBackgroundColor.push(lighten(topicColors[i], 10));
+	});
 
-		intervals.graphs = setInterval(function () {
-			updateTrafficGraph(currentGraph.units, currentGraph.until, currentGraph.amount);
-		}, realtime ? DEFAULTS.realtimeInterval : DEFAULTS.graphInterval);
+	function buildTopicsLegend() {
+		let html = '';
+		topics.forEach(function (t, i) {
+			const title = escape(t.title);
+			const tidEscaped = escape(t.tid);
+			const link = t.tid ?
+				`<a title="${title}" href="${config.relative_path}/topic/${tidEscaped}" target="_blank">${title}</a>` :
+				title;
+			const label = t.count === '0' ? title : link;
+
+			html += '<li>' +
+				`<div style="background-color: ${topicColors[i]};"></div>` +
+				`<span>(${t.count}) ${label}</span>` +
+				'</li>';
+		});
+		$('#topics-legend').html(html);
 	}
 
-	function setupFullscreen() {
-		var container = document.getElementById('analytics-panel');
-		var $container = $(container);
-		var btn = $container.find('.fa-expand');
-		var fsMethod;
-		var exitMethod;
+	buildTopicsLegend();
+	graphs.topics.update();
+}
 
-		if (container.requestFullscreen) {
-			fsMethod = 'requestFullscreen';
-			exitMethod = 'exitFullscreen';
-		} else if (container.mozRequestFullScreen) {
-			fsMethod = 'mozRequestFullScreen';
-			exitMethod = 'mozCancelFullScreen';
-		} else if (container.webkitRequestFullscreen) {
-			fsMethod = 'webkitRequestFullscreen';
-			exitMethod = 'webkitCancelFullScreen';
-		} else if (container.msRequestFullscreen) {
-			fsMethod = 'msRequestFullscreen';
-			exitMethod = 'msCancelFullScreen';
+function setupDarkModeButton() {
+	let bsTheme = localStorage.getItem('data-bs-theme') || 'light';
+	$('#toggle-dark-mode').prop('checked', bsTheme === 'dark')
+		.on('click', function () {
+			const isChecked = $(this).is(':checked');
+			bsTheme = isChecked ? 'dark' : 'light';
+			$('html').attr('data-bs-theme', bsTheme);
+			localStorage.setItem('data-bs-theme', bsTheme);
+		});
+}
+
+function setupRealtimeButton() {
+	$('#toggle-realtime').on('click', function () {
+		initiateDashboard($(this).is(':checked'));
+	});
+}
+
+function initiateDashboard(realtime) {
+	clearInterval(intervals.rooms);
+	clearInterval(intervals.graphs);
+
+	intervals.rooms = setInterval(function () {
+		if (app.isFocused && socket.connected) {
+			socket.emit('admin.rooms.getAll', updateRoomUsage);
 		}
+	}, realtime ? DEFAULTS.realtimeInterval : DEFAULTS.roomInterval);
 
-		if (fsMethod) {
-			btn.addClass('active');
-			btn.on('click', function () {
-				if ($container.hasClass('fullscreen')) {
-					document[exitMethod]();
-					$container.removeClass('fullscreen');
-				} else {
-					container[fsMethod]();
-					$container.addClass('fullscreen');
-				}
-			});
-		}
-	}
+	intervals.graphs = setInterval(function () {
+		updateTrafficGraph(currentGraph.units, currentGraph.until, currentGraph.amount);
+	}, realtime ? DEFAULTS.realtimeInterval : DEFAULTS.graphInterval);
+}
 
-	return Admin;
-});

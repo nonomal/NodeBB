@@ -1,5 +1,6 @@
 {
-	"trending": "Trending",
+	"plugins": "Plugins",
+	"trending": "Populært",
 	"installed": "Installed",
 	"active": "Active",
 	"inactive": "Inactive",

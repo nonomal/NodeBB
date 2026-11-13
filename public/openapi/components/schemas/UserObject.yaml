@@ -5,6 +5,9 @@ UserObject:
       type: number
       description: A user identifier
       example: 1
+    isLocal:
+      type: boolean
+      description: Whether the user belongs to the local installation or not.
     username:
       type: string
       description: A friendly name for a given user account
@@ -36,23 +39,16 @@ UserObject:
       nullable: true
     fullname:
       type: string
+      nullable: true
       example: Mr. Dragon Fruit Jr.
     displayname:
       type: string
       description: This is either username or fullname depending on forum and user settings
       example: Dragon Fruit
-    location:
-      type: string
-      example: 'Toronto, Canada'
-      nullable: true
     birthday:
       type: string
       description: A birthdate given in an ISO format parseable by the Date object
       example: 03/27/2020
-      nullable: true
-    website:
-      type: string
-      example: 'https://example.org'
       nullable: true
     aboutme:
       type: string
@@ -91,9 +87,9 @@ UserObject:
       description: A UNIX timestamp representing the moment the user posted last
       example: 1585337827953
     banned:
-      type: number
+      type: boolean
       description: A Boolean representing whether a user is banned or not
-      example: 0
+      example: false
     'banned:expire':
       type: number
       description: A UNIX timestamp representing the moment the ban will be lifted
@@ -133,6 +129,16 @@ UserObject:
       example:
         - administrators
         - Staff
+    muted:
+      type: boolean
+      description: Whether or not the user has been muted.
+    mutedUntil:
+      type: number
+      description: A UNIX timestamp representing the moment a muted state will be lifted.
+    mutedReason:
+      type: string
+      nullable: true
+      description: The admin-provided reason for being muted.
     'icon:text':
       type: string
       description: A single-letter representation of a username. This is used in the auto-generated icon given to users without an avatar
@@ -163,9 +169,7 @@ UserObject:
     - joindate
     - lastonline
     - picture
-    - location
     - birthday
-    - website
     - aboutme
     - signature
     - uploadedpicture
@@ -177,7 +181,6 @@ UserObject:
     - banned
     - 'banned:expire'
     - status
-    - enum
     - flags
     - followerCount
     - followingCount
@@ -185,7 +188,6 @@ UserObject:
     - 'cover:position'
     - groupTitle
     - groupTitleArray
-    - example
     - 'icon:text'
     - 'icon:bgColor'
     - joindateISO
@@ -200,6 +202,9 @@ UserObjectFull:
       type: number
       description: A user identifier
       example: 1
+    isLocal:
+      type: boolean
+      description: Whether the user belongs to the local installation or not.
     username:
       type: string
       description: A friendly name for a given user account
@@ -213,7 +218,7 @@ UserObjectFull:
       description: Email address associated with the user account
       example: dragonfruit@example.org
     'email:confirmed':
-      type: number
+      type: boolean
       description: Whether the user has confirmed their email address or not
       example: 1
     joindate:
@@ -236,16 +241,10 @@ UserObjectFull:
       type: string
       description: This is either username or fullname depending on forum and user settings
       example: Dragon Fruit
-    location:
-      type: string
-      example: 'Toronto, Canada'
     birthday:
       type: string
       description: A birthdate given in an ISO format parseable by the Date object
       example: 03/27/2020
-    website:
-      type: string
-      example: 'https://example.org'
     aboutme:
       type: string
       example: |
@@ -281,7 +280,7 @@ UserObjectFull:
       description: A UNIX timestamp representing the moment the user posted last
       example: 1585337827953
     banned:
-      type: number
+      type: boolean
       description: A Boolean representing whether a user is banned or not
       example: 0
     'banned:expire':
@@ -322,6 +321,23 @@ UserObjectFull:
       example:
         - administrators
         - Staff
+    iconBackgrounds:
+      type: array
+      items:
+        type: string
+        description: A valid CSS colour code
+        example: '#fff'
+    muted:
+      type: boolean
+      description: Whether or not the user has been muted.
+    mutedUntil:
+      type: number
+      description: A UNIX timestamp representing the moment a muted state will be lifted.
+      nullable: true
+    mutedReason:
+      type: string
+      description: The admin-provided reason for being muted.
+      nullable: true
     'icon:text':
       type: string
       description: A single-letter representation of a username. This is used in the auto-generated icon given to users without an avatar
@@ -348,6 +364,8 @@ UserObjectFull:
       type: string
     age:
       type: number
+    emailHidden:
+      type: boolean
     emailClass:
       type: string
     ips:
@@ -359,15 +377,11 @@ UserObjectFull:
     counts:
       type: object
       properties:
-        best:
-          type: number
         blocks:
-          type: number
-        bookmarks:
           type: number
         categoriesWatched:
           type: number
-        downvoted:
+        tagsWatched:
           type: number
         followers:
           type: number
@@ -375,17 +389,13 @@ UserObjectFull:
           type: number
         groups:
           type: number
-        ignored:
-          type: number
         posts:
           type: number
         topics:
           type: number
         uploaded:
           type: number
-        upvoted:
-          type: number
-        watched:
+        shares:
           type: number
     isBlocked:
       type: boolean
@@ -413,19 +423,44 @@ UserObjectFull:
       type: boolean
     canBan:
       type: boolean
+    canMute:
+      type: boolean
     canFlag:
       type: boolean
+    flagId:
+      type: number
+      nullable: true
     canChangePassword:
       type: boolean
     isSelf:
       type: boolean
     isFollowing:
       type: boolean
+    isFollowPending:
+      type: boolean
+    canChat:
+      type: boolean
     hasPrivateChat:
       type: number
     showHidden:
       type: boolean
+    allowProfilePicture:
+      type: boolean
+    allowCoverPicture:
+      type: boolean
+    allowProfileImageUploads:
+      type: number
+    maximumProfileImageSize:
+      type: number
+    profileImageDimension:
+      type: number
+    allowedProfileImageExtensions:
+      type: string
     groups:
+      type: array
+      items:
+        $ref: ./GroupObject.yaml#/GroupFullObject
+    selectedGroup:
       type: array
       items:
         $ref: ./GroupObject.yaml#/GroupFullObject
@@ -444,6 +479,9 @@ UserObjectFull:
             type: string
           route:
             type: string
+          url:
+            type: string
+            description: The relative path to the profile link route from the root of the forum
           name:
             type: string
           visibility:
@@ -471,29 +509,10 @@ UserObjectFull:
           - name
           - visibility
           - public
-    sso:
-      type: array
-      items:
-        type: object
-        properties:
-          associated:
-            type: boolean
-          url:
-            type: string
-          name:
-            type: string
-          icon:
-            type: string
-          deauthUrl:
-            type: string
-    websiteLink:
-      type: string
-    websiteName:
-      type: string
     username:disableEdit:
-      type: number
+      type: boolean
     email:disableEdit:
-      type: number
+      type: boolean
 UserObjectSlim:
   type: object
   properties:
@@ -501,6 +520,9 @@ UserObjectSlim:
       type: number
       description: A user identifier
       example: 1
+    isLocal:
+      type: boolean
+      description: Whether the user belongs to the local installation or not.
     username:
       type: string
       description: A friendly name for a given user account
@@ -546,7 +568,7 @@ UserObjectSlim:
       example: 0
       nullable: true
     banned:
-      type: number
+      type: boolean
       description: A Boolean representing whether a user is banned or not
       example: 0
     'banned:expire':
@@ -579,13 +601,47 @@ UserObjectSlim:
       type: string
       description: An ISO 8601 formatted date string representing the moment a ban will be lifted, or the words "Not Banned"
       example: Not Banned
+UserObjectTiny:
+  type: object
+  properties:
+    username:
+      type: string
+      description: A friendly name for a given user account
+    userslug:
+      type: string
+      description: An URL-safe variant of the username (i.e. lower-cased, spaces
+        removed, etc.)
+    picture:
+      type: string
+      nullable: true
+    uid:
+      type: number
+      description: A user identifier
+    icon:text:
+      type: string
+      description: A single-letter representation of a username. This is used in the
+        auto-generated icon given to users without
+        an avatar
+    icon:bgColor:
+      type: string
+      description: A six-character hexadecimal colour code assigned to the user. This
+        value is used in conjunction with
+        `icon:text` for the user's auto-generated
+        icon
+      example: "#f44336"
 UserObjectACP:
   type: object
+  required:
+    - uid
+    - username
   properties:
     uid:
       type: number
       description: A user identifier
       example: 1
+    isLocal:
+      type: boolean
+      description: Whether the user belongs to the local installation or not.
     username:
       type: string
       description: A friendly name for a given user account
@@ -602,6 +658,9 @@ UserObjectACP:
       type: string
       description: Email address associated with the user account
       example: dragonfruit@example.org
+    emailToConfirm:
+      type: string
+      description: Email address user used during signup, this email is not associated with the user until it is confirmed by clicking the link in the confirmation email.
     postcount:
       type: number
       example: 1000
@@ -610,9 +669,12 @@ UserObjectACP:
       description: A UNIX timestamp representing the moment the user's account was created
       example: 1585337827953
     banned:
-      type: number
+      type: boolean
       description: A Boolean representing whether a user is banned or not
       example: 0
+    muted:
+      type: boolean
+      description: Whether or not the user has been muted.
     reputation:
       type: number
       description: The user's reputation score on the forum. Out-of-the-box, users gain/lose reputation points based on upvotes/downvotes, though plugins can alter the logic and criterion for awarding reputation points
@@ -634,6 +696,12 @@ UserObjectACP:
       type: number
       description: Whether the user has confirmed their email address or not
       example: 1
+    'email:expired':
+      type: boolean
+      description: True if confirmation email expired
+    'email:pending':
+      type: boolean
+      description: True if confirmation email is still pending
     'icon:text':
       type: string
       description: A single-letter representation of a username. This is used in the auto-generated icon given to users without an avatar
@@ -648,6 +716,10 @@ UserObjectACP:
     lastonlineISO:
       type: string
       example: '2020-03-27T20:30:36.590Z'
+    banned_until:
+      type: number
+      description: A UNIX timestamp representing the moment a ban will be lifted
+      example: 0
     banned_until_readable:
       type: string
       description: An ISO 8601 formatted date string representing the moment a ban will be lifted, or the words "Not Banned"
@@ -659,3 +731,51 @@ UserObjectACP:
       nullable: true
     ips:
       type: array
+BanMuteArray:
+  type: array
+  items:
+    type: object
+    properties:
+      uid:
+        type: number
+      timestamp:
+        type: number
+      expire:
+        type: number
+      fromUid:
+        type: number
+      user:
+        type: object
+        properties:
+          username:
+            type: string
+            description: A friendly name for a given user account
+          userslug:
+            type: string
+            description: An URL-safe variant of the username (i.e. lower-cased, spaces
+              removed, etc.)
+          picture:
+            type: string
+          uid:
+            type: number
+            description: A user identifier
+          icon:text:
+            type: string
+            description: A single-letter representation of a username. This is used in the
+              auto-generated icon given to users without
+              an avatar
+          icon:bgColor:
+            type: string
+            description: A six-character hexadecimal colour code assigned to the user. This
+              value is used in conjunction with
+              `icon:text` for the user's auto-generated
+              icon
+            example: "#f44336"
+      until:
+        type: number
+      untilISO:
+        type: string
+      timestampISO:
+        type: string
+      reason:
+        type: string

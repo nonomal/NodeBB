@@ -3,27 +3,28 @@
 define('admin/manage/group', [
 	'forum/groups/memberlist',
 	'iconSelect',
-	'translator',
 	'categorySelector',
 	'groupSearch',
 	'slugify',
 	'api',
-], function (memberList, iconSelect, translator, categorySelector, groupSearch, slugify, api) {
-	var Groups = {};
+	'modals',
+	'alerts',
+	'admin/settings',
+], function (
+	memberList, iconSelect, categorySelector, groupSearch,
+	slugify, api, modals, alerts, settings
+) {
+	const Groups = {};
 
 	Groups.init = function () {
-		var groupIcon = $('#group-icon');
-		var changeGroupUserTitle = $('#change-group-user-title');
-		var changeGroupLabelColor = $('#change-group-label-color');
-		var changeGroupTextColor = $('#change-group-text-color');
-		var groupLabelPreview = $('#group-label-preview');
-		var groupLabelPreviewText = $('#group-label-preview-text');
+		const groupIcon = $('#group-icon');
+		const changeGroupUserTitle = $('#change-group-user-title');
+		const changeGroupLabelColor = $('#change-group-label-color');
+		const changeGroupTextColor = $('#change-group-text-color');
+		const groupLabelPreview = $('#group-label-preview');
+		const groupLabelPreviewText = $('#group-label-preview-text');
 
-		var groupName = ajaxify.data.group.name;
-
-		$('#group-selector').on('change', function () {
-			ajaxify.go('admin/manage/groups/' + $(this).val() + window.location.hash);
-		});
+		const groupName = ajaxify.data.group.name;
 
 		memberList.init('admin/manage/group');
 
@@ -41,10 +42,10 @@ define('admin/manage/group', [
 
 		setupGroupMembersMenu();
 
-		$('#group-icon, #group-icon-label').on('click', function () {
-			var currentIcon = groupIcon.attr('value');
+		$('#group-icon-container').on('click', function () {
+			const currentIcon = groupIcon.attr('value');
 			iconSelect.init(groupIcon, function () {
-				var newIcon = groupIcon.attr('value');
+				let newIcon = groupIcon.attr('value');
 				if (newIcon === currentIcon) {
 					return;
 				}
@@ -64,13 +65,18 @@ define('admin/manage/group', [
 			showLinks: true,
 		});
 
-		var cidSelector = categorySelector.init($('.member-post-cids-selector [component="category-selector"]'), {
+		const cidSelector = categorySelector.init($('.member-post-cids-selector [component="category-selector"]'), {
 			onSelect: function (selectedCategory) {
-				var cids = ($('#memberPostCids').val() || '').split(',').map(cid => parseInt(cid, 10));
-				cids.push(selectedCategory.cid);
-				cids = cids.filter((cid, index, array) => array.indexOf(cid) === index);
-				$('#memberPostCids').val(cids.join(','));
+				const cids = new Set(($('#memberPostCids').val() || '').split(',').filter(Boolean));
+				if (cids.has(String(selectedCategory.cid))) {
+					cids.delete(String(selectedCategory.cid));
+				} else {
+					cids.add(String(selectedCategory.cid));
+				}
+
+				$('#memberPostCids').val(Array.from(cids).join(','));
 				cidSelector.selectCategory(0);
+				return false;
 			},
 		});
 
@@ -79,6 +85,16 @@ define('admin/manage/group', [
 		$('form [data-property]').on('change', function () {
 			app.flags = app.flags || {};
 			app.flags._unsaved = true;
+		});
+
+		$('[data-action="delete"]').on('click', function () {
+			modals.confirm('[[admin/manage/groups:alerts.confirm-delete]]', function (confirm) {
+				if (confirm) {
+					api.del(`/groups/${slugify(ajaxify.data.group.name)}`, {}).then(() => {
+						ajaxify.go('/admin/manage/groups');
+					}).catch(alerts.error);
+				}
+			});
 		});
 
 		$('#save').on('click', function () {
@@ -96,44 +112,39 @@ define('admin/manage/group', [
 				disableJoinRequests: $('#group-disableJoinRequests').is(':checked'),
 				disableLeave: $('#group-disableLeave').is(':checked'),
 			}).then(() => {
-				var newName = $('#change-group-name').val();
+				const newName = $('#change-group-name').val();
 
 				// If the group name changed, change url
 				if (groupName !== newName) {
 					ajaxify.go('admin/manage/groups/' + encodeURIComponent(newName), undefined, true);
 				}
-
-				app.alertSuccess('[[admin/manage/groups:edit.save-success]]');
-			}).catch(app.alertError);
+				settings.toggleSaveSuccess($('#save'));
+			}).catch(alerts.error);
 			return false;
 		});
 	};
 
 	function setupGroupMembersMenu() {
 		$('[component="groups/members"]').on('click', '[data-action]', function () {
-			var btnEl = $(this);
-			var userRow = btnEl.parents('[data-uid]');
-			var ownerFlagEl = userRow.find('.member-name .user-owner-icon');
-			var isOwner = !ownerFlagEl.hasClass('invisible');
-			var uid = userRow.attr('data-uid');
-			var action = btnEl.attr('data-action');
+			const btnEl = $(this);
+			const userRow = btnEl.parents('[data-uid]');
+			const ownerFlagEl = userRow.find('.member-name .user-owner-icon');
+			const isOwner = !ownerFlagEl.hasClass('invisible');
+			const uid = userRow.attr('data-uid');
+			const action = btnEl.attr('data-action');
 
 			switch (action) {
 				case 'toggleOwnership':
-					api[isOwner ? 'del' : 'put'](`/groups/${ajaxify.data.group.slug}/ownership/${uid}`, {}).then(() => {
+					memberList.toggleOwnership(ajaxify.data.group.slug, uid, isOwner).then(() => {
 						ownerFlagEl.toggleClass('invisible');
-					}).catch(app.alertError);
+						userRow.attr('data-isowner', isOwner ? '0' : '1');
+					}).catch(alerts.error);
 					break;
 
 				case 'kick':
-					bootbox.confirm('[[admin/manage/groups:edit.confirm-remove-user]]', function (confirm) {
-						if (!confirm) {
-							return;
-						}
-						api.del('/groups/' + ajaxify.data.group.slug + '/membership/' + uid).then(() => {
-							userRow.slideUp().remove();
-						}).catch(app.alertError);
-					});
+					memberList.kickMember(ajaxify.data.group.slug, uid).then(() => {
+						userRow.remove();
+					}).catch(alerts.error);
 					break;
 				default:
 					break;
@@ -143,15 +154,13 @@ define('admin/manage/group', [
 
 	function navigateToCategory(cid) {
 		if (cid) {
-			var url = 'admin/manage/privileges/' + cid + '?group=' + ajaxify.data.group.nameEncoded;
+			const url = 'admin/manage/privileges/' + cid + '?group=' + ajaxify.data.group.nameEncoded;
 			if (app.flags && app.flags._unsaved === true) {
-				translator.translate('[[global:unsaved-changes]]', function (text) {
-					bootbox.confirm(text, function (navigate) {
-						if (navigate) {
-							app.flags._unsaved = false;
-							ajaxify.go(url);
-						}
-					});
+				modals.confirm('[[global:unsaved-changes]]', function (navigate) {
+					if (navigate) {
+						app.flags._unsaved = false;
+						ajaxify.go(url);
+					}
 				});
 				return;
 			}

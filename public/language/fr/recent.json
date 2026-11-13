@@ -5,15 +5,9 @@
     "month": "Mois",
     "year": "An",
     "alltime": "Toujours",
-    "no_recent_topics": "Il n'y a aucun sujet récent.",
-    "no_popular_topics": "Il n'y a pas de sujet populaire.",
-    "there-is-a-new-topic": "Il y a un nouveau sujet.",
-    "there-is-a-new-topic-and-a-new-post": "Il y a un nouveau sujet et un nouveau message.",
-    "there-is-a-new-topic-and-new-posts": "Il y a un nouveau sujet et %1 nouveaux messages.",
-    "there-are-new-topics": "Il y a %1 nouveaux sujets.",
-    "there-are-new-topics-and-a-new-post": "Il y a %1 nouveaux sujets et un nouveau message.",
-    "there-are-new-topics-and-new-posts": "Il y a %1 nouveaux sujets et %2 nouveaux messages.",
-    "there-is-a-new-post": "Il y a un nouveau message.",
-    "there-are-new-posts": "Il y a %1 nouveaux messages.",
-    "click-here-to-reload": "Cliquez ici pour recharger."
+    "no-recent-topics": "Il n'y a aucun sujet récent.",
+    "no-popular-topics": "Il n'y a pas de sujet populaire.",
+    "load-new-posts": "Charger les nouveaux messages",
+    "uncategorized.title": "Tous les sujets connus",
+    "uncategorized.intro": "Cette page présente la liste chronologique de tous les sujets abordés sur ce forum. Les opinions exprimées dans les sujets ci-dessous ne sont pas modérées et ne reflètent pas nécessairement celles de ce site web."
 }

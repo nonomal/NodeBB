@@ -4,16 +4,10 @@
     "week": "Tuần",
     "month": "Tháng",
     "year": "Năm",
-    "alltime": "Mọi Lúc",
-    "no_recent_topics": "Không có chủ đề gần đây.",
-    "no_popular_topics": "Không có chủ đề nào phổ biến.",
-    "there-is-a-new-topic": "Có chủ đề mới",
-    "there-is-a-new-topic-and-a-new-post": "Có chủ đề mới và bài viết mới",
-    "there-is-a-new-topic-and-new-posts": "Có 1 chủ đề mới và %1 bài viết mới.",
-    "there-are-new-topics": "Có %1 chủ đề mới.",
-    "there-are-new-topics-and-a-new-post": "Có %1 chủ đề mới và 1 bài viết mới.",
-    "there-are-new-topics-and-new-posts": "Có %1 chủ đề mới và %2 bài viết mới.",
-    "there-is-a-new-post": "Có bài viết mới",
-    "there-are-new-posts": "Có %1 bài viết mới.",
-    "click-here-to-reload": "Nhấn vào đây để tải lại."
+    "alltime": "Tất Cả Thời Gian",
+    "no-recent-topics": "Không có chủ đề gần đây.",
+    "no-popular-topics": "Không có chủ đề phổ biến.",
+    "load-new-posts": "Tải bài đăng mới",
+    "uncategorized.title": "Tất cả các chủ đề đã biết",
+    "uncategorized.intro": "Trang này hiển thị danh sách theo thứ tự thời gian của mọi chủ đề mà diễn đàn này đã nhận được.<br />Các quan điểm và ý kiến ​​thể hiện trong các chủ đề dưới đây không được kiểm duyệt và có thể không thể hiện quan điểm và ý kiến ​​của trang web này."
 }

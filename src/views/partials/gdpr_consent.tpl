@@ -1,23 +1,22 @@
-<div class="form-group">
-	<p class="lead">[[user:consent.lead]]</p>
-	<p>[[user:consent.intro]]</p>
-	<div class="checkbox">
-		<label>
-			<input type="checkbox" name="gdpr_agree_data" id="gdpr_agree_data"> <strong>[[register:gdpr_agree_data]]</strong>
-		</label>
+<div class="mb-3">
+	<p class="lead">{{tx("user:consent.lead")}}</p>
+	<p>{{tx("user:consent.intro")}}</p>
+	<div class="form-check mb-3">
+		<input class="form-check-input" type="checkbox" name="gdpr_agree_data" id="gdpr_agree_data" role="switch">
+		<label class="form-check-label" for="gdpr_agree_data">{{tx("register:gdpr-agree-data")}}</label>
 	</div>
+
 	<p>
-		[[user:consent.email_intro]]
-		<!-- IF digestEnabled -->
-		[[user:consent.digest_frequency, {digestFrequency}]]
-		<!-- ELSE -->
-		[[user:consent.digest_off]]
-		<!-- END -->
+		{{tx("user:consent.email-intro")}}
+		{{{ if digestEnabled }}}
+		{{tx("user:consent.digest-frequency", digestFrequency)}}
+		{{{ else }}}
+		{{tx("user:consent.digest-off")}}
+		{{{ end }}}
 	</p>
-	
-	<div class="checkbox">
-		<label>
-			<input type="checkbox" name="gdpr_agree_email" id="gdpr_agree_email"> <strong>[[register:gdpr_agree_email]]</strong>
-		</label>
+
+	<div class="form-check">
+		<input class="form-check-input" type="checkbox" name="gdpr_agree_email" id="gdpr_agree_email" role="switch">
+		<label class="form-check-label" for="gdpr_agree_email">{{tx("register:gdpr-agree-email")}}</label>
 	</div>
 </div>

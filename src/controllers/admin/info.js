@@ -11,6 +11,8 @@ const rooms = require('../../socket.io/admin/rooms');
 const infoController = module.exports;
 
 let info = {};
+let previousUsage = process.cpuUsage();
+let usageStartDate = Date.now();
 
 infoController.get = function (req, res) {
 	info = {};
@@ -69,7 +71,7 @@ async function getNodeInfo() {
 			version: process.version,
 			memoryUsage: process.memoryUsage(),
 			uptime: process.uptime(),
-			cpuUsage: process.cpuUsage(),
+			cpuUsage: getCpuUsage(),
 		},
 		os: {
 			hostname: os.hostname(),
@@ -86,16 +88,16 @@ async function getNodeInfo() {
 			isPrimary: nconf.get('isPrimary'),
 			runJobs: nconf.get('runJobs'),
 			jobsDisabled: nconf.get('jobsDisabled'),
+			acpPluginInstallDisabled: nconf.get('acpPluginInstallDisabled'),
 		},
 	};
-	data.process.cpuUsage.user /= 1000000;
-	data.process.cpuUsage.user = data.process.cpuUsage.user.toFixed(2);
-	data.process.cpuUsage.system /= 1000000;
-	data.process.cpuUsage.system = data.process.cpuUsage.system.toFixed(2);
-	data.process.memoryUsage.humanReadable = (data.process.memoryUsage.rss / (1024 * 1024)).toFixed(2);
+
+	data.process.memoryUsage.rssReadable = (data.process.memoryUsage.rss / (1024 * 1024 * 1024)).toFixed(2);
+	data.process.memoryUsage.heapUsedReadable = (data.process.memoryUsage.heapUsed / (1024 * 1024 * 1024)).toFixed(2);
 	data.process.uptimeHumanReadable = humanReadableUptime(data.process.uptime);
-	data.os.freemem = (data.os.freemem / 1000000).toFixed(2);
-	data.os.totalmem = (data.os.totalmem / 1000000).toFixed(2);
+	data.os.freemem = (data.os.freemem / (1024 * 1024 * 1024)).toFixed(2);
+	data.os.totalmem = (data.os.totalmem / (1024 * 1024 * 1024)).toFixed(2);
+	data.os.usedmem = (data.os.totalmem - data.os.freemem).toFixed(2);
 	const [stats, gitInfo] = await Promise.all([
 		rooms.getLocalStats(),
 		getGitInfo(),
@@ -105,15 +107,29 @@ async function getNodeInfo() {
 	return data;
 }
 
+function getCpuUsage() {
+	const newUsage = process.cpuUsage();
+	const diff = (newUsage.user + newUsage.system) - (previousUsage.user + previousUsage.system);
+	const now = Date.now();
+	const result = diff / ((now - usageStartDate) * 1000) * 100;
+	previousUsage = newUsage;
+	usageStartDate = now;
+	return result.toFixed(2);
+}
+
 function humanReadableUptime(seconds) {
+	const oneHourInSeconds = 3600;
+	const oneDayInSeconds = oneHourInSeconds * 24;
 	if (seconds < 60) {
 		return `${Math.floor(seconds)}s`;
-	} else if (seconds < 3600) {
+	} else if (seconds < oneHourInSeconds) {
 		return `${Math.floor(seconds / 60)}m`;
-	} else if (seconds < 3600 * 24) {
+	} else if (seconds < oneDayInSeconds) {
 		return `${Math.floor(seconds / (60 * 60))}h`;
 	}
-	return `${Math.floor(seconds / (60 * 60 * 24))}d`;
+	const days = Math.floor(seconds / (oneDayInSeconds));
+	const hours = Math.floor((seconds % (oneDayInSeconds)) / oneHourInSeconds);
+	return `${days}d ${hours}h`;
 }
 
 async function getGitInfo() {
@@ -130,5 +146,5 @@ async function getGitInfo() {
 		getAsync('git rev-parse HEAD'),
 		getAsync('git rev-parse --abbrev-ref HEAD'),
 	]);
-	return { hash: hash, hashShort: hash.substr(0, 6), branch: branch };
+	return { hash: hash, hashShort: hash.slice(0, 6), branch: branch };
 }

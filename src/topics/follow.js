@@ -5,7 +5,8 @@ const db = require('../database');
 const notifications = require('../notifications');
 const privileges = require('../privileges');
 const plugins = require('../plugins');
-const utils = require('../utils');
+const user = require('../user');
+const tx = require('../translator');
 
 module.exports = function (Topics) {
 	Topics.toggleFollow = async function (tid, uid) {
@@ -35,8 +36,8 @@ module.exports = function (Topics) {
 	};
 
 	async function setWatching(method1, method2, hook, tid, uid) {
-		if (parseInt(uid, 10) <= 0) {
-			return;
+		if (!(parseInt(uid, 10) > 0)) {
+			throw new Error('[[error:not-logged-in]]');
 		}
 		const exists = await Topics.exists(tid);
 		if (!exists) {
@@ -48,29 +49,30 @@ module.exports = function (Topics) {
 	}
 
 	async function follow(tid, uid) {
-		await addToSets(`tid:${tid}:followers`, `uid:${uid}:followed_tids`, tid, uid);
+		await db.setAdd(`tid:${tid}:followers`, uid);
+		await db.sortedSetAdd(`uid:${uid}:followed_tids`, Date.now(), tid);
+		await updateFollowerCount(tid);
 	}
 
 	async function unfollow(tid, uid) {
-		await removeFromSets(`tid:${tid}:followers`, `uid:${uid}:followed_tids`, tid, uid);
+		await db.setRemove(`tid:${tid}:followers`, uid);
+		await db.sortedSetRemove(`uid:${uid}:followed_tids`, tid);
+		await updateFollowerCount(tid);
 	}
 
 	async function ignore(tid, uid) {
-		await addToSets(`tid:${tid}:ignorers`, `uid:${uid}:ignored_tids`, tid, uid);
+		await db.setAdd(`tid:${tid}:ignorers`, uid);
+		await db.sortedSetAdd(`uid:${uid}:ignored_tids`, Date.now(), tid);
 	}
 
 	async function unignore(tid, uid) {
-		await removeFromSets(`tid:${tid}:ignorers`, `uid:${uid}:ignored_tids`, tid, uid);
+		await db.setRemove(`tid:${tid}:ignorers`, uid);
+		await db.sortedSetRemove(`uid:${uid}:ignored_tids`, tid);
 	}
 
-	async function addToSets(set1, set2, tid, uid) {
-		await db.setAdd(set1, uid);
-		await db.sortedSetAdd(set2, Date.now(), tid);
-	}
-
-	async function removeFromSets(set1, set2, tid, uid) {
-		await db.setRemove(set1, uid);
-		await db.sortedSetRemove(set2, tid);
+	async function updateFollowerCount(tid) {
+		const count = await db.setCount(`tid:${tid}:followers`);
+		await Topics.setTopicField(tid, 'followercount', count);
 	}
 
 	Topics.isFollowing = async function (tids, uid) {
@@ -156,17 +158,20 @@ module.exports = function (Topics) {
 		if (!followers.length) {
 			return;
 		}
-
-		let { title } = postData.topic;
-		if (title) {
-			title = utils.decodeHTMLEntities(title);
-		}
-
+		const [displayName, title] = await Promise.all([
+			user.getNotificationDisplayname(exceptUid),
+			Topics.getNotificationTitle(postData.topic.tid),
+		]);
+		const typeToTxKey = {
+			'new-reply': 'notifications:user-posted-to',
+			'post-edit': 'notifications:user-edited-post',
+		};
 		const notification = await notifications.create({
 			subject: title,
+			bodyShort: tx.compile(typeToTxKey[notifData.type], displayName, title),
 			bodyLong: postData.content,
 			pid: postData.pid,
-			path: `/post/${postData.pid}`,
+			path: `/post/${encodeURIComponent(postData.pid)}`,
 			tid: postData.topic.tid,
 			from: exceptUid,
 			topicTitle: title,

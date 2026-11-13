@@ -38,51 +38,76 @@ Blacklist.save = async function (rules) {
 	pubsub.publish('blacklist:reload');
 };
 
+Blacklist.addRule = async function (rule) {
+	const { valid } = Blacklist.validate(rule);
+	if (!valid.length) {
+		throw new Error('[[error:invalid-rule]]');
+	}
+	let rules = await Blacklist.get();
+	rules = `${rules}\n${valid[0]}`;
+	await Blacklist.save(rules);
+};
+
 Blacklist.get = async function () {
 	const data = await db.getObject('ip-blacklist-rules');
 	return data && data.rules;
 };
 
 Blacklist.test = async function (clientIp) {
-	// Some handy test addresses
-	// clientIp = '2001:db8:85a3:0:0:8a2e:370:7334';	// IPv6
-	// clientIp = '127.0.15.1';	// IPv4
-	// clientIp = '127.0.15.1:3443'; // IPv4 with port strip port to not fail
 	if (!clientIp) {
 		return;
 	}
-	clientIp = clientIp.split(':').length === 2 ? clientIp.split(':')[0] : clientIp;
+	const parts = clientIp.split(':');
+	if (parts.length === 2) {
+		clientIp = parts[0];
+	}
+
+	if (!validator.isIP(clientIp)) {
+		throw new Error('[[error:invalid-ip]]');
+	}
 
 	let addr;
 	try {
 		addr = ipaddr.parse(clientIp);
+		// Normalize IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) to plain IPv4
+		if (addr.kind() === 'ipv6' && addr.isIPv4MappedAddress()) {
+			addr = addr.toIPv4Address();
+			clientIp = addr.toString();
+		}
 	} catch (err) {
 		winston.error(`[meta/blacklist] Error parsing client IP : ${clientIp}`);
 		throw err;
 	}
 
-	if (
-		!Blacklist._rules.ipv4.includes(clientIp) &&	// not explicitly specified in ipv4 list
-		!Blacklist._rules.ipv6.includes(clientIp) &&	// not explicitly specified in ipv6 list
-		!Blacklist._rules.cidr.some((subnet) => {
+	const rules = Blacklist._rules;
+	function checkCidrRange(address) {
+		if (!rules.cidr.length) {
+			return false;
+		}
+
+		return rules.cidr.some((subnet) => {
 			const cidr = ipaddr.parseCIDR(subnet);
-			if (addr.kind() !== cidr[0].kind()) {
+			if (address.kind() !== cidr[0].kind()) {
 				return false;
 			}
-			return addr.match(cidr);
-		})	// not in a blacklisted IPv4 or IPv6 cidr range
-	) {
-		try {
-			// To return test failure, pass back an error in callback
-			await plugins.hooks.fire('filter:blacklist.test', { ip: clientIp });
-		} catch (err) {
-			analytics.increment('blacklist');
-			throw err;
-		}
-	} else {
+			return address.match(cidr);
+		});
+	}
+
+	if (rules.ipv4.includes(clientIp) ||
+		rules.ipv6.includes(clientIp) ||
+		checkCidrRange(addr)) {
 		const err = new Error('[[error:blacklisted-ip]]');
 		err.code = 'blacklisted-ip';
 
+		analytics.increment('blacklist');
+		throw err;
+	}
+
+	try {
+		// To return test failure, throw an error in hook
+		await plugins.hooks.fire('filter:blacklist.test', { ip: clientIp });
+	} catch (err) {
 		analytics.increment('blacklist');
 		throw err;
 	}
@@ -129,7 +154,7 @@ Blacklist.validate = function (rules) {
 		}
 
 		if (!addr || whitelist.includes(rule)) {
-			invalid.push(validator.escape(rule));
+			invalid.push(rule);
 			return false;
 		}
 
@@ -160,12 +185,4 @@ Blacklist.validate = function (rules) {
 	};
 };
 
-Blacklist.addRule = async function (rule) {
-	const { valid } = Blacklist.validate(rule);
-	if (!valid.length) {
-		throw new Error('[[error:invalid-rule]]');
-	}
-	let rules = await Blacklist.get();
-	rules = `${rules}\n${valid[0]}`;
-	await Blacklist.save(rules);
-};
+

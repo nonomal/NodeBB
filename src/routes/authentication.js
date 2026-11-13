@@ -6,25 +6,19 @@ const passportLocal = require('passport-local').Strategy;
 const BearerStrategy = require('passport-http-bearer').Strategy;
 const winston = require('winston');
 
-const meta = require('../meta');
 const controllers = require('../controllers');
 const helpers = require('../controllers/helpers');
 const plugins = require('../plugins');
+const api = require('../api');
+const { generateToken } = require('../middleware/csrf');
 
 let loginStrategies = [];
 
 const Auth = module.exports;
 
 Auth.initialize = function (app, middleware) {
-	const passportInitMiddleware = passport.initialize();
-	app.use((req, res, next) => {
-		passportInitMiddleware(req, res, next);
-	});
-	const passportSessionMiddleware = passport.session();
-	app.use((req, res, next) => {
-		passportSessionMiddleware(req, res, next);
-	});
-
+	app.use(passport.initialize());
+	app.use(passport.session());
 	app.use((req, res, next) => {
 		Auth.setAuthVars(req, res);
 		next();
@@ -51,13 +45,8 @@ Auth.getLoginStrategies = function () {
 };
 
 Auth.verifyToken = async function (token, done) {
-	let { tokens = [] } = await meta.settings.get('core.api');
-	tokens = tokens.reduce((memo, cur) => {
-		memo[cur.token] = cur.uid;
-		return memo;
-	}, {});
-
-	const uid = tokens[token];
+	const tokenObj = await api.utils.tokens.get(token);
+	const uid = tokenObj ? tokenObj.uid : undefined;
 
 	if (uid !== undefined) {
 		if (parseInt(uid, 10) > 0) {
@@ -105,8 +94,14 @@ Auth.reloadRoutes = async function (params) {
 				};
 
 				if (strategy.checkState !== false) {
-					req.session.ssoState = req.csrfToken && req.csrfToken();
+					req.session.ssoState = generateToken(req, true);
 					opts.state = req.session.ssoState;
+				}
+				if (req.query.next) {
+					const next = helpers.normalizeReturnToPath(req.query.next);
+					if (next) {
+						req.session.next = next;
+					}
 				}
 
 				// Allow SSO plugins to override/append options (for use in passport prototype authorizationParams)
@@ -121,15 +116,15 @@ Auth.reloadRoutes = async function (params) {
 				return next();
 			}
 
-			next(req.query.state !== req.session.ssoState ? new Error('[[error:csrf-invalid]]') : null);
+			next((!req.session.ssoState || req.query.state !== req.session.ssoState) ? new Error('[[error:csrf-invalid]]') : null);
 		}, (req, res, next) => {
 			// Trigger registration interstitial checks
 			req.session.registration = req.session.registration || {};
 			// save returnTo for later usage in /register/complete
 			// passport seems to remove `req.session.returnTo` after it redirects
-			req.session.registration.returnTo = req.session.returnTo;
+			req.session.registration.returnTo = req.session.next || req.session.returnTo;
 
-			passport.authenticate(strategy.name, (err, user) => {
+			passport.authenticate(strategy.name, (err, user, info) => {
 				if (err) {
 					if (req.session && req.session.registration) {
 						delete req.session.registration;
@@ -141,36 +136,42 @@ Auth.reloadRoutes = async function (params) {
 					if (req.session && req.session.registration) {
 						delete req.session.registration;
 					}
-					return helpers.redirect(res, strategy.failureUrl !== undefined ? strategy.failureUrl : '/login');
+					if (info && info.message) {
+						return helpers.redirect(res, `/?register=${encodeURIComponent(info.message)}`);
+					}
+					return helpers.redirect(res, strategy.failureUrl || '/login');
 				}
 
 				res.locals.user = user;
 				res.locals.strategy = strategy;
 				next();
 			})(req, res, next);
-		},
-		Auth.middleware.validateAuth,
-		(req, res, next) => {
+		}, Auth.middleware.validateAuth, (req, res, next) => {
+			const wasForceLogin = !!req.session.forceLogin;
+			delete req.session.forceLogin;
 			async.waterfall([
-				async.apply(req.login.bind(req), res.locals.user),
-				async.apply(controllers.authentication.onSuccessfulLogin, req, req.uid),
+				async.apply(req.login.bind(req), res.locals.user, { keepSessionInfo: true }),
+				async.apply(controllers.authentication.onSuccessfulLogin, req, res.locals.user.uid, true, wasForceLogin),
 			], (err) => {
 				if (err) {
 					return next(err);
 				}
 
-				helpers.redirect(res, strategy.successUrl !== undefined ? strategy.successUrl : '/');
+				helpers.redirect(res, strategy.successUrl || '/');
 			});
 		});
 	});
 
-	const multipart = require('connect-multiparty');
-	const multipartMiddleware = multipart();
-	const middlewares = [multipartMiddleware, Auth.middleware.applyCSRF, Auth.middleware.applyBlacklist];
+	const upload = require('../middleware/multer');
+	const middlewares = [
+		upload.any(),
+		Auth.middleware.applyCSRF,
+		Auth.middleware.applyBlacklist,
+	];
 
 	router.post('/register', middlewares, controllers.authentication.register);
 	router.post('/register/complete', middlewares, controllers.authentication.registerComplete);
-	router.post('/register/abort', controllers.authentication.registerAbort);
+	router.post('/register/abort', middlewares, controllers.authentication.registerAbort);
 	router.post('/login', Auth.middleware.applyCSRF, Auth.middleware.applyBlacklist, controllers.authentication.login);
 	router.post('/logout', Auth.middleware.applyCSRF, controllers.authentication.logout);
 };

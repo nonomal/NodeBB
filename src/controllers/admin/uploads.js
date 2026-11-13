@@ -3,28 +3,38 @@
 const path = require('path');
 const nconf = require('nconf');
 const fs = require('fs');
+const winston = require('winston');
 
 const meta = require('../../meta');
+const categories = require('../../categories');
 const posts = require('../../posts');
 const file = require('../../file');
 const image = require('../../image');
 const plugins = require('../../plugins');
 const pagination = require('../../pagination');
 
-const allowedImageTypes = ['image/png', 'image/jpeg', 'image/pjpeg', 'image/jpg', 'image/gif', 'image/svg+xml'];
+const allowedImageTypes = [
+	'image/png', 'image/jpeg', 'image/pjpeg', 'image/jpg', 'image/gif', 'image/svg+xml',
+];
 
 const uploadsController = module.exports;
 
 uploadsController.get = async function (req, res, next) {
 	const currentFolder = path.join(nconf.get('upload_path'), req.query.dir || '');
-	if (!currentFolder.startsWith(nconf.get('upload_path'))) {
+	if (!file.isPathInside(nconf.get('upload_path'), currentFolder)) {
 		return next(new Error('[[error:invalid-path]]'));
 	}
 	const itemsPerPage = 20;
 	const page = parseInt(req.query.page, 10) || 1;
+	let files;
 	try {
-		let files = await fs.promises.readdir(currentFolder);
-		files = files.filter(filename => filename !== '.gitignore');
+		await checkSymLinks(req.query.dir);
+		files = await getFilesInFolder(currentFolder);
+	} catch (err) {
+		winston.error(err.stack);
+		return next(new Error('[[error:invalid-path]]'));
+	}
+	try {
 		const itemCount = files.length;
 		const start = Math.max(0, (page - 1) * itemsPerPage);
 		const stop = start + itemsPerPage;
@@ -46,7 +56,7 @@ uploadsController.get = async function (req, res, next) {
 		});
 
 		// Add post usage info if in /files
-		if (['/files', '/files/'].includes(req.query.dir)) {
+		if (['files', '/files', '/files/'].includes(req.query.dir)) {
 			const usage = await posts.uploads.getUsage(files);
 			files.forEach((file, idx) => {
 				file.inPids = usage[idx].map(pid => parseInt(pid, 10));
@@ -64,18 +74,49 @@ uploadsController.get = async function (req, res, next) {
 	}
 };
 
+async function checkSymLinks(folder) {
+	let dir = path.normalize(folder || '');
+	while (dir.length && dir !== '.') {
+		const nextPath = path.join(nconf.get('upload_path'), dir);
+		// eslint-disable-next-line no-await-in-loop
+		const stat = await fs.promises.lstat(nextPath);
+		if (stat.isSymbolicLink()) {
+			throw new Error('[[invalid-path]]');
+		}
+		const newDir = path.dirname(dir);
+		if (newDir === dir) {
+			break;
+		}
+		dir = newDir;
+	}
+}
+
+async function getFilesInFolder(folder) {
+	const dirents = await fs.promises.readdir(folder, { withFileTypes: true });
+	const files = [];
+	for await (const dirent of dirents) {
+		if (!dirent.isSymbolicLink() && dirent.name !== '.gitignore') {
+			files.push(dirent.name);
+		}
+	}
+	return files;
+}
+
 function buildBreadcrumbs(currentFolder) {
 	const crumbs = [];
 	const parts = currentFolder.replace(nconf.get('upload_path'), '').split(path.sep);
 	let currentPath = '';
-	parts.forEach((part) => {
+	parts.forEach((part, i) => {
 		const dir = path.join(currentPath, part);
-		crumbs.push({
+		const crumb = {
 			text: part || 'Uploads',
-			url: part ?
+		};
+		if (i < parts.length - 1) {
+			crumb.url = part ?
 				(`${nconf.get('relative_path')}/admin/manage/uploads?dir=${dir}`) :
-				`${nconf.get('relative_path')}/admin/manage/uploads`,
-		});
+				`${nconf.get('relative_path')}/admin/manage/uploads`;
+		}
+		crumbs.push(crumb);
 		currentPath = dir;
 	});
 
@@ -87,17 +128,18 @@ async function filesToData(currentDir, files) {
 }
 
 async function getFileData(currentDir, file) {
-	const stat = await fs.promises.stat(path.join(currentDir, file));
+	const pathToFile = path.join(currentDir, file);
+	const stat = await fs.promises.stat(pathToFile);
 	let filesInDir = [];
 	if (stat.isDirectory()) {
-		filesInDir = await fs.promises.readdir(path.join(currentDir, file));
+		filesInDir = await getFilesInFolder(pathToFile);
 	}
 	const url = `${nconf.get('upload_url') + currentDir.replace(nconf.get('upload_path'), '')}/${file}`;
 	return {
 		name: file,
-		path: path.join(currentDir, file).replace(nconf.get('upload_path'), ''),
+		path: pathToFile.replace(path.join(nconf.get('upload_path'), '/'), ''),
 		url: url,
-		fileCount: Math.max(0, filesInDir.length - 1), // ignore .gitignore
+		fileCount: filesInDir.length,
 		size: stat.size,
 		sizeHumanReadable: `${(stat.size / 1024).toFixed(1)}KiB`,
 		isDirectory: stat.isDirectory(),
@@ -107,166 +149,170 @@ async function getFileData(currentDir, file) {
 }
 
 uploadsController.uploadCategoryPicture = async function (req, res, next) {
-	const uploadedFile = req.files.files[0];
-	let params = null;
+	const uploadedFile = req.files[0];
+	let params;
 
 	try {
 		params = JSON.parse(req.body.params);
 	} catch (e) {
-		file.delete(uploadedFile.path);
 		return next(new Error('[[error:invalid-json]]'));
 	}
 
-	if (validateUpload(res, uploadedFile, allowedImageTypes)) {
-		const filename = `category-${params.cid}${path.extname(uploadedFile.name)}`;
-		await uploadImage(filename, 'category', uploadedFile, req, res, next);
-	}
+	await validateUpload(uploadedFile, allowedImageTypes);
+	const filename = `category-${params.cid}${path.extname(uploadedFile.name)}`;
+	const storedFile = await uploadImage(filename, 'category', uploadedFile, req);
+	await categories.setCategoryField(params.cid, 'backgroundImageUpdatedAt', Date.now());
+	res.json([storedFile]);
 };
 
-uploadsController.uploadFavicon = async function (req, res, next) {
-	const uploadedFile = req.files.files[0];
+uploadsController.uploadFavicon = async function (req, res) {
+	const uploadedFile = req.files[0];
 	const allowedTypes = ['image/x-icon', 'image/vnd.microsoft.icon'];
 
-	if (validateUpload(res, uploadedFile, allowedTypes)) {
-		try {
-			const imageObj = await file.saveFileToLocal('favicon.ico', 'system', uploadedFile.path);
-			res.json([{ name: uploadedFile.name, url: imageObj.url }]);
-		} catch (err) {
-			next(err);
-		} finally {
-			file.delete(uploadedFile.path);
-		}
-	}
+	await validateUpload(uploadedFile, allowedTypes);
+	const filename = 'favicon' + path.extname(uploadedFile.name);
+	const storedFile = await uploadImage(filename, 'system', uploadedFile, req);
+	await meta.configs.set('brand:favicon:updatedAt', Date.now());
+	res.json([storedFile]);
 };
 
-uploadsController.uploadTouchIcon = async function (req, res, next) {
-	const uploadedFile = req.files.files[0];
+uploadsController.uploadTouchIcon = async function (req, res) {
+	const uploadedFile = req.files[0];
 	const allowedTypes = ['image/png'];
 	const sizes = [36, 48, 72, 96, 144, 192, 512];
 
-	if (validateUpload(res, uploadedFile, allowedTypes)) {
-		try {
-			const imageObj = await file.saveFileToLocal('touchicon-orig.png', 'system', uploadedFile.path);
-			// Resize the image into squares for use as touch icons at various DPIs
-			for (const size of sizes) {
-				/* eslint-disable no-await-in-loop */
-				await image.resizeImage({
-					path: uploadedFile.path,
-					target: path.join(nconf.get('upload_path'), 'system', `touchicon-${size}.png`),
-					width: size,
-					height: size,
-				});
-			}
-			res.json([{ name: uploadedFile.name, url: imageObj.url }]);
-		} catch (err) {
-			next(err);
-		} finally {
-			file.delete(uploadedFile.path);
-		}
+	await validateUpload(uploadedFile, allowedTypes);
+
+	const imageObj = await file.saveFileToLocal('touchicon-orig.png', 'system', uploadedFile.path);
+	// Resize the image into squares for use as touch icons at various DPIs
+	for (const size of sizes) {
+		/* eslint-disable no-await-in-loop */
+		await image.resizeImage({
+			path: uploadedFile.path,
+			target: path.join(nconf.get('upload_path'), 'system', `touchicon-${size}.png`),
+			width: size,
+			height: size,
+		});
 	}
+	await meta.configs.set('brand:touchIcon:updatedAt', Date.now());
+	res.json([{ name: uploadedFile.name, url: imageObj.url }]);
 };
 
-
-uploadsController.uploadMaskableIcon = async function (req, res, next) {
-	const uploadedFile = req.files.files[0];
+uploadsController.uploadMaskableIcon = async function (req, res) {
+	const uploadedFile = req.files[0];
 	const allowedTypes = ['image/png'];
 
-	if (validateUpload(res, uploadedFile, allowedTypes)) {
-		try {
-			const imageObj = await file.saveFileToLocal('maskableicon-orig.png', 'system', uploadedFile.path);
-			res.json([{ name: uploadedFile.name, url: imageObj.url }]);
-		} catch (err) {
-			next(err);
-		} finally {
-			file.delete(uploadedFile.path);
-		}
-	}
+	await validateUpload(uploadedFile, allowedTypes);
+	const imageObj = await file.saveFileToLocal('maskableicon-orig.png', 'system', uploadedFile.path);
+	await meta.configs.set('brand:maskableIcon:updatedAt', Date.now());
+	res.json([{ name: uploadedFile.name, url: imageObj.url }]);
 };
 
-uploadsController.uploadLogo = async function (req, res, next) {
-	await upload('site-logo', req, res, next);
+uploadsController.uploadScreenshot = async function (req, res) {
+	const uploadedFile = req.files[0];
+	const allowedTypes = ['image/png', 'image/jpeg'];
+
+	await validateUpload(uploadedFile, allowedTypes);
+
+	const imageObj = await file.saveFileToLocal('screenshot.png', 'system', uploadedFile.path);
+	const { width, height } = await image.size(uploadedFile.path);
+	await meta.configs.setMultiple({
+		'brand:screenshot:updatedAt': Date.now(),
+		'brand:screenshot:width': width,
+		'brand:screenshot:height': height,
+	});
+	res.json([{ name: uploadedFile.name, url: imageObj.url }]);
 };
 
 uploadsController.uploadFile = async function (req, res, next) {
-	const uploadedFile = req.files.files[0];
+	const uploadedFile = req.files[0];
 	let params;
 	try {
 		params = JSON.parse(req.body.params);
 	} catch (e) {
-		file.delete(uploadedFile.path);
 		return next(new Error('[[error:invalid-json]]'));
 	}
 
-	try {
-		const data = await file.saveFileToLocal(uploadedFile.name, params.folder, uploadedFile.path);
-		res.json([{ url: data.url }]);
-	} catch (err) {
-		next(err);
-	} finally {
-		file.delete(uploadedFile.path);
+	const uploadPath = nconf.get('upload_path');
+	const targetFolder = path.join(uploadPath, params.folder || '');
+	if (!file.isPathInside(uploadPath, targetFolder) || !await file.exists(targetFolder)) {
+		return next(new Error('[[error:invalid-path]]'));
 	}
+
+	const data = await file.saveFileToLocal(uploadedFile.name, params.folder, uploadedFile.path);
+	res.json([{ url: data.url }]);
 };
 
-uploadsController.uploadDefaultAvatar = async function (req, res, next) {
-	await upload('avatar-default', req, res, next);
+uploadsController.uploadLogo = async function (req, res) {
+	const storedFile = await upload('site-logo', req);
+	await meta.configs.set('brand:logo:updatedAt', Date.now());
+	res.json([storedFile]);
 };
 
-uploadsController.uploadOgImage = async function (req, res, next) {
-	await upload('og:image', req, res, next);
+uploadsController.uploadDefaultAvatar = async function (req, res) {
+	const storedFile = await upload('avatar-default', req);
+	await meta.configs.set('defaultAvatar:updatedAt', Date.now());
+	res.json([storedFile]);
 };
 
-async function upload(name, req, res, next) {
-	const uploadedFile = req.files.files[0];
+uploadsController.uploadOgImage = async function (req, res) {
+	const storedFile = await upload('og:image', req);
+	await meta.configs.set('og:image:updatedAt', Date.now());
+	res.json([storedFile]);
+};
 
-	if (validateUpload(res, uploadedFile, allowedImageTypes)) {
-		const filename = name + path.extname(uploadedFile.name);
-		await uploadImage(filename, 'system', uploadedFile, req, res, next);
-	}
+async function upload(name, req) {
+	const uploadedFile = req.files[0];
+
+	await validateUpload(uploadedFile, allowedImageTypes);
+	const filename = name + path.extname(uploadedFile.name);
+	return await uploadImage(filename, 'system', uploadedFile, req);
 }
 
-function validateUpload(res, uploadedFile, allowedTypes) {
+async function validateUpload(uploadedFile, allowedTypes) {
 	if (!allowedTypes.includes(uploadedFile.type)) {
-		file.delete(uploadedFile.path);
-		res.json({ error: `[[error:invalid-image-type, ${allowedTypes.join('&#44; ')}]]` });
-		return false;
+		throw new Error(`[[error:invalid-image-type, ${uploadedFile.type}, ${allowedTypes.join('&#44; ')}]]`);
 	}
-
-	return true;
 }
 
-async function uploadImage(filename, folder, uploadedFile, req, res, next) {
+async function uploadImage(filename, folder, uploadedFile, req) {
 	let imageData;
-	try {
-		if (plugins.hooks.hasListeners('filter:uploadImage')) {
-			imageData = await plugins.hooks.fire('filter:uploadImage', { image: uploadedFile, uid: req.uid, folder: folder });
-		} else {
-			imageData = await file.saveFileToLocal(filename, folder, uploadedFile.path);
-		}
 
-		if (path.basename(filename, path.extname(filename)) === 'site-logo' && folder === 'system') {
-			const uploadPath = path.join(nconf.get('upload_path'), folder, 'site-logo-x50.png');
-			await image.resizeImage({
-				path: uploadedFile.path,
-				target: uploadPath,
-				height: 50,
-			});
-			await meta.configs.set('brand:emailLogo', path.join(nconf.get('upload_url'), 'system/site-logo-x50.png'));
-			const size = await image.size(uploadedFile.path);
-			await meta.configs.setMultiple({
-				'brand:logo:width': size.width,
-				'brand:logo:height': size.height,
-			});
-		} else if (path.basename(filename, path.extname(filename)) === 'og:image' && folder === 'system') {
-			const size = await image.size(uploadedFile.path);
-			await meta.configs.setMultiple({
-				'og:image:width': size.width,
-				'og:image:height': size.height,
-			});
-		}
-		res.json([{ name: uploadedFile.name, url: imageData.url.startsWith('http') ? imageData.url : nconf.get('relative_path') + imageData.url }]);
-	} catch (err) {
-		next(err);
-	} finally {
-		file.delete(uploadedFile.path);
+	if (plugins.hooks.hasListeners('filter:uploadImage')) {
+		imageData = await plugins.hooks.fire('filter:uploadImage', {
+			image: uploadedFile,
+			uid: req.uid,
+			folder: folder,
+		});
+	} else {
+		imageData = await file.saveFileToLocal(filename, folder, uploadedFile.path);
 	}
+
+	if (path.basename(filename, path.extname(filename)) === 'site-logo' && folder === 'system') {
+		const uploadPath = path.join(nconf.get('upload_path'), folder, 'site-logo-x50.png');
+		await image.resizeImage({
+			path: uploadedFile.path,
+			target: uploadPath,
+			height: 50,
+		});
+		await meta.configs.set('brand:emailLogo', path.join(nconf.get('upload_url'), 'system/site-logo-x50.png'));
+		const size = await image.size(uploadedFile.path);
+		await meta.configs.setMultiple({
+			'brand:logo:width': size.width,
+			'brand:logo:height': size.height,
+		});
+	} else if (path.basename(filename, path.extname(filename)) === 'og:image' && folder === 'system') {
+		const size = await image.size(uploadedFile.path);
+		await meta.configs.setMultiple({
+			'og:image:width': size.width,
+			'og:image:height': size.height,
+		});
+	}
+
+	return {
+		name: uploadedFile.name,
+		url: imageData.url.startsWith('http') ?
+			imageData.url :
+			nconf.get('relative_path') + imageData.url,
+	};
 }

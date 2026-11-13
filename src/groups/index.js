@@ -3,7 +3,9 @@
 const user = require('../user');
 const db = require('../database');
 const plugins = require('../plugins');
+const privileges = require('../privileges');
 const slugify = require('../slugify');
+const cache = require('../cache');
 
 const Groups = module.exports;
 
@@ -24,7 +26,7 @@ require('./cache')(Groups);
 
 Groups.BANNED_USERS = 'banned-users';
 
-Groups.ephemeralGroups = ['guests', 'spiders'];
+Groups.ephemeralGroups = ['guests', 'spiders', 'fediverse'];
 
 Groups.systemGroups = [
 	'registered-users',
@@ -55,7 +57,7 @@ Groups.removeEphemeralGroups = function (groups) {
 	return groups;
 };
 
-const isPrivilegeGroupRegex = /^cid:\d+:privileges:[\w\-:]+$/;
+const isPrivilegeGroupRegex = /^cid:(?:-?\d+|admin):privileges:[\w\-:]+$/;
 Groups.isPrivilegeGroup = function (groupName) {
 	return isPrivilegeGroupRegex.test(groupName);
 };
@@ -75,20 +77,45 @@ Groups.getGroupsFromSet = async function (set, start, stop) {
 };
 
 Groups.getGroupsBySort = async function (sort, start, stop) {
+	return await Groups.getGroupsFromSet(sortToSet(sort), start, stop);
+};
+
+Groups.getGroupCountBySort = async function (sort) {
+	return await db.sortedSetCard(sortToSet(sort));
+};
+
+function sortToSet(sort) {
 	let set = 'groups:visible:name';
 	if (sort === 'count') {
 		set = 'groups:visible:memberCount';
 	} else if (sort === 'date') {
 		set = 'groups:visible:createtime';
 	}
-	return await Groups.getGroupsFromSet(set, start, stop);
-};
+	return set;
+}
 
-Groups.getNonPrivilegeGroups = async function (set, start, stop) {
-	let groupNames = await db.getSortedSetRevRange(set, start, stop);
-	groupNames = groupNames.concat(Groups.ephemeralGroups).filter(groupName => !Groups.isPrivilegeGroup(groupName));
+Groups.getNonPrivilegeGroups = async function (set, start, stop, flags) {
+	if (!flags) {
+		flags = {
+			ephemeral: true,
+		};
+	}
+	const useCache = set === 'groups:createtime' && parseInt(start, 10) === 0 && parseInt(stop, 10) === -1;
+	let groupNames = useCache ?
+		await Groups.getAllGroupNames('groups:createtime') :
+		await db.getSortedSetRevRange(set, start, stop);
+	groupNames = groupNames.filter(groupName => !Groups.isPrivilegeGroup(groupName));
+	if (flags.ephemeral) {
+		groupNames = groupNames.concat(Groups.ephemeralGroups);
+	}
+
 	const groupsData = await Groups.getGroupsData(groupNames);
 	return groupsData.filter(Boolean);
+};
+
+Groups.getAllGroupNames = async function (set) {
+	const names = await cache.get(`zset:${set}`, () => db.getSortedSetRevRange(set, 0, -1));
+	return [...names];
 };
 
 Groups.getGroups = async function (set, start, stop) {
@@ -98,7 +125,7 @@ Groups.getGroups = async function (set, start, stop) {
 Groups.getGroupsAndMembers = async function (groupNames) {
 	const [groups, members] = await Promise.all([
 		Groups.getGroupsData(groupNames),
-		Groups.getMemberUsers(groupNames, 0, 3),
+		Groups.getMemberUsers(groupNames, 0, 9),
 	]);
 	groups.forEach((group, index) => {
 		if (group) {
@@ -120,30 +147,34 @@ Groups.get = async function (groupName, options) {
 		stop = (parseInt(options.userListCount, 10) || 4) - 1;
 	}
 
-	const [groupData, members, pending, invited, isMember, isPending, isInvited, isOwner] = await Promise.all([
+	const [groupData, members, isMember, isPending, isInvited, isOwner, isAdmin, isGlobalMod] = await Promise.all([
 		Groups.getGroupData(groupName),
 		Groups.getOwnersAndMembers(groupName, options.uid, 0, stop),
-		Groups.getUsersFromSet(`group:${groupName}:pending`, ['username', 'userslug', 'picture']),
-		Groups.getUsersFromSet(`group:${groupName}:invited`, ['username', 'userslug', 'picture']),
 		Groups.isMember(options.uid, groupName),
 		Groups.isPending(options.uid, groupName),
 		Groups.isInvited(options.uid, groupName),
 		Groups.ownership.isOwner(options.uid, groupName),
+		privileges.admin.can('admin:groups', options.uid),
+		user.isGlobalModerator(options.uid),
 	]);
 
 	if (!groupData) {
 		return null;
 	}
-	const descriptionParsed = await plugins.hooks.fire('filter:parse.raw', String(groupData.description || ''));
-	groupData.descriptionParsed = descriptionParsed;
+
+	groupData.isOwner = isOwner || isAdmin || (isGlobalMod && !groupData.system);
+	if (groupData.isOwner) {
+		([groupData.pending, groupData.invited] = await Promise.all([
+			Groups.getPending(groupName),
+			Groups.getInvites(groupName),
+		]));
+	}
+
 	groupData.members = members;
 	groupData.membersNextStart = stop + 1;
-	groupData.pending = pending.filter(Boolean);
-	groupData.invited = invited.filter(Boolean);
 	groupData.isMember = isMember;
 	groupData.isPending = isPending;
 	groupData.isInvited = isInvited;
-	groupData.isOwner = isOwner;
 	const results = await plugins.hooks.fire('filter:group.get', { group: groupData });
 	return results.group;
 };

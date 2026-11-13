@@ -2,12 +2,15 @@
 
 const db = require('../database');
 const user = require('../user');
+const activitypub = require('../activitypub');
+const utils = require('../utils');
 
 module.exports = function (Categories) {
 	Categories.watchStates = {
 		ignoring: 1,
 		notwatching: 2,
-		watching: 3,
+		tracking: 3,
+		watching: 4,
 	};
 
 	Categories.isIgnored = async function (cids, uid) {
@@ -19,7 +22,7 @@ module.exports = function (Categories) {
 	};
 
 	Categories.getWatchState = async function (cids, uid) {
-		if (!(parseInt(uid, 10) > 0)) {
+		if (!activitypub.helpers.isUri(uid) && !(parseInt(uid, 10) > 0)) {
 			return cids.map(() => Categories.watchStates.notwatching);
 		}
 		if (!Array.isArray(cids) || !cids.length) {
@@ -27,10 +30,14 @@ module.exports = function (Categories) {
 		}
 		const keys = cids.map(cid => `cid:${cid}:uid:watch:state`);
 		const [userSettings, states] = await Promise.all([
-			user.getSettings(uid),
+			utils.isNumber(uid) ? user.getSettings(uid) : { categoryWatchState: 0 },
 			db.sortedSetsScore(keys, uid),
 		]);
-		return states.map(state => state || Categories.watchStates[userSettings.categoryWatchState]);
+
+		const fallbacks = cids.map(cid => (utils.isNumber(cid) ?
+			Categories.watchStates[userSettings.categoryWatchState] : Categories.watchStates.notwatching));
+
+		return states.map((state, idx) => state || fallbacks[idx]);
 	};
 
 	Categories.getIgnorers = async function (cid, start, stop) {

@@ -1,15 +1,13 @@
 'use strict';
 
 
-define('share', function () {
-	var module = {};
+define('share', ['hooks', 'translator'], function (hooks, translator) {
+	const share = {};
 
-	module.addShareHandlers = function (name) {
-		var baseUrl = window.location.protocol + '//' + window.location.host;
-
+	share.addShareHandlers = function (name) {
 		function openShare(url, urlToPost, width, height) {
-			window.open(url + encodeURIComponent(baseUrl + config.relative_path + urlToPost), '_blank', 'width=' + width + ',height=' + height + ',scrollbars=no,status=no');
-			$(window).trigger('action:share.open', {
+			window.open(url, '_blank', 'width=' + width + ',height=' + height + ',scrollbars=no,status=no');
+			hooks.fire('action:share.open', {
 				url: url,
 				urlToPost: urlToPost,
 			});
@@ -17,8 +15,8 @@ define('share', function () {
 		}
 
 		$('#content').off('shown.bs.dropdown', '.share-dropdown').on('shown.bs.dropdown', '.share-dropdown', function () {
-			var postLink = $(this).find('.post-link');
-			postLink.val(baseUrl + getPostUrl($(this)));
+			const postLink = $(this).find('.post-link');
+			postLink.val(getPostUrl($(this)));
 
 			// without the setTimeout can't select the text in the input
 			setTimeout(function () {
@@ -32,18 +30,55 @@ define('share', function () {
 		});
 
 		addHandler('[component="share/twitter"]', function () {
-			return openShare('https://twitter.com/intent/tweet?text=' + encodeURIComponent(name) + '&url=', getPostUrl($(this)), 550, 420);
+			const postUrl = getPostUrl($(this));
+			const twitter_url = `https://twitter.com/intent/tweet?text=${encodeURIComponent(name)}&url=${encodeURIComponent(postUrl)}`;
+			return openShare(twitter_url, postUrl, 550, 420);
 		});
 
 		addHandler('[component="share/facebook"]', function () {
-			return openShare('https://www.facebook.com/sharer/sharer.php?u=', getPostUrl($(this)), 626, 436);
+			const postUrl = getPostUrl($(this));
+			const facebook_url = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(postUrl)}`;
+			return openShare(facebook_url, postUrl, 626, 436);
 		});
 
-		addHandler('[component="share/google"]', function () {
-			return openShare('https://plus.google.com/share?url=', getPostUrl($(this)), 500, 570);
+		addHandler('[component="share/whatsapp"]', function () {
+			const postUrl = getPostUrl($(this));
+			const message = encodeURIComponent(name) + ' - ' + encodeURIComponent(postUrl);
+			const whatsapp_url = config.useragent.isMobile ?
+				`whatsapp://send?text=${message}` :
+				`https://wa.me/?text=${message}`;
+			return openShare(whatsapp_url, postUrl, 626, 436);
 		});
 
-		$(window).trigger('action:share.addHandlers', { openShare: openShare });
+		addHandler('[component="share/telegram"]', function () {
+			const postUrl = getPostUrl($(this));
+			const telegram_url = `https://t.me/share/url?text=${encodeURIComponent(name)}&url=${encodeURIComponent(postUrl)}`;
+			return openShare(telegram_url, postUrl, 626, 436);
+		});
+
+		addHandler('[component="share/linkedin"]', function () {
+			const postUrl = getPostUrl($(this));
+			const linkedin_url = `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(postUrl)}`;
+			return openShare(linkedin_url, postUrl, 626, 436);
+		});
+
+		addHandler('[component="share/mastodon"]', function () {
+			const postUrl = getPostUrl($(this));
+			const mastodon_url = `https://share.joinmastodon.org/#text=${encodeURIComponent(postUrl)}`;
+			return openShare(mastodon_url, postUrl, 626, 760);
+		});
+
+		addHandler('[component="share/email"]', async function () {
+			const postUrl = getPostUrl($(this));
+			const [subject, body] = await translator.translateKeys([
+				translator.compile('topic:share-mail-subject', config.siteTitle),
+				translator.compile('topic:share-mail-body', postUrl),
+			]);
+			const mailtoUrl = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+			window.location.href = mailtoUrl;
+		});
+
+		hooks.fire('action:share.addHandlers', { openShare: openShare });
 	};
 
 	function addHandler(selector, callback) {
@@ -51,9 +86,11 @@ define('share', function () {
 	}
 
 	function getPostUrl(clickedElement) {
-		var pid = parseInt(clickedElement.parents('[data-pid]').attr('data-pid'), 10);
-		return '/post' + (pid ? '/' + (pid) : '');
+		const pid = clickedElement.parents('[data-pid]').attr('data-pid');
+		return pid ?
+			`${config.url}/post/${pid}` :
+			window.location.href;
 	}
 
-	return module;
+	return share;
 });

@@ -10,22 +10,22 @@
 */
 
 define('scrollStop', function () {
-	var Module = {};
+	const ScrollStop = {};
 
-	Module.apply = function (element) {
+	ScrollStop.apply = function (element) {
 		$(element).on('mousewheel', function (e) {
-			var scrollTop = this.scrollTop;
-			var scrollHeight = this.scrollHeight;
-			var elementHeight = Math.round(this.getBoundingClientRect().height);
+			const scrollTop = this.scrollTop;
+			const scrollHeight = this.scrollHeight;
+			const elementHeight = Math.round(this.getBoundingClientRect().height);
 
 			if (
 				(e.originalEvent.deltaY < 0 && scrollTop === 0) || // scroll up
-				(e.originalEvent.deltaY > 0 && (elementHeight + scrollTop) >= scrollHeight)	// scroll down
+				(e.originalEvent.deltaY > 0 && (elementHeight + scrollTop) >= scrollHeight) // scroll down
 			) {
 				return false;
 			}
 		});
 	};
 
-	return Module;
+	return ScrollStop;
 });

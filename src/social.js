@@ -1,7 +1,9 @@
 'use strict';
 
+const _ = require('lodash');
 const plugins = require('./plugins');
 const db = require('./database');
+const meta = require('./meta');
 
 const social = module.exports;
 
@@ -9,29 +11,53 @@ social.postSharing = null;
 
 social.getPostSharing = async function () {
 	if (social.postSharing) {
-		return social.postSharing;
+		return _.cloneDeep(social.postSharing);
 	}
 
 	let networks = [
 		{
 			id: 'facebook',
 			name: 'Facebook',
-			class: 'fa-facebook',
+			class: 'fa-brands fa-facebook',
 		},
 		{
 			id: 'twitter',
-			name: 'Twitter',
-			class: 'fa-twitter',
+			name: 'X (Twitter)',
+			class: 'fa-brands fa-x-twitter',
+		},
+		{
+			id: 'whatsapp',
+			name: 'Whatsapp',
+			class: 'fa-brands fa-whatsapp',
+		},
+		{
+			id: 'telegram',
+			name: 'Telegram',
+			class: 'fa-brands fa-telegram',
+		},
+		{
+			id: 'linkedin',
+			name: 'LinkedIn',
+			class: 'fa-brands fa-linkedin',
+		},
+		{
+			id: 'mastodon',
+			name: 'Mastodon',
+			class: 'fa-brands fa-mastodon',
+		},
+		{
+			id: 'email',
+			name: 'Email',
+			class: 'fa-regular fa-envelope',
 		},
 	];
 	networks = await plugins.hooks.fire('filter:social.posts', networks);
-	const activated = await db.getSetMembers('social:posts.activated');
 	networks.forEach((network) => {
-		network.activated = activated.includes(network.id);
+		network.activated = parseInt(meta.config[`post-sharing-${network.id}`], 10) === 1;
 	});
 
 	social.postSharing = networks;
-	return networks;
+	return _.cloneDeep(networks);
 };
 
 social.getActivePostSharing = async function () {
@@ -40,12 +66,16 @@ social.getActivePostSharing = async function () {
 };
 
 social.setActivePostSharingNetworks = async function (networkIDs) {
-	await db.delete('social:posts.activated');
+	// keeping for 1.0.0 upgrade script that uses this function
+	social.postSharing = null;
 	if (!networkIDs.length) {
 		return;
 	}
-	await db.setAdd('social:posts.activated', networkIDs);
-	social.postSharing = null;
+	const data = {};
+	networkIDs.forEach((id) => {
+		data[`post-sharing-${id}`] = 1;
+	});
+	await db.setObject('config', data);
 };
 
 require('./promisify')(social);

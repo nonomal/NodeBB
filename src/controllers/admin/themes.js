@@ -4,13 +4,16 @@ const path = require('path');
 const fs = require('fs');
 
 const file = require('../../file');
-const { paths } = require('../../constants');
+const { paths, themeNamePattern } = require('../../constants');
 
 const themesController = module.exports;
 
 const defaultScreenshotPath = path.join(__dirname, '../../../public/images/themes/default.png');
 
-themesController.get = async function (req, res, next) {
+themesController.get = async function (req, res) {
+	if (!themeNamePattern.test(req.params.theme)) {
+		throw new Error('[[error:invalid-data]]');
+	}
 	const themeDir = path.join(paths.nodeModules, req.params.theme);
 	const themeConfigPath = path.join(themeDir, 'theme.json');
 
@@ -20,12 +23,18 @@ themesController.get = async function (req, res, next) {
 		themeConfig = JSON.parse(themeConfig);
 	} catch (err) {
 		if (err.code === 'ENOENT') {
-			return next(Error('invalid-data'));
+			throw new Error('[[error:invalid-data]]');
 		}
-		return next(err);
+		throw err;
 	}
 
-	const screenshotPath = themeConfig.screenshot ? path.join(themeDir, themeConfig.screenshot) : defaultScreenshotPath;
-	const exists = await file.exists(screenshotPath);
+	const screenshotPath = themeConfig.screenshot ?
+		path.join(themeDir, themeConfig.screenshot) :
+		'';
+
+	if (screenshotPath && !screenshotPath.startsWith(themeDir)) {
+		throw new Error('[[error:invalid-path]]');
+	}
+	const exists = screenshotPath ? await file.exists(screenshotPath) : false;
 	res.sendFile(exists ? screenshotPath : defaultScreenshotPath);
 };

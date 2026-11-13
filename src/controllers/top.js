@@ -2,7 +2,6 @@
 'use strict';
 
 const nconf = require('nconf');
-const validator = require('validator');
 
 const helpers = require('./helpers');
 const recentController = require('./recent');
@@ -19,10 +18,13 @@ topController.get = async function (req, res, next) {
 		data.title = `[[pages:top-${term}]]`;
 	}
 
-	const feedQs = data.rssFeedUrl.split('?')[1];
-	data.rssFeedUrl = `${nconf.get('relative_path')}/top/${validator.escape(String(req.query.term || 'alltime'))}.rss`;
-	if (req.loggedIn) {
-		data.rssFeedUrl += `?${feedQs}`;
+	if (!data['feeds:disableRSS'] && data.rssFeedUrl) {
+		const feedQs = data.rssFeedUrl.split('?')[1];
+		data.rssFeedUrl = `${nconf.get('relative_path')}/top/${(req.query.term || 'alltime')}.rss`;
+		if (req.loggedIn) {
+			data.rssFeedUrl += `?${feedQs}`;
+		}
 	}
+
 	res.render('top', data);
 };

@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const nconf = require('nconf');
 const winston = require('winston');
 const _ = require('lodash');
@@ -28,7 +29,21 @@ connection.getConnectionOptions = function (postgres) {
 		password: postgres.password,
 		database: postgres.database,
 		ssl: String(postgres.ssl) === 'true',
+		max: 20,
+		connectionTimeoutMillis: 90000,
 	};
+
+	if (typeof postgres.ssl === 'object' && !Array.isArray(postgres.ssl) && postgres.ssl !== null) {
+		const { ssl } = postgres;
+		connOptions.ssl = {
+			rejectUnauthorized: ssl.rejectUnauthorized,
+		};
+		['ca', 'key', 'cert'].forEach((prop) => {
+			if (ssl.hasOwnProperty(prop)) {
+				connOptions.ssl[prop] = fs.readFileSync(ssl[prop]).toString();
+			}
+		});
+	}
 
 	return _.merge(connOptions, postgres.options || {});
 };

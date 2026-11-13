@@ -5,6 +5,7 @@ const _ = require('lodash');
 
 const db = require('../database');
 const plugins = require('../plugins');
+const meta = require('../meta');
 const privileges = require('../privileges');
 const utils = require('../utils');
 const slugify = require('../slugify');
@@ -20,15 +21,16 @@ module.exports = function (Categories) {
 
 		data.name = String(data.name || `Category ${cid}`);
 		const slug = `${cid}/${slugify(data.name)}`;
+		const handle = await Categories.generateHandle(slugify(data.name));
 		const smallestOrder = firstChild.length ? firstChild[0].score - 1 : 1;
-		const order = data.order || smallestOrder;	// If no order provided, place it at the top
+		const order = data.order || smallestOrder; // If no order provided, place it at the top
 		const colours = Categories.assignColours();
 
 		let category = {
 			cid: cid,
 			name: data.name,
+			handle,
 			description: data.description ? data.description : '',
-			descriptionParsed: data.descriptionParsed ? data.descriptionParsed : '',
 			icon: data.icon ? data.icon : '',
 			bgColor: data.bgColor || colours[0],
 			color: data.color || colours[1],
@@ -40,7 +42,7 @@ module.exports = function (Categories) {
 			order: order,
 			link: data.link || '',
 			numRecentReplies: 1,
-			class: (data.class ? data.class : 'col-md-3 col-xs-6'),
+			class: (data.class ? data.class : 'col-md-3 col-6'),
 			imageClass: 'cover',
 			isSection: 0,
 			subCategoriesPerPage: 10,
@@ -56,6 +58,7 @@ module.exports = function (Categories) {
 			'groups:topics:read',
 			'groups:topics:create',
 			'groups:topics:reply',
+			'groups:topics:crosspost',
 			'groups:topics:tag',
 			'groups:posts:edit',
 			'groups:posts:history',
@@ -81,25 +84,20 @@ module.exports = function (Categories) {
 		category = result.category;
 
 		await db.setObject(`category:${category.cid}`, category);
-		if (!category.descriptionParsed) {
-			await Categories.parseDescription(category.cid, category.description);
-		}
-
 		await db.sortedSetAddBulk([
 			['categories:cid', category.order, category.cid],
 			[`cid:${parentCid}:children`, category.order, category.cid],
-			['categories:name', 0, `${data.name.substr(0, 200).toLowerCase()}:${category.cid}`],
+			['categories:name', 0, `${data.name.slice(0, 200).toLowerCase()}:${category.cid}`],
+			['categoryhandle:cid', cid, handle],
 		]);
 
-		await privileges.categories.give(result.defaultPrivileges, category.cid, 'registered-users');
+		await privileges.categories.give(result.defaultPrivileges, category.cid, ['registered-users', 'fediverse']);
 		await privileges.categories.give(result.modPrivileges, category.cid, ['administrators', 'Global Moderators']);
 		await privileges.categories.give(result.guestPrivileges, category.cid, ['guests', 'spiders']);
 
-		cache.del([
-			'categories:cid',
-			`cid:${parentCid}:children`,
-			`cid:${parentCid}:children:all`,
-		]);
+		cache.del('categories:cid');
+		await Categories.clearParentCategoryCache(parentCid);
+
 		if (data.cloneFromCid && parseInt(data.cloneFromCid, 10)) {
 			category = await Categories.copySettingsFrom(data.cloneFromCid, category.cid, !data.parentCid);
 		}
@@ -110,6 +108,22 @@ module.exports = function (Categories) {
 
 		plugins.hooks.fire('action:category.create', { category: category });
 		return category;
+	};
+
+	Categories.clearParentCategoryCache = async function (parentCid) {
+		while (parentCid || parseInt(parentCid, 10) === 0) {
+			cache.del([
+				`cid:${parentCid}:children`,
+				`cid:${parentCid}:children:all`,
+			]);
+
+			if (parseInt(parentCid, 10) === 0) {
+				return;
+			}
+			// clear all the way to root
+			// eslint-disable-next-line no-await-in-loop
+			parentCid = await Categories.getCategoryField(parentCid, 'parentCid');
+		}
 	};
 
 	async function duplicateCategoriesChildren(parentCid, cid, uid) {
@@ -132,10 +146,31 @@ module.exports = function (Categories) {
 		await async.each(children, Categories.create);
 	}
 
+	async function generateHandle(slug) {
+		let taken;
+		try {
+			taken = await meta.slugTaken(slug);
+		} catch (e) {
+			// invalid slug passed in
+			slug = 'category';
+			taken = true;
+		}
+
+		let suffix;
+		while (taken) {
+			suffix = utils.generateUUID().slice(0, 8);
+			// eslint-disable-next-line no-await-in-loop
+			taken = await meta.slugTaken(`${slug}-${suffix}`);
+		}
+
+		return `${slug}${suffix ? `-${suffix}` : ''}`;
+	}
+	Categories.generateHandle = generateHandle; // exported for upgrade script (4.0.0)
+
 	Categories.assignColours = function () {
 		const backgrounds = ['#AB4642', '#DC9656', '#F7CA88', '#A1B56C', '#86C1B9', '#7CAFC2', '#BA8BAF', '#A16946'];
 		const text = ['#ffffff', '#ffffff', '#333333', '#ffffff', '#333333', '#ffffff', '#ffffff', '#ffffff'];
-		const index = Math.floor(Math.random() * backgrounds.length);
+		const index = utils.secureRandom(0, backgrounds.length - 1);
 		return [backgrounds[index], text[index]];
 	};
 
@@ -148,17 +183,13 @@ module.exports = function (Categories) {
 			throw new Error('[[error:invalid-cid]]');
 		}
 
-		const oldParent = parseInt(destination.parentCid, 10) || 0;
-		const newParent = parseInt(source.parentCid, 10) || 0;
-		if (copyParent && newParent !== parseInt(toCid, 10)) {
+		const oldParent = String(destination.parentCid || 0);
+		const newParent = String(source.parentCid || 0);
+		if (copyParent && newParent !== String(toCid)) {
 			await db.sortedSetRemove(`cid:${oldParent}:children`, toCid);
 			await db.sortedSetAdd(`cid:${newParent}:children`, source.order, toCid);
-			cache.del([
-				`cid:${oldParent}:children`,
-				`cid:${oldParent}:children:all`,
-				`cid:${newParent}:children`,
-				`cid:${newParent}:children:all`,
-			]);
+			await Categories.clearParentCategoryCache(oldParent);
+			await Categories.clearParentCategoryCache(newParent);
 		}
 
 		destination.description = source.description;
@@ -199,13 +230,24 @@ module.exports = function (Categories) {
 		cache.del(`cid:${toCid}:tag:whitelist`);
 	}
 
-	Categories.copyPrivilegesFrom = async function (fromCid, toCid, group) {
+	Categories.copyPrivilegesFrom = async function (fromCid, toCid, group, filter) {
+		// Guard against a non-numeric source (e.g. the "all categories" pseudo-cid). Its
+		// privilege sets do not exist, so every privilege held by the target would be treated
+		// as "not in source" and rescinded — turning a copy into a bulk revoke.
+		if (!utils.isNumber(fromCid) || !utils.isNumber(toCid)) {
+			throw new Error('[[error:invalid-data]]');
+		}
 		group = group || '';
+		let privsToCopy = privileges.categories.getPrivilegesByFilter(filter);
+
+		if (group) {
+			privsToCopy = privsToCopy.map(priv => `groups:${priv}`);
+		} else {
+			privsToCopy = privsToCopy.concat(privsToCopy.map(priv => `groups:${priv}`));
+		}
 
 		const data = await plugins.hooks.fire('filter:categories.copyPrivilegesFrom', {
-			privileges: group ?
-				privileges.categories.groupPrivilegeList.slice() :
-				privileges.categories.privilegeList.slice(),
+			privileges: privsToCopy,
 			fromCid: fromCid,
 			toCid: toCid,
 			group: group,

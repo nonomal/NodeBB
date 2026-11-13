@@ -5,7 +5,7 @@
 	"uptime-seconds": "运行秒数",
 	"uptime-days": "运行天数",
 
-	"mongo": "Mongo",
+	"mongo": "MongoDB",
 	"mongo.version": "MongoDB 版本",
 	"mongo.storage-engine": "存储引擎",
 	"mongo.collections": "集合",
@@ -22,7 +22,7 @@
 	"mongo.bytes-out": "字节输出",
 	"mongo.num-requests": "请求数量",
 	"mongo.raw-info": "MongoDB 原始信息",
-	"mongo.unauthorized": "NodeBB无法从MongoDB数据库请求相应的统计信息。请确保NodeBB使用的用户含有&quot;admin&quot;数据库的&quot;clusterMonitor&quot;角色。",
+	"mongo.unauthorized": "NodeBB 无法查询 MongoDB 数据库以获取相关统计信息。请确保 NodeBB 使用的用户在 &quot;admin&quot; 数据库中具有 &quot;clusterMonitor&quot; 角色。",
 
 	"redis": "Redis",
 	"redis.version": "Redis 版本",

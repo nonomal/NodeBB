@@ -1,14 +1,18 @@
 'use strict';
 
 
-define('flags', ['hooks', 'components', 'api'], function (hooks, components, api) {
-	var Flag = {};
-	var flagModal;
-	var flagCommit;
-	var flagReason;
+define('flags', ['hooks', 'components', 'api', 'alerts'], function (hooks, components, api, alerts) {
+	const Flag = {};
+	let flagModal;
+	let flagCommit;
+	let flagReason;
+	let currentData = {};
 
 	Flag.showFlagModal = function (data) {
-		app.parseAndTranslate('partials/modals/flag_modal', data, function (html) {
+		currentData = data;
+		data.remote = data.id && URL.canParse(data.id) ? new URL(data.id).hostname : false;
+
+		app.parseAndTranslate('modals/flag', data, function (html) {
 			flagModal = html;
 			flagModal.on('hidden.bs.modal', function () {
 				flagModal.remove();
@@ -17,41 +21,39 @@ define('flags', ['hooks', 'components', 'api'], function (hooks, components, api
 			flagCommit = flagModal.find('#flag-post-commit');
 			flagReason = flagModal.find('#flag-reason-custom');
 
-			// Quick-report buttons
-			flagModal.on('click', '.flag-reason', function () {
-				var reportText = $(this).text();
-
-				if (flagReason.val().length === 0) {
-					return createFlag(data.type, data.id, reportText);
+			flagModal.on('click', 'input[name="flag-reason"]', function () {
+				if ($(this).attr('id') === 'flag-reason-other') {
+					flagReason.removeAttr('disabled');
+					if (!flagReason.val().length) {
+						flagCommit.attr('disabled', true);
+					}
+				} else {
+					flagReason.attr('disabled', true);
+					flagCommit.removeAttr('disabled');
 				}
-
-				// Custom reason has text, confirm submission
-				bootbox.confirm({
-					title: '[[flags:modal-submit-confirm]]',
-					message: '<p>[[flags:modal-submit-confirm-text]]</p><p class="help-block">[[flags:modal-submit-confirm-text-help]]</p>',
-					callback: function (result) {
-						if (result) {
-							createFlag(data.type, data.id, reportText);
-						}
-					},
-				});
 			});
 
-			// Custom reason report submission
 			flagCommit.on('click', function () {
-				createFlag(data.type, data.id, flagModal.find('#flag-reason-custom').val());
+				const selected = $('input[name="flag-reason"]:checked');
+				let reason = selected.val();
+				if (selected.attr('id') === 'flag-reason-other') {
+					reason = flagReason.val();
+				}
+				const notifyRemote = $('input[name="flag-notify-remote"]').is(':checked');
+				createFlag(currentData.type, currentData.id, reason, notifyRemote);
 			});
 
-			flagModal.on('click', '.toggle-custom', function () {
-				flagReason.prop('disabled', false);
+			flagModal.on('click', '#flag-reason-other', function () {
 				flagReason.focus();
 			});
 
+
 			flagModal.modal('show');
-			$(window).trigger('action:flag.showModal', {
+			hooks.fire('action:flag.showModal', {
 				modalEl: flagModal,
 				type: data.type,
 				id: data.id,
+				remote: data.remote,
 			});
 
 			flagModal.find('#flag-reason-custom').on('keyup blur change', checkFlagButtonEnable);
@@ -62,29 +64,49 @@ define('flags', ['hooks', 'components', 'api'], function (hooks, components, api
 		api.put(`/flags/${flagId}`, {
 			state: 'resolved',
 		}).then(() => {
-			app.alertSuccess('[[flags:resolved]]');
+			alerts.success('[[flags:resolved]]');
 			hooks.fire('action:flag.resolved', { flagId: flagId });
-		}).catch(app.alertError);
+		}).catch(alerts.error);
 	};
 
-	function createFlag(type, id, reason) {
+
+	Flag.rescind = function (flagId) {
+		api.del(`/flags/${flagId}/report`).then(() => {
+			alerts.success('[[flags:report-rescinded]]');
+			hooks.fire('action:flag.rescinded', { flagId: flagId });
+		}).catch(alerts.error);
+	};
+
+	Flag.purge = function (flagId) {
+		api.del(`/flags/${flagId}`).then(() => {
+			alerts.success('[[flags:purged]]');
+			hooks.fire('action:flag.purged', { flagId: flagId });
+		}).catch(alerts.error);
+	};
+
+	function createFlag(type, id, reason, notifyRemote = false) {
 		if (!type || !id || !reason) {
 			return;
 		}
-		var data = { type: type, id: id, reason: reason };
+		const data = { type: type, id: id, reason: reason, notifyRemote: notifyRemote, roomId: currentData.roomId };
 		api.post('/flags', data, function (err, flagId) {
 			if (err) {
-				return app.alertError(err.message);
+				return alerts.error(err);
 			}
 
 			flagModal.modal('hide');
-			app.alertSuccess('[[flags:modal-submit-success]]');
+			alerts.success('[[flags:modal-submit-success]]');
 			if (type === 'post') {
-				var postEl = components.get('post', 'pid', id);
+				const postEl = components.get('post', 'pid', id);
 				postEl.find('[component="post/flag"]').addClass('hidden').parent().attr('hidden', '');
 				postEl.find('[component="post/already-flagged"]').removeClass('hidden').parent().attr('hidden', null);
+			} else if (type === 'message') {
+				const msgEl = components.get('chat/message', id);
+				if (msgEl.length) {
+					msgEl.find('[data-action="flag"]').closest('li').addClass('hidden');
+				}
 			}
-			$(window).trigger('action:flag.create', { flagId: flagId, data: data });
+			hooks.fire('action:flag.create', { flagId: flagId, data: data });
 		});
 	}
 

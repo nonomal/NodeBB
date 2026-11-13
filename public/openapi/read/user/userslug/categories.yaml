@@ -42,6 +42,8 @@ get:
                           type: string
                         bgColor:
                           type: string
+                        backgroundImage:
+                          type: string
                         descriptionParsed:
                           type: string
                         depth:
@@ -51,6 +53,8 @@ get:
                         isIgnored:
                           type: boolean
                         isWatched:
+                          type: boolean
+                        isTracked:
                           type: boolean
                         isNotWatched:
                           type: boolean

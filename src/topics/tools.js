@@ -8,6 +8,7 @@ const categories = require('../categories');
 const user = require('../user');
 const plugins = require('../plugins');
 const privileges = require('../privileges');
+const utils = require('../utils');
 
 
 module.exports = function (Topics) {
@@ -33,7 +34,8 @@ module.exports = function (Topics) {
 		}
 		const canDelete = await privileges.topics.canDelete(tid, uid);
 
-		const data = await plugins.hooks.fire(isDelete ? 'filter:topic.delete' : 'filter:topic.restore', { topicData: topicData, uid: uid, isDelete: isDelete, canDelete: canDelete, canRestore: canDelete });
+		const hook = isDelete ? 'delete' : 'restore';
+		const data = await plugins.hooks.fire(`filter:topic.${hook}`, { topicData: topicData, uid: uid, isDelete: isDelete, canDelete: canDelete, canRestore: canDelete });
 
 		if ((!data.canDelete && data.isDelete) || (!data.canRestore && !data.isDelete)) {
 			throw new Error('[[error:no-privileges]]');
@@ -161,25 +163,33 @@ module.exports = function (Topics) {
 			throw new Error('[[error:no-privileges]]');
 		}
 
+		// crossposted categories hold the same zsets, so they pin and unpin alongside the topic's own
+		const crossposts = await Topics.crossposts.get(tid);
+		const cids = [topicData.cid, ...crossposts.map(crosspost => crosspost.cid)];
+
 		const promises = [
 			Topics.setTopicField(tid, 'pinned', pin ? 1 : 0),
 			Topics.events.log(tid, { type: pin ? 'pin' : 'unpin', uid }),
 		];
 		if (pin) {
-			promises.push(db.sortedSetAdd(`cid:${topicData.cid}:tids:pinned`, Date.now(), tid));
-			promises.push(db.sortedSetsRemove([
-				`cid:${topicData.cid}:tids`,
-				`cid:${topicData.cid}:tids:posts`,
-				`cid:${topicData.cid}:tids:votes`,
-			], tid));
+			promises.push(db.sortedSetsAdd(cids.map(cid => `cid:${cid}:tids:pinned`), Date.now(), tid));
+			promises.push(db.sortedSetsRemove(cids.flatMap(cid => [
+				`cid:${cid}:tids`,
+				`cid:${cid}:tids:create`,
+				`cid:${cid}:tids:posts`,
+				`cid:${cid}:tids:votes`,
+				`cid:${cid}:tids:views`,
+			]), tid));
 		} else {
-			promises.push(db.sortedSetRemove(`cid:${topicData.cid}:tids:pinned`, tid));
+			promises.push(db.sortedSetsRemove(cids.map(cid => `cid:${cid}:tids:pinned`), tid));
 			promises.push(Topics.deleteTopicField(tid, 'pinExpiry'));
-			promises.push(db.sortedSetAddBulk([
-				[`cid:${topicData.cid}:tids`, topicData.lastposttime, tid],
-				[`cid:${topicData.cid}:tids:posts`, topicData.postcount, tid],
-				[`cid:${topicData.cid}:tids:votes`, parseInt(topicData.votes, 10) || 0, tid],
-			]));
+			promises.push(db.sortedSetAddBulk(cids.flatMap(cid => [
+				[`cid:${cid}:tids`, topicData.lastposttime, tid],
+				[`cid:${cid}:tids:create`, topicData.timestamp, tid],
+				[`cid:${cid}:tids:posts`, topicData.postcount, tid],
+				[`cid:${cid}:tids:votes`, parseInt(topicData.votes, 10) || 0, tid],
+				[`cid:${cid}:tids:views`, topicData.viewcount, tid],
+			])));
 			topicData.pinExpiry = undefined;
 			topicData.pinExpiryISO = undefined;
 		}
@@ -196,29 +206,38 @@ module.exports = function (Topics) {
 	}
 
 	topicTools.orderPinnedTopics = async function (uid, data) {
-		const tids = data.map(topic => topic && topic.tid);
-		const topicData = await Topics.getTopicsFields(tids, ['cid']);
+		const { tid, order } = data;
+		const cid = await Topics.getTopicField(tid, 'cid');
 
-		const uniqueCids = _.uniq(topicData.map(topicData => topicData && topicData.cid));
-		if (uniqueCids.length > 1 || !uniqueCids.length || !uniqueCids[0]) {
+		if (!cid || !tid || !utils.isNumber(order) || order < 0) {
 			throw new Error('[[error:invalid-data]]');
 		}
-
-		const cid = uniqueCids[0];
 
 		const isAdminOrMod = await privileges.categories.isAdminOrMod(cid, uid);
 		if (!isAdminOrMod) {
 			throw new Error('[[error:no-privileges]]');
 		}
 
-		const isPinned = await db.isSortedSetMembers(`cid:${cid}:tids:pinned`, tids);
-		data = data.filter((topicData, index) => isPinned[index]);
-		const bulk = data.map(topicData => [`cid:${cid}:tids:pinned`, topicData.order, topicData.tid]);
-		await db.sortedSetAddBulk(bulk);
+		const pinnedTids = await db.getSortedSetRange(`cid:${cid}:tids:pinned`, 0, -1);
+		const currentIndex = pinnedTids.indexOf(String(tid));
+		if (currentIndex === -1) {
+			return;
+		}
+		const newOrder = pinnedTids.length - order - 1;
+		// moves tid to index order in the array
+		if (pinnedTids.length > 1) {
+			pinnedTids.splice(Math.max(0, newOrder), 0, pinnedTids.splice(currentIndex, 1)[0]);
+		}
+
+		await db.sortedSetAdd(
+			`cid:${cid}:tids:pinned`,
+			pinnedTids.map((tid, index) => index),
+			pinnedTids
+		);
 	};
 
 	topicTools.move = async function (tid, data) {
-		const cid = parseInt(data.cid, 10);
+		const cid = utils.isNumber(data.cid) ? parseInt(data.cid, 10) : data.cid;
 		const topicData = await Topics.getTopicData(tid);
 		if (!topicData) {
 			throw new Error('[[error:no-topic]]');
@@ -226,12 +245,18 @@ module.exports = function (Topics) {
 		if (cid === topicData.cid) {
 			throw new Error('[[error:cant-move-topic-to-same-category]]');
 		}
+		if (data.uid !== 'system' && (!utils.isNumber(cid) || !utils.isNumber(topicData.cid))) {
+			throw new Error('[[error:cant-move-topic-to-from-remote-categories]]');
+		}
+
 		const tags = await Topics.getTopicTags(tid);
 		await db.sortedSetsRemove([
 			`cid:${topicData.cid}:tids`,
+			`cid:${topicData.cid}:tids:create`,
 			`cid:${topicData.cid}:tids:pinned`,
 			`cid:${topicData.cid}:tids:posts`,
 			`cid:${topicData.cid}:tids:votes`,
+			`cid:${topicData.cid}:tids:views`,
 			`cid:${topicData.cid}:tids:lastposttime`,
 			`cid:${topicData.cid}:recent_tids`,
 			`cid:${topicData.cid}:uid:${topicData.uid}:tids`,
@@ -250,8 +275,10 @@ module.exports = function (Topics) {
 			bulk.push([`cid:${cid}:tids:pinned`, Date.now(), tid]);
 		} else {
 			bulk.push([`cid:${cid}:tids`, topicData.lastposttime, tid]);
+			bulk.push([`cid:${cid}:tids:create`, topicData.timestamp, tid]);
 			bulk.push([`cid:${cid}:tids:posts`, topicData.postcount, tid]);
 			bulk.push([`cid:${cid}:tids:votes`, votes, tid]);
+			bulk.push([`cid:${cid}:tids:views`, topicData.viewcount, tid]);
 		}
 		await db.sortedSetAddBulk(bulk);
 
@@ -259,21 +286,37 @@ module.exports = function (Topics) {
 		await categories.moveRecentReplies(tid, oldCid, cid);
 
 		await Promise.all([
-			categories.incrementCategoryFieldBy(oldCid, 'topic_count', -1),
-			categories.incrementCategoryFieldBy(cid, 'topic_count', 1),
-			categories.updateRecentTidForCid(cid),
-			categories.updateRecentTidForCid(oldCid),
 			Topics.setTopicFields(tid, {
 				cid: cid,
 				oldCid: oldCid,
 			}),
 			Topics.updateCategoryTagsCount([oldCid, cid], tags),
+			Topics.events.log(tid, { type: 'move', uid: data.uid, fromCid: oldCid }),
 		]);
+
+		// Update entry in recent topics zset — must come after hash update
+		if (oldCid === -1 || cid === -1) {
+			Topics.updateRecent(tid, topicData.lastposttime); // no await req'd
+		}
+
 		const hookData = _.clone(data);
 		hookData.fromCid = oldCid;
 		hookData.toCid = cid;
 		hookData.tid = tid;
 
 		plugins.hooks.fire('action:topic.move', hookData);
+	};
+
+	topicTools.share = async function (tid, uid, timestamp = Date.now()) {
+		const set = `uid:${uid}:shares`;
+		const shared = await db.isSortedSetMember(set, tid);
+		if (shared) {
+			return;
+		}
+
+		await Promise.all([
+			Topics.events.log(tid, { type: 'share', uid: uid }),
+			db.sortedSetAdd(set, timestamp, tid),
+		]);
 	};
 };

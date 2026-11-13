@@ -26,6 +26,9 @@ get:
                   selectCategoryLabel:
                     type: string
                     description: Label to use for the category selector
+                  firstRun:
+                    type: boolean
+                    description: True if no user has ever logged in to this instance
                   categories:
                     description: A collection of category data objects
                     type: array
@@ -38,6 +41,9 @@ get:
                               type: array
                               items:
                                 type: string
+                            unread:
+                              type: boolean
+                              description: True if category or it's children have unread topics
                             unread-class:
                               type: string
                             children:
@@ -74,6 +80,8 @@ get:
                                           type: object
                                           properties:
                                             pid:
+                                              type: number
+                                            uid:
                                               type: number
                                             timestamp:
                                               type: number
@@ -133,10 +141,17 @@ get:
                                 properties:
                                   pid:
                                     type: number
+                                  uid:
+                                    type: number
+                                  tid:
+                                    type: number
                                   timestamp:
                                     type: number
                                   content:
                                     type: string
+                                  sourceContent:
+                                    type: string
+                                    nullable: true
                                   timestampISO:
                                     type: string
                                     description: An ISO 8601 formatted date string (complementing `timestamp`)
@@ -146,6 +161,9 @@ get:
                                       uid:
                                         type: number
                                         description: A user identifier
+                                      isLocal:
+                                        type: boolean
+                                        description: Whether the user belongs to the local installation or not.
                                       username:
                                         type: string
                                         description: A friendly name for a given user account
@@ -179,27 +197,14 @@ get:
                                   topic:
                                     type: object
                                     properties:
+                                      tid:
+                                        type: number
                                       slug:
                                         type: string
                                       title:
                                         type: string
                             teaser:
-                              type: object
-                              properties:
-                                url:
-                                  type: string
-                                timestampISO:
-                                  type: string
-                                  description: An ISO 8601 formatted date string (complementing `timestamp`)
-                                pid:
-                                  type: number
-                                topic:
-                                  type: object
-                                  properties:
-                                    slug:
-                                      type: string
-                                    title:
-                                      type: string
+                              $ref: ../components/schemas/TeaserObject.yaml#/TeaserObject
                             imageClass:
                               type: string
               - $ref: ../components/schemas/Pagination.yaml#/Pagination

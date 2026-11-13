@@ -1,6 +1,5 @@
 'use strict';
 
-const async = require('async');
 const db = require('../../database');
 
 const batch = require('../../batch');
@@ -9,61 +8,37 @@ const user = require('../../user');
 module.exports = {
 	name: 'Record first entry in username/email history',
 	timestamp: Date.UTC(2018, 7, 28),
-	method: function (callback) {
+	method: async function () {
 		const { progress } = this;
 
-		batch.processSortedSet('users:joindate', (ids, next) => {
-			async.each(ids, (uid, next) => {
-				async.parallel([
-					function (next) {
-						// Username
-						async.waterfall([
-							async.apply(db.sortedSetCard, `user:${uid}:usernames`),
-							(count, next) => {
-								if (count > 0) {
-									// User has changed their username before, no record of original username, skip.
-									return setImmediate(next, null, null);
-								}
+		progress.total = await db.sortedSetCard('users:joindate');
 
-								user.getUserFields(uid, ['username', 'joindate'], next);
-							},
-							(userdata, next) => {
-								if (!userdata || !userdata.joindate) {
-									return setImmediate(next);
-								}
+		await batch.processSortedSet('users:joindate', async (uids) => {
+			const [usernameHistory, emailHistory, userData] = await Promise.all([
+				db.sortedSetsCard(uids.map(uid => `user:${uid}:usernames`)),
+				db.sortedSetsCard(uids.map(uid => `user:${uid}:emails`)),
+				user.getUsersFields(uids, ['uid', 'username', 'email', 'joindate']),
+			]);
 
-								db.sortedSetAdd(`user:${uid}:usernames`, userdata.joindate, [userdata.username, userdata.joindate].join(':'), next);
-							},
-						], next);
-					},
-					function (next) {
-						// Email
-						async.waterfall([
-							async.apply(db.sortedSetCard, `user:${uid}:emails`),
-							(count, next) => {
-								if (count > 0) {
-									// User has changed their email before, no record of original email, skip.
-									return setImmediate(next, null, null);
-								}
-
-								user.getUserFields(uid, ['email', 'joindate'], next);
-							},
-							(userdata, next) => {
-								if (!userdata || !userdata.joindate) {
-									return setImmediate(next);
-								}
-
-								db.sortedSetAdd(`user:${uid}:emails`, userdata.joindate, [userdata.email, userdata.joindate].join(':'), next);
-							},
-						], next);
-					},
-				], (err) => {
-					progress.incr();
-					setImmediate(next, err);
-				});
-			}, next);
+			const bulkAdd = [];
+			userData.forEach((data, index) => {
+				const thisUsernameHistory = usernameHistory[index];
+				const thisEmailHistory = emailHistory[index];
+				if (thisUsernameHistory <= 0 && data && data.joindate && data.username) {
+					bulkAdd.push([
+						`user:${data.uid}:usernames`, data.joindate, [data.username, data.joindate].join(':'),
+					]);
+				}
+				if (thisEmailHistory <= 0 && data && data.joindate && data.email) {
+					bulkAdd.push([
+						`user:${data.uid}:emails`, data.joindate, [data.email, data.joindate].join(':'),
+					]);
+				}
+			});
+			await db.sortedSetAddBulk(bulkAdd);
+			progress.incr(uids.length);
 		}, {
-			progress: this.progress,
-		}, callback);
+			batch: 500,
+		});
 	},
 };

@@ -8,7 +8,7 @@ nconf.argv().env({
 
 const fs = require('fs');
 const path = require('path');
-const archiver = require('archiver');
+const { ZipArchive } = require('archiver');
 const winston = require('winston');
 
 process.env.NODE_ENV = process.env.NODE_ENV || 'production';
@@ -33,7 +33,7 @@ process.on('message', async (msg) => {
 
 		const user = require('../index');
 
-		const archive = archiver('zip', {
+		const archive = new ZipArchive({
 			zlib: { level: 9 }, // Sets the compression level.
 		});
 
@@ -74,14 +74,8 @@ process.on('message', async (msg) => {
 		winston.verbose(`[user/export/uploads] Collating uploads for uid ${targetUid}`);
 		await user.collateUploads(targetUid, archive);
 
-		const uploadedPicture = await user.getUserField(targetUid, 'uploadedpicture');
-		if (uploadedPicture) {
-			const filePath = uploadedPicture.replace(nconf.get('upload_url'), '');
-			archive.file(path.join(nconf.get('upload_path'), filePath), {
-				name: path.basename(filePath),
-			});
-		}
-
+		const profileUploadPath = path.join(nconf.get('upload_path'), `profile/uid-${targetUid}`);
+		archive.directory(profileUploadPath, 'profile');
 		archive.finalize();
 	}
 });

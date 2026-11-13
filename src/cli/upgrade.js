@@ -1,6 +1,7 @@
 'use strict';
 
 const nconf = require('nconf');
+const chalk = require('chalk').default;
 
 const packageInstall = require('./package-install');
 const { upgradePlugins } = require('./upgrade-plugins');
@@ -11,21 +12,21 @@ const steps = {
 		handler: function () {
 			packageInstall.updatePackageFile();
 			packageInstall.preserveExtraneousPlugins();
-			process.stdout.write('  OK\n'.green);
+			process.stdout.write(chalk.green('  OK\n'));
 		},
 	},
 	install: {
 		message: 'Bringing base dependencies up to date...',
 		handler: function () {
-			process.stdout.write('  started\n'.green);
+			process.stdout.write(chalk.green('  started\n'));
 			packageInstall.installAll();
 		},
 	},
 	plugins: {
 		message: 'Checking installed plugins for updates...',
-		handler: async function () {
+		handler: async function (options) {
 			await require('../database').init();
-			await upgradePlugins();
+			await upgradePlugins(options.unattended);
 		},
 	},
 	schema: {
@@ -44,14 +45,14 @@ const steps = {
 	},
 };
 
-async function runSteps(tasks) {
+async function runSteps(tasks, options) {
 	try {
 		for (let i = 0; i < tasks.length; i++) {
 			const step = steps[tasks[i]];
 			if (step && step.message && step.handler) {
-				process.stdout.write(`\n${(`${i + 1}. `).bold}${step.message.yellow}`);
+				process.stdout.write(`\n${chalk.bold(`${i + 1}. `)}${chalk.yellow(step.message)}`);
 				/* eslint-disable-next-line */
-				await step.handler();
+				await step.handler(options);
 			}
 		}
 		const message = 'NodeBB Upgrade Complete!';
@@ -60,7 +61,7 @@ async function runSteps(tasks) {
 		const { columns } = process.stdout;
 		const spaces = columns ? new Array(Math.floor(columns / 2) - (message.length / 2) + 1).join(' ') : '  ';
 
-		console.log(`\n\n${spaces}${message.green.bold}${'\n'.reset}`);
+		console.log(`\n\n${spaces}${chalk.green.bold(message)}\n`);
 
 		process.exit();
 	} catch (err) {
@@ -70,7 +71,20 @@ async function runSteps(tasks) {
 }
 
 async function runUpgrade(upgrades, options) {
-	console.log('\nUpdating NodeBB...'.cyan);
+	const winston = require('winston');
+	const path = require('path');
+	winston.configure({
+		transports: [
+			new winston.transports.Console({
+				handleExceptions: true,
+			}),
+			new winston.transports.File({
+				filename: path.join(__dirname, '../../', nconf.get('logFile') || 'logs/output.log'),
+			}),
+		],
+	});
+
+	console.log(chalk.cyan('\nUpdating NodeBB...'));
 	options = options || {};
 	// disable mongo timeouts during upgrade
 	nconf.set('mongo:options:socketTimeoutMS', 0);
@@ -81,11 +95,12 @@ async function runUpgrade(upgrades, options) {
 				options.plugins || options.schema || options.build) {
 			tasks = tasks.filter(key => options[key]);
 		}
-		await runSteps(tasks);
+		await runSteps(tasks, options);
 		return;
 	}
-
-	await require('../database').init();
+	const db = require('../database');
+	await db.init();
+	await db.createIndices();
 	await require('../meta').configs.init();
 	await require('../upgrade').runParticular(upgrades);
 	process.exit(0);

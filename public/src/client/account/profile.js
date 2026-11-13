@@ -3,9 +3,9 @@
 
 define('forum/account/profile', [
 	'forum/account/header',
-	'components',
-], function (header) {
-	var Account = {};
+	'modals',
+], function (header, modals) {
+	const Account = {};
 
 	Account.init = function () {
 		header.init();
@@ -14,12 +14,19 @@ define('forum/account/profile', [
 
 		processPage();
 
+		if (parseInt(ajaxify.data.emailChanged, 10) === 1) {
+			modals.alert({
+				message: '[[user:emailUpdate.change-instructions]]',
+				closeButton: false,
+			});
+		}
+
 		socket.removeListener('event:user_status_change', onUserStatusChange);
 		socket.on('event:user_status_change', onUserStatusChange);
 	};
 
 	function processPage() {
-		$('[component="posts"] [component="post/content"] img:not(.not-responsive), [component="aboutme"] img:not(.not-responsive)').addClass('img-responsive');
+		$('[component="posts"] [component="post/content"] img:not(.not-responsive), [component="aboutme"] img:not(.not-responsive)').addClass('img-fluid');
 	}
 
 	function onUserStatusChange(data) {

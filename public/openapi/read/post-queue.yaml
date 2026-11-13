@@ -1,7 +1,7 @@
 get:
   tags:
     - admin
-  summary: Get flag data
+  summary: Get post queue
   responses:
     "200":
       description: ""
@@ -42,6 +42,8 @@ get:
                               description: A user identifier
                             type:
                               type: string
+                            canEdit:
+                              type: boolean
                             data:
                               type: object
                               properties:
@@ -123,7 +125,13 @@ get:
                                   type: number
                                   description: A topic identifier
                                 toPid:
-                                  nullable: true
+                                  anyOf:
+                                    - type: number
+                                    - type: string
+                                    - type: string
+                                      nullable: true
+                                      enum:
+                                        - null
                             user:
                               type: object
                               properties:
@@ -162,6 +170,20 @@ get:
                                 titleRaw:
                                   type: string
                         - $ref: ../components/schemas/CategoryObject.yaml#/CategoryObject
+                  isAdmin:
+                    type: boolean
+                  canAccept:
+                    type: boolean
+                  enabled:
+                    type: number
+                  singlePost:
+                    type: boolean
+                  privileges:
+                    type: object
+                    properties: {}
+                    additionalProperties:
+                      description: "A list of global and admin privileges, and whether the calling user has (or has inherited) them"
+                      type: boolean
               - $ref: ../components/schemas/Pagination.yaml#/Pagination
               - $ref: ../components/schemas/Breadcrumbs.yaml#/Breadcrumbs
               - $ref: ../components/schemas/CommonProps.yaml#/CommonProps

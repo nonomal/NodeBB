@@ -1,69 +1,49 @@
+/* eslint-disable no-await-in-loop */
+
 'use strict';
 
-const async = require('async');
 const db = require('../../database');
-
 const batch = require('../../batch');
-// var user = require('../../user');
 
 module.exports = {
 	name: 'Upgrade bans to hashes',
 	timestamp: Date.UTC(2018, 8, 24),
-	method: function (callback) {
+	method: async function () {
 		const { progress } = this;
 
-		batch.processSortedSet('users:joindate', (uids, next) => {
-			async.eachSeries(uids, (uid, next) => {
-				progress.incr();
+		progress.total = await db.sortedSetCard('users:joindate');
 
-				async.parallel({
-					bans: function (next) {
-						db.getSortedSetRevRangeWithScores(`uid:${uid}:bans`, 0, -1, next);
-					},
-					reasons: function (next) {
-						db.getSortedSetRevRangeWithScores(`banned:${uid}:reasons`, 0, -1, next);
-					},
-					userData: function (next) {
-						db.getObjectFields(`user:${uid}`, ['banned', 'banned:expire', 'joindate', 'lastposttime', 'lastonline'], next);
-					},
-				}, (err, results) => {
-					function addBan(key, data, callback) {
-						async.waterfall([
-							function (next) {
-								db.setObject(key, data, next);
-							},
-							function (next) {
-								db.sortedSetAdd(`uid:${uid}:bans:timestamp`, data.timestamp, key, next);
-							},
-						], callback);
-					}
-					if (err) {
-						return next(err);
-					}
-					// has no ban history and isn't banned, skip
-					if (!results.bans.length && !parseInt(results.userData.banned, 10)) {
-						return next();
-					}
+		await batch.processSortedSet('users:joindate', async (uids) => {
+			progress.incr(uids.length);
+			const [allUserData, allBans] = await Promise.all([
+				db.getObjectsFields(
+					uids.map(uid => `user:${uid}`),
+					['banned', 'banned:expire', 'joindate', 'lastposttime', 'lastonline'],
+				),
+				db.getSortedSetsMembersWithScores(
+					uids.map(uid => `uid:${uid}:bans`)
+				),
+			]);
 
-					// has no history, but is banned, create plain object with just uid and timestmap
-					if (!results.bans.length && parseInt(results.userData.banned, 10)) {
-						const banTimestamp = (
-							results.userData.lastonline ||
-							results.userData.lastposttime ||
-							results.userData.joindate ||
-							Date.now()
-						);
-						const banKey = `uid:${uid}:ban:${banTimestamp}`;
-						addBan(banKey, { uid: uid, timestamp: banTimestamp }, next);
-						return;
-					}
+			await Promise.all(uids.map(async (uid, index) => {
+				const userData = allUserData[index];
+				const bans = allBans[index] || [];
 
+				// has no history, but is banned, create plain object with just uid and timestmap
+				if (!bans.length && parseInt(userData.banned, 10)) {
+					const banTimestamp = (
+						userData.lastonline ||
+						userData.lastposttime ||
+						userData.joindate ||
+						Date.now()
+					);
+					const banKey = `uid:${uid}:ban:${banTimestamp}`;
+					await addBan(uid, banKey, { uid: uid, timestamp: banTimestamp });
+				} else if (bans.length) {
+					const reasons = await db.getSortedSetRevRangeWithScores(`banned:${uid}:reasons`, 0, -1);
 					// process ban history
-					async.eachSeries(results.bans, (ban, next) => {
-						function findReason(score) {
-							return results.reasons.find(reasonData => reasonData.score === score);
-						}
-						const reasonData = findReason(ban.score);
+					for (const ban of bans) {
+						const reasonData = reasons.find(reasonData => reasonData.score === ban.score);
 						const banKey = `uid:${uid}:ban:${ban.score}`;
 						const data = {
 							uid: uid,
@@ -73,14 +53,19 @@ module.exports = {
 						if (reasonData) {
 							data.reason = reasonData.value;
 						}
-						addBan(banKey, data, next);
-					}, (err) => {
-						next(err);
-					});
-				});
-			}, next);
+						await addBan(uid, banKey, data);
+					}
+				}
+			}));
 		}, {
-			progress: this.progress,
-		}, callback);
+			batch: 500,
+		});
 	},
 };
+
+async function addBan(uid, key, data) {
+	await Promise.all([
+		db.setObject(key, data),
+		db.sortedSetAdd(`uid:${uid}:bans:timestamp`, data.timestamp, key),
+	]);
+}

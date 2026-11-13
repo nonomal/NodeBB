@@ -1,6 +1,5 @@
 'use strict';
 
-const validator = require('validator');
 const nconf = require('nconf');
 
 const meta = require('../meta');
@@ -12,22 +11,61 @@ const privileges = require('../privileges');
 
 const groupsController = module.exports;
 
-groupsController.list = async function (req, res) {
-	const sort = req.query.sort || 'alpha';
+const url = nconf.get('url');
+const validSorts = ['alpha', 'count', 'date'];
 
-	const [groupData, allowGroupCreation] = await Promise.all([
-		groups.getGroupsBySort(sort, 0, 14),
+groupsController.list = async function (req, res) {
+	const sort = validSorts.includes(req.query.sort) ? req.query.sort : 'alpha';
+	const page = parseInt(req.query.page, 10) || 1;
+	const [allowGroupCreation, [groupData, pageCount]] = await Promise.all([
 		privileges.global.can('group:create', req.uid),
+		getGroups(req, sort, page),
 	]);
+
+	res.locals.linkTags = [
+		{
+			rel: 'canonical',
+			href: `${url}${req.url.replace(/^\/api/, '')}`,
+		},
+	];
 
 	res.render('groups/list', {
 		groups: groupData,
 		allowGroupCreation: allowGroupCreation,
-		nextStart: 15,
+		sort: sort,
+		pagination: pagination.create(page, pageCount, req.query),
 		title: '[[pages:groups]]',
 		breadcrumbs: helpers.buildBreadcrumbs([{ text: '[[pages:groups]]' }]),
 	});
 };
+
+async function getGroups(req, sort, page) {
+	const resultsPerPage = req.query.query ? 100 : 15;
+	const start = Math.max(0, page - 1) * resultsPerPage;
+	const stop = start + resultsPerPage - 1;
+
+	if (req.query.query) {
+		const filterHidden = req.query.filterHidden === 'true' || !await user.isAdministrator(req.uid);
+		const groupData = await groups.search(req.query.query, {
+			sort,
+			filterHidden: filterHidden,
+			showMembers: req.query.showMembers === 'true',
+			hideEphemeralGroups: req.query.hideEphemeralGroups === 'true',
+			excludeGroups: Array.isArray(req.query.excludeGroups) ? req.query.excludeGroups : [],
+		});
+		const pageCount = Math.ceil(groupData.length / resultsPerPage);
+
+		return [groupData.slice(start, stop + 1), pageCount];
+	}
+
+	const [groupData, groupCount] = await Promise.all([
+		groups.getGroupsBySort(sort, start, stop),
+		groups.getGroupCountBySort(sort),
+	]);
+
+	const pageCount = Math.ceil(groupCount / resultsPerPage);
+	return [groupData, pageCount];
+}
 
 groupsController.details = async function (req, res, next) {
 	const lowercaseSlug = req.params.slug.toLowerCase();
@@ -45,7 +83,7 @@ groupsController.details = async function (req, res, next) {
 	const [exists, isHidden, isAdmin, isGlobalMod] = await Promise.all([
 		groups.exists(groupName),
 		groups.isHidden(groupName),
-		user.isAdministrator(req.uid),
+		privileges.admin.can('admin:groups', req.uid),
 		user.isGlobalModerator(req.uid),
 	]);
 	if (!exists) {
@@ -71,7 +109,13 @@ groupsController.details = async function (req, res, next) {
 	if (!groupData) {
 		return next();
 	}
-	groupData.isOwner = groupData.isOwner || isAdmin || (isGlobalMod && !groupData.system);
+
+	res.locals.linkTags = [
+		{
+			rel: 'canonical',
+			href: `${url}/groups/${lowercaseSlug}`,
+		},
+	];
 
 	res.render('groups/details', {
 		title: `[[pages:group, ${groupData.displayName}]]`,
@@ -107,7 +151,7 @@ groupsController.members = async function (req, res, next) {
 
 	const breadcrumbs = helpers.buildBreadcrumbs([
 		{ text: '[[pages:groups]]', url: '/groups' },
-		{ text: validator.escape(String(groupName)), url: `/groups/${req.params.slug}` },
+		{ text: groupName, url: `/groups/${req.params.slug}` },
 		{ text: '[[groups:details.members]]' },
 	]);
 

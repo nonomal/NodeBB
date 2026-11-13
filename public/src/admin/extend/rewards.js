@@ -1,14 +1,16 @@
 'use strict';
 
 
-define('admin/extend/rewards', [], function () {
-	var rewards = {};
+define('admin/extend/rewards', [
+	'alerts',
+	'jquery-ui/widgets/sortable',
+], function (alerts) {
+	const rewards = {};
 
-
-	var available;
-	var active;
-	var conditions;
-	var conditionals;
+	let available;
+	let active;
+	let conditions;
+	let conditionals;
 
 	rewards.init = function () {
 		available = ajaxify.data.rewards;
@@ -16,23 +18,19 @@ define('admin/extend/rewards', [], function () {
 		conditions = ajaxify.data.conditions;
 		conditionals = ajaxify.data.conditionals;
 
-		$('[data-selected]').each(function () {
-			select($(this));
-		});
-
 		$('#active')
 			.on('change', '[data-selected]', function () {
 				update($(this));
 			})
 			.on('click', '.delete', function () {
-				var parent = $(this).parents('[data-id]');
-				var id = parent.attr('data-id');
+				const parent = $(this).parents('[data-id]');
+				const id = parent.attr('data-id');
 
 				socket.emit('admin.rewards.delete', { id: id }, function (err) {
 					if (err) {
-						app.alertError(err.message);
+						alerts.error(err);
 					} else {
-						app.alertSuccess('[[admin/extend/rewards:alert.delete-success]]');
+						alerts.success('[[admin/extend/rewards:alert.delete-success]]');
 					}
 				});
 
@@ -40,25 +38,33 @@ define('admin/extend/rewards', [], function () {
 				return false;
 			})
 			.on('click', '.toggle', function () {
-				var btn = $(this);
-				var disabled = btn.hasClass('btn-success');
-				btn.toggleClass('btn-warning').toggleClass('btn-success').translateHtml('[[admin/extend/rewards:' + (disabled ? 'disable' : 'enable') + ']]');
+				const btn = $(this);
+				btn.parent().find('.toggle').removeClass('hidden');
+				btn.addClass('hidden');
 				// send disable api call
 				return false;
+			})
+			.sortable({
+				handle: '[component="sort/handle"]',
+				axis: 'y',
+				zIndex: 9999,
 			});
 
 		$('#new').on('click', newReward);
 		$('#save').on('click', saveRewards);
 
-		populateInputs();
+		Promise.all(
+			$('[data-selected]').toArray().map(el => select($(el)))
+		).then(populateInputs);
 	};
 
 	function select(el) {
 		el.val(el.attr('data-selected'));
 		switch (el.attr('name')) {
 			case 'rid':
-				selectReward(el);
-				break;
+				return selectReward(el);
+			default:
+				return Promise.resolve();
 		}
 	}
 
@@ -66,67 +72,45 @@ define('admin/extend/rewards', [], function () {
 		el.attr('data-selected', el.val());
 		switch (el.attr('name')) {
 			case 'rid':
-				selectReward(el);
-				break;
+				return selectReward(el);
+			default:
+				return Promise.resolve();
 		}
 	}
 
-	function selectReward(el) {
-		var parent = el.parents('[data-rid]');
-		var div = parent.find('.inputs');
-		var inputs;
-		var html = '';
+	async function selectReward(el) {
+		const parent = el.parents('[data-rid]');
+		const div = parent.find('.inputs');
+		let inputs;
 
-		for (var reward in available) {
-			if (available.hasOwnProperty(reward)) {
-				if (available[reward].rid === el.attr('data-selected')) {
-					inputs = available[reward].inputs;
-					parent.attr('data-rid', available[reward].rid);
-					break;
-				}
-			}
+		const selectedReward = available.find(reward => reward.rid === el.attr('data-selected'));
+		if (selectedReward) {
+			inputs = selectedReward.inputs;
+			parent.attr('data-rid', selectedReward.rid);
 		}
 
 		if (!inputs) {
-			return app.alertError('[[admin/extend/rewards:alert.no-inputs-found]] ' + el.attr('data-selected'));
+			return alerts.error(`[[admin/extend/rewards:alert.no-inputs-found, ${el.attr('data-selected')}`);
 		}
-
-		inputs.forEach(function (input) {
-			html += '<label for="' + input.name + '">' + input.label + '<br />';
-			switch (input.type) {
-				case 'select':
-					html += '<select name="' + input.name + '">';
-					input.values.forEach(function (value) {
-						html += '<option value="' + value.value + '">' + value.name + '</option>';
-					});
-					break;
-				case 'text':
-					html += '<input type="text" name="' + input.name + '" />';
-					break;
-			}
-			html += '</label><br />';
-		});
-
+		const html = await app.parseAndTranslate('admin/partials/rewards/inputs', { inputs });
 		div.html(html);
 	}
 
 	function populateInputs() {
 		$('[data-rid]').each(function (i) {
-			var div = $(this).find('.inputs');
-			var rewards = active[i].rewards;
+			const div = $(this).find('.inputs');
+			const rewards = active[i].rewards;
 
-			for (var reward in rewards) {
-				if (rewards.hasOwnProperty(reward)) {
-					div.find('[name="' + reward + '"]').val(rewards[reward]);
-				}
+			for (const [reward, value] of Object.entries(rewards)) {
+				div.find('[name="' + reward + '"]').val(value);
 			}
 		});
 	}
 
 	function newReward() {
-		var ul = $('#active');
+		const ul = $('#active');
 
-		var data = {
+		const data = {
 			active: [{
 				disabled: true,
 				value: '',
@@ -146,12 +130,12 @@ define('admin/extend/rewards', [], function () {
 	}
 
 	function saveRewards() {
-		var activeRewards = [];
+		const activeRewards = [];
 
 		$('#active li').each(function () {
-			var data = { rewards: {} };
-			var main = $(this).find('form.main').serializeArray();
-			var rewards = $(this).find('form.rewards').serializeArray();
+			const data = { rewards: {} };
+			const main = $(this).find('form.main').serializeArray();
+			const rewards = $(this).find('form.rewards').serializeArray();
 
 			main.forEach(function (obj) {
 				data[obj.name] = obj.value;
@@ -162,17 +146,28 @@ define('admin/extend/rewards', [], function () {
 			});
 
 			data.id = $(this).attr('data-id');
-			data.disabled = $(this).find('.toggle').hasClass('btn-success');
+			data.disabled = $(this).find('.toggle.disable').hasClass('hidden');
 
 			activeRewards.push(data);
 		});
 
-		socket.emit('admin.rewards.save', activeRewards, function (err) {
+		socket.emit('admin.rewards.save', activeRewards, function (err, result) {
 			if (err) {
-				app.alertError(err.message);
-			} else {
-				app.alertSuccess('[[admin/extend/rewards:alert.save-success]]');
+				return alerts.error(err);
 			}
+
+			const saveBtn = document.getElementById('save');
+			saveBtn.classList.toggle('saved', true);
+			setTimeout(() => {
+				saveBtn.classList.toggle('saved', false);
+			}, 5000);
+
+			// newly added rewards are missing data-id, update to prevent rewards getting duplicated
+			$('#active li').each(function (index) {
+				if (!$(this).attr('data-id')) {
+					$(this).attr('data-id', result[index].id);
+				}
+			});
 		});
 	}
 

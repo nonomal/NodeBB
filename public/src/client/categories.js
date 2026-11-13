@@ -1,20 +1,12 @@
 'use strict';
 
 
-define('forum/categories', ['components', 'categorySelector', 'hooks'], function (components, categorySelector, hooks) {
-	var	categories = {};
+define('forum/categories', ['categorySelector', 'modals', 'benchpress'], function (categorySelector, modals, benchpress) {
+	const categories = {};
 
-	$(window).on('action:ajaxify.start', function (ev, data) {
-		if (ajaxify.currentPage !== data.url) {
-			socket.removeListener('event:new_post', categories.onNewPost);
-		}
-	});
-
-	categories.init = function () {
+	categories.init = async function () {
 		app.enterRoom('categories');
 
-		socket.removeListener('event:new_post', categories.onNewPost);
-		socket.on('event:new_post', categories.onNewPost);
 		categorySelector.init($('[component="category-selector"]'), {
 			privilege: 'find',
 			onSelect: function (category) {
@@ -22,50 +14,17 @@ define('forum/categories', ['components', 'categorySelector', 'hooks'], function
 			},
 		});
 
-		$('.category-header').tooltip({
-			placement: 'bottom',
-		});
-	};
-
-	categories.onNewPost = function (data) {
-		if (data && data.posts && data.posts.length && data.posts[0].topic) {
-			renderNewPost(data.posts[0].topic.cid, data.posts[0]);
+		if (ajaxify.data.firstRun) {
+			const html = await benchpress.render('modals/first-run');
+			modals.dialog({
+				title: '[[category:first-run.welcome]]',
+				message: html,
+				backdrop: true,
+				scrollback: false,
+				closeButton: true,
+			});
 		}
 	};
-
-	function renderNewPost(cid, post) {
-		var category = components.get('categories/category', 'cid', cid);
-		var numRecentReplies = category.attr('data-numRecentReplies');
-		if (!numRecentReplies || !parseInt(numRecentReplies, 10)) {
-			return;
-		}
-		if (!category.find('[component="topic/teaser"]').length) {
-			return;
-		}
-
-		var recentPosts = category.find('[component="category/posts"]');
-
-		app.parseAndTranslate('partials/categories/lastpost', 'posts', { posts: [post] }, function (html) {
-			html.find('.post-content img:not(.not-responsive)').addClass('img-responsive');
-			html.hide();
-			if (recentPosts.length === 0) {
-				html.appendTo(category);
-			} else {
-				html.insertBefore(recentPosts.first());
-			}
-
-			html.fadeIn();
-
-			app.createUserTooltips();
-			html.find('.timeago').timeago();
-
-			if (category.find('[component="category/posts"]').length > parseInt(numRecentReplies, 10)) {
-				recentPosts.last().remove();
-			}
-
-			hooks.fire('action:posts.loaded', { posts: [post] });
-		});
-	}
 
 	return categories;
 });

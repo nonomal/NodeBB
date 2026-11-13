@@ -1,21 +1,18 @@
 'use strict';
 
 const prompt = require('prompt');
-const request = require('request-promise-native');
 const cproc = require('child_process');
 const semver = require('semver');
 const fs = require('fs');
 const path = require('path');
-const nconf = require('nconf');
-const util = require('util');
+const chalk = require('chalk').default;
+
 
 const { paths, pluginNamePattern } = require('../constants');
+const pkgInstall = require('./package-install');
 
-const packageManager = nconf.get('package_manager');
-
-const supportedPackageManagerList = require('./package-install').supportedPackageManager; // load config from src/cli/package-install.js
-
-let packageManagerExecutable = supportedPackageManagerList.indexOf(packageManager) >= 0 ? packageManager : 'npm';
+const packageManager = pkgInstall.getPackageManager();
+let packageManagerExecutable = packageManager;
 const packageManagerInstallArgs = packageManager === 'yarn' ? ['add'] : ['install', '--save'];
 
 if (process.platform === 'win32') {
@@ -77,11 +74,12 @@ async function getCurrentVersion() {
 }
 
 async function getSuggestedModules(nbbVersion, toCheck) {
-	let body = await request({
-		method: 'GET',
-		url: `https://packages.nodebb.org/api/v1/suggest?version=${nbbVersion}&package[]=${toCheck.join('&package[]=')}`,
-		json: true,
-	});
+	const request = require('../request');
+	let { response, body } = await request.get(`https://packages.nodebb.org/api/v1/suggest?version=${nbbVersion}&package[]=${toCheck.join('&package[]=')}`);
+	if (!response.ok) {
+		console.warn(`Unable to get suggested module for NodeBB(${nbbVersion}) ${toCheck.join(',')}`);
+		return [];
+	}
 	if (!Array.isArray(body) && toCheck.length === 1) {
 		body = [body];
 	}
@@ -91,17 +89,17 @@ async function getSuggestedModules(nbbVersion, toCheck) {
 async function checkPlugins() {
 	process.stdout.write('Checking installed plugins and themes for updates... ');
 	const [plugins, nbbVersion] = await Promise.all([
-		getInstalledPlugins,
-		getCurrentVersion,
+		getInstalledPlugins(),
+		getCurrentVersion(),
 	]);
 
 	const toCheck = Object.keys(plugins);
 	if (!toCheck.length) {
-		process.stdout.write('  OK'.green + ''.reset);
-		return [];	// no extraneous plugins installed
+		process.stdout.write(chalk.green('  OK'));
+		return []; // no extraneous plugins installed
 	}
 	const suggestedModules = await getSuggestedModules(nbbVersion, toCheck);
-	process.stdout.write('  OK'.green + ''.reset);
+	process.stdout.write(chalk.green('  OK'));
 
 	let current;
 	let suggested;
@@ -109,7 +107,7 @@ async function checkPlugins() {
 		current = plugins[suggestObj.package];
 		suggested = suggestObj.version;
 
-		if (suggestObj.code === 'match-found' && semver.gt(suggested, current)) {
+		if (suggestObj.code === 'match-found' && semver.valid(current) && semver.valid(suggested) && semver.gt(suggested, current)) {
 			return {
 				name: suggestObj.package,
 				current: current,
@@ -122,42 +120,54 @@ async function checkPlugins() {
 	return upgradable;
 }
 
-async function upgradePlugins() {
+async function getUpgradeConfirmation(unattended) {
+	if (unattended) {
+		return true;
+	}
+	if (!process.stdin.isTTY) {
+		return false;
+	}
+	prompt.message = '';
+	prompt.delimiter = '';
+
+	prompt.start();
+	const result = await prompt.get({
+		name: 'upgrade',
+		description: '\nProceed with upgrade (y|n)?',
+		type: 'string',
+	});
+	return ['y', 'Y', 'yes', 'YES'].includes(result.upgrade);
+}
+
+async function upgradePlugins(unattended = false) {
 	try {
 		const found = await checkPlugins();
 		if (found && found.length) {
-			process.stdout.write(`\n\nA total of ${String(found.length).bold} package(s) can be upgraded:\n\n`);
+			process.stdout.write(`\n\nA total of ${chalk.bold(String(found.length))} package(s) can be upgraded:\n\n`);
 			found.forEach((suggestObj) => {
-				process.stdout.write(`${'  * '.yellow + suggestObj.name.reset} (${suggestObj.current.yellow}${' -> '.reset}${suggestObj.suggested.green}${')\n'.reset}`);
+				process.stdout.write(`${chalk.yellow('  * ') + suggestObj.name} (${chalk.yellow(suggestObj.current)} -> ${chalk.green(suggestObj.suggested)})\n`);
 			});
 		} else {
-			console.log('\nAll packages up-to-date!'.green + ''.reset);
+			console.log(chalk.green('\nAll packages up-to-date!'));
 			return;
 		}
 
-		prompt.message = '';
-		prompt.delimiter = '';
-
-		const promptGet = util.promisify((schema, callback) => prompt.get(schema, callback));
-		prompt.start();
-		const result = await promptGet({
-			name: 'upgrade',
-			description: '\nProceed with upgrade (y|n)?'.reset,
-			type: 'string',
-		});
-
-		if (['y', 'Y', 'yes', 'YES'].includes(result.upgrade)) {
+		if (await getUpgradeConfirmation(unattended)) {
 			console.log('\nUpgrading packages...');
 			const args = packageManagerInstallArgs.concat(found.map(suggestObj => `${suggestObj.name}@${suggestObj.suggested}`));
-
-			cproc.execFileSync(packageManagerExecutable, args, { stdio: 'ignore' });
+			const options = { stdio: 'ignore' };
+			if (process.platform === 'win32') {
+				options.shell = true;
+			}
+			cproc.execFileSync(packageManagerExecutable, args, options);
 		} else {
-			console.log('Package upgrades skipped'.yellow + '. Check for upgrades at any time by running "'.reset + './nodebb upgrade -p'.green + '".'.reset);
+			console.log(`${chalk.yellow('Package upgrades skipped')}. Check for upgrades at any time by running "${chalk.green('./nodebb upgrade -p')}".`);
 		}
 	} catch (err) {
-		console.log('Warning'.yellow + ': An unexpected error occured when attempting to verify plugin upgradability'.reset);
+		console.log(`${chalk.yellow('Warning')}: An unexpected error occured when attempting to verify plugin upgradability`);
 		throw err;
 	}
 }
 
+exports.getUpgradeConfirmation = getUpgradeConfirmation;
 exports.upgradePlugins = upgradePlugins;

@@ -1,11 +1,9 @@
 'use strict';
 
-const async = require('async');
 const _ = require('lodash');
 const path = require('path');
 const nconf = require('nconf');
-const util = require('util');
-const rimrafAsync = util.promisify(require('rimraf'));
+const { rimraf } = require('rimraf');
 
 const db = require('../database');
 const posts = require('../posts');
@@ -14,66 +12,70 @@ const topics = require('../topics');
 const groups = require('../groups');
 const messaging = require('../messaging');
 const plugins = require('../plugins');
+const activitypub = require('../activitypub');
 const batch = require('../batch');
-const file = require('../file');
+const utils = require('../utils');
 
 module.exports = function (User) {
 	const deletesInProgress = {};
 
 	User.delete = async (callerUid, uid) => {
 		await User.deleteContent(callerUid, uid);
-		await removeFromSortedSets(uid);
 		return await User.deleteAccount(uid);
 	};
 
 	User.deleteContent = async function (callerUid, uid) {
-		if (parseInt(uid, 10) <= 0) {
+		if (utils.isNumber(uid) && parseInt(uid, 10) <= 0) {
 			throw new Error('[[error:invalid-uid]]');
 		}
 		if (deletesInProgress[uid]) {
 			throw new Error('[[error:already-deleting]]');
 		}
 		deletesInProgress[uid] = 'user.delete';
-		await deletePosts(callerUid, uid);
-		await deleteTopics(callerUid, uid);
-		await deleteUploads(uid);
-		await deleteQueued(uid);
+		async function deletePostsTopics() {
+			await deletePosts(callerUid, uid);
+			await deleteTopics(callerUid, uid);
+		}
+		await Promise.all([
+			deletePostsTopics(),
+			deleteUploads(callerUid, uid),
+			deleteQueued(uid),
+		]);
 		delete deletesInProgress[uid];
 	};
 
 	async function deletePosts(callerUid, uid) {
-		await batch.processSortedSet(`uid:${uid}:posts`, async (ids) => {
-			await async.eachSeries(ids, async (pid) => {
-				await posts.purge(pid, callerUid);
-			});
-		}, { alwaysStartAt: 0 });
+		await batch.processSortedSet(`uid:${uid}:posts`, async (pids) => {
+			await posts.purge(pids, callerUid);
+			await db.sortedSetRemove(`uid:${uid}:posts`, pids);
+		}, { alwaysStartAt: 0, batch: 500 });
 	}
 
 	async function deleteTopics(callerUid, uid) {
-		await batch.processSortedSet(`uid:${uid}:topics`, async (ids) => {
-			await async.eachSeries(ids, async (tid) => {
-				await topics.purge(tid, callerUid);
-			});
-		}, { alwaysStartAt: 0 });
+		await batch.processSortedSet(`uid:${uid}:topics`, async (tids) => {
+			await topics.purgePostsAndTopic(tids, callerUid);
+			await db.sortedSetRemove(`uid:${uid}:topics`, tids);
+		}, { alwaysStartAt: 0, batch: 100 });
 	}
 
-	async function deleteUploads(uid) {
-		await batch.processSortedSet(`uid:${uid}:uploads`, async (uploadNames) => {
-			await async.each(uploadNames, async (uploadName) => {
-				await file.delete(path.join(nconf.get('upload_path'), uploadName));
-			});
-			await db.sortedSetRemove(`uid:${uid}:uploads`, uploadNames);
-		}, { alwaysStartAt: 0 });
+	async function deleteUploads(callerUid, uid) {
+		await batch.processSortedSet(`uid:${uid}:uploads`, async (uploads) => {
+			await User.deleteUpload(callerUid, uid, uploads);
+		}, { alwaysStartAt: 0, batch: 500 });
 	}
 
 	async function deleteQueued(uid) {
 		let deleteIds = [];
 		await batch.processSortedSet('post:queue', async (ids) => {
 			const data = await db.getObjects(ids.map(id => `post:queue:${id}`));
-			const userQueuedIds = data.filter(d => parseInt(d.uid, 10) === parseInt(uid, 10)).map(d => d.id);
+			const userQueuedIds = data.filter(d => String(d.uid) === String(uid)).map(d => d.id);
 			deleteIds = deleteIds.concat(userQueuedIds);
 		}, { batch: 500 });
-		await async.eachSeries(deleteIds, posts.removeFromQueue);
+
+		for (const id of deleteIds) {
+			// eslint-disable-next-line no-await-in-loop
+			await posts.removeFromQueue(id);
+		}
 	}
 
 	async function removeFromSortedSets(uid) {
@@ -83,10 +85,12 @@ module.exports = function (User) {
 			'users:reputation',
 			'users:banned',
 			'users:banned:expire',
+			'users:muted',
 			'users:flags',
 			'users:online',
 			'digest:day:uids',
 			'digest:week:uids',
+			'digest:biweek:uids',
 			'digest:month:uids',
 		], uid);
 	}
@@ -96,35 +100,43 @@ module.exports = function (User) {
 			throw new Error('[[error:already-deleting]]');
 		}
 		deletesInProgress[uid] = 'user.deleteAccount';
-
+		const isLocal = utils.isNumber(uid);
 		await removeFromSortedSets(uid);
-		const userData = await db.getObject(`user:${uid}`);
+		const userData = await db.getObject(isLocal ? `user:${uid}` : `userRemote:${uid}`);
 
 		if (!userData || !userData.username) {
 			delete deletesInProgress[uid];
 			throw new Error('[[error:no-user]]');
 		}
 
-		await plugins.hooks.fire('static:user.delete', { uid: uid });
-		await deleteVotes(uid);
-		await deleteChats(uid);
-		await User.auth.revokeAllSessions(uid);
+		await plugins.hooks.fire('static:user.delete', { uid: uid, userData: userData });
+		await Promise.all([
+			deleteVotes(uid),
+			deleteChats(uid),
+			User.auth.revokeAllSessions(uid),
+		]);
 
 		const keys = [
 			`uid:${uid}:notifications:read`,
 			`uid:${uid}:notifications:unread`,
 			`uid:${uid}:bookmarks`,
-			`uid:${uid}:followed_tids`,
-			`uid:${uid}:ignored_tids`,
+			`uid:${uid}:tids_read`,
+			`uid:${uid}:tids_unread`,
 			`user:${uid}:settings`,
 			`user:${uid}:usernames`,
 			`user:${uid}:emails`,
 			`uid:${uid}:topics`, `uid:${uid}:posts`,
+			`uid:${uid}:cids`,
 			`uid:${uid}:chats`, `uid:${uid}:chats:unread`,
-			`uid:${uid}:chat:rooms`, `uid:${uid}:chat:rooms:unread`,
+			`uid:${uid}:chat:rooms`,
+			`uid:${uid}:chat:rooms:unread`,
+			`uid:${uid}:chat:rooms:read`,
 			`uid:${uid}:upvote`, `uid:${uid}:downvote`,
 			`uid:${uid}:flag:pids`,
-			`uid:${uid}:sessions`, `uid:${uid}:sessionUUID:sessionId`,
+			`uid:${uid}:sessions`,
+			`uid:${uid}:shares`,
+			`uid:${uid}:profile:pictures`,
+			`uid:${uid}:keys`,
 			`invitation:uid:${uid}`,
 		];
 
@@ -145,53 +157,78 @@ module.exports = function (User) {
 
 		await Promise.all([
 			db.sortedSetRemoveBulk(bulkRemove),
-			db.decrObjectField('global', 'userCount'),
+			isLocal ? db.decrObjectField('global', 'userCount') : null,
 			db.deleteAll(keys),
 			db.setRemove('invitation:uids', uid),
 			deleteUserIps(uid),
-			deleteBans(uid),
+			deleteBlocks(uid),
 			deleteUserFromFollowers(uid),
+			deleteUserFromFollowedTopics(uid),
+			deleteUserFromIgnoredTopics(uid),
+			deleteUserFromFollowedTags(uid),
 			deleteImages(uid),
 			groups.leaveAllGroups(uid),
 			flags.resolveFlag('user', uid, uid),
 			User.reset.cleanByUid(uid),
+			User.email.expireValidation(uid),
+			!isLocal ? activitypub.actors.remove(uid) : null,
 		]);
-		await db.deleteAll([`followers:${uid}`, `following:${uid}`, `user:${uid}`]);
+		await db.deleteAll([
+			`followers:${uid}`, `following:${uid}`,
+			`uid:${uid}:followed_tags`, `uid:${uid}:followed_tids`,
+			`uid:${uid}:ignored_tids`,
+			`${isLocal ? 'user' : 'userRemote'}:${uid}`,
+		]);
 		delete deletesInProgress[uid];
 		return userData;
 	};
 
+	async function deleteUserFromFollowedTopics(uid) {
+		const tids = await db.getSortedSetRange(`uid:${uid}:followed_tids`, 0, -1);
+		await db.setsRemove(tids.map(tid => `tid:${tid}:followers`), uid);
+	}
+
+	async function deleteUserFromIgnoredTopics(uid) {
+		const tids = await db.getSortedSetRange(`uid:${uid}:ignored_tids`, 0, -1);
+		await db.setsRemove(tids.map(tid => `tid:${tid}:ignorers`), uid);
+	}
+
+	async function deleteUserFromFollowedTags(uid) {
+		const tags = await db.getSortedSetRange(`uid:${uid}:followed_tags`, 0, -1);
+		await db.sortedSetsRemove(tags.map(tag => `tag:${tag}:followers`), uid);
+	}
+
 	async function deleteVotes(uid) {
-		const [upvotedPids, downvotedPids] = await Promise.all([
-			db.getSortedSetRange(`uid:${uid}:upvote`, 0, -1),
-			db.getSortedSetRange(`uid:${uid}:downvote`, 0, -1),
-		]);
-		const pids = _.uniq(upvotedPids.concat(downvotedPids).filter(Boolean));
-		await async.eachSeries(pids, async (pid) => {
+		const upvoteDownvotePids = await db.getSortedSetRange([
+			`uid:${uid}:upvote`, `uid:${uid}:downvote`,
+		], 0, -1);
+		const pids = _.uniq(upvoteDownvotePids).filter(Boolean);
+		for (const pid of pids) {
+			// eslint-disable-next-line no-await-in-loop
 			await posts.unvote(pid, uid);
-		});
+		}
 	}
 
 	async function deleteChats(uid) {
-		const roomIds = await db.getSortedSetRange(`uid:${uid}:chat:rooms`, 0, -1);
-		const userKeys = roomIds.map(roomId => `uid:${uid}:chat:room:${roomId}:mids`);
-
-		await Promise.all([
-			messaging.leaveRooms(uid, roomIds),
-			db.deleteAll(userKeys),
-		]);
+		const roomIds = await db.getSortedSetRange([
+			`uid:${uid}:chat:rooms`, `chat:rooms:public`,
+		], 0, -1);
+		await messaging.leaveRooms(uid, roomIds);
 	}
 
 	async function deleteUserIps(uid) {
 		const ips = await db.getSortedSetRange(`uid:${uid}:ip`, 0, -1);
-		await db.sortedSetsRemove(ips.map(ip => `ip:${ip}:uid`), uid);
-		await db.delete(`uid:${uid}:ip`);
+		await Promise.all([
+			db.sortedSetsRemove(ips.map(ip => `ip:${ip}:uid`), uid),
+			db.delete(`uid:${uid}:ip`),
+		]);
 	}
 
-	async function deleteBans(uid) {
-		const bans = await db.getSortedSetRange(`uid:${uid}:bans:timestamp`, 0, -1);
-		await db.deleteAll(bans);
-		await db.delete(`uid:${uid}:bans:timestamp`);
+	async function deleteBlocks(uid) {
+		const blockerUids = await db.getSortedSetRange(`uid:${uid}:blocker_uids`, 0, -1);
+		await db.sortedSetsRemove(blockerUids.map(uid => `uid:${uid}:blocked_uids`), uid);
+		await db.deleteAll([`uid:${uid}:blocked_uids`, `uid:${uid}:blocker_uids`]);
+		User.blocks._cache.del([String(uid), ...blockerUids]);
 	}
 
 	async function deleteUserFromFollowers(uid) {
@@ -201,28 +238,31 @@ module.exports = function (User) {
 		]);
 
 		async function updateCount(uids, name, fieldName) {
-			await async.each(uids, async (uid) => {
-				let count = await db.sortedSetCard(name + uid);
-				count = parseInt(count, 10) || 0;
-				await db.setObjectField(`user:${uid}`, fieldName, count);
+			await batch.processArray(uids, async (uids) => {
+				const counts = await db.sortedSetsCard(uids.map(uid => name + uid));
+				const bulkSet = counts.map(
+					(count, index) => ([`user:${uids[index]}`, { [fieldName]: count || 0 }])
+				);
+				await db.setObjectBulk(bulkSet);
+			}, {
+				batch: 500,
 			});
 		}
 
 		const followingSets = followers.map(uid => `following:${uid}`);
 		const followerSets = following.map(uid => `followers:${uid}`);
 
+		await db.sortedSetsRemove(followerSets.concat(followingSets), uid);
 		await Promise.all([
-			db.sortedSetsRemove(followerSets.concat(followingSets), uid),
 			updateCount(following, 'followers:', 'followerCount'),
 			updateCount(followers, 'following:', 'followingCount'),
 		]);
 	}
 
 	async function deleteImages(uid) {
-		const folder = path.join(nconf.get('upload_path'), 'profile');
-		await Promise.all([
-			rimrafAsync(path.join(folder, `${uid}-profilecover*`)),
-			rimrafAsync(path.join(folder, `${uid}-profileavatar*`)),
-		]);
+		if (utils.isNumber(uid)) {
+			const folder = path.join(nconf.get('upload_path'), 'profile', `uid-${uid}`);
+			await rimraf(folder);
+		}
 	}
 };

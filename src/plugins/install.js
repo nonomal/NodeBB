@@ -2,21 +2,21 @@
 
 const winston = require('winston');
 const path = require('path');
-const fs = require('fs');
+const fs = require('fs').promises;
 const nconf = require('nconf');
 const os = require('os');
 const cproc = require('child_process');
 const util = require('util');
-const request = require('request-promise-native');
 
+const request = require('../request');
 const db = require('../database');
 const meta = require('../meta');
 const pubsub = require('../pubsub');
-const { paths } = require('../constants');
+const { paths, pluginNamePattern } = require('../constants');
+const pkgInstall = require('../cli/package-install');
+const cache = require('../cache');
 
-const supportedPackageManagerList = require('../cli/package-install').supportedPackageManager;
-// load config from src/cli/package-install.js
-const packageManager = supportedPackageManagerList.indexOf(nconf.get('package_manager')) >= 0 ? nconf.get('package_manager') : 'npm';
+const packageManager = pkgInstall.getPackageManager();
 let packageManagerExecutable = packageManager;
 const packageManagerCommands = {
 	yarn: {
@@ -43,39 +43,57 @@ if (process.platform === 'win32') {
 
 module.exports = function (Plugins) {
 	if (nconf.get('isPrimary')) {
-		pubsub.on('plugins:toggleInstall', (data) => {
+		pubsub.on('plugins:toggleInstall', async (data) => {
 			if (data.hostname !== os.hostname()) {
-				toggleInstall(data.id, data.version);
+				try {
+					await toggleInstall(data.id, data.version, data.type);
+				} catch (err) {
+					winston.error(err.stack);
+				}
 			}
 		});
 
-		pubsub.on('plugins:upgrade', (data) => {
+		pubsub.on('plugins:upgrade', async (data) => {
 			if (data.hostname !== os.hostname()) {
-				upgrade(data.id, data.version);
+				try {
+					await upgrade(data.id, data.version);
+				} catch (err) {
+					winston.error(err.stack);
+				}
 			}
 		});
 	}
 
-	Plugins.toggleActive = async function (id) {
-		const isActive = await Plugins.isActive(id);
-		if (isActive) {
+	Plugins.toggleActive = async function (id, active) {
+		if (nconf.get('plugins:active')) {
+			winston.error('Cannot activate plugins while plugin state is set in the configuration (config.json, environmental variables or terminal arguments), please modify the configuration instead');
+			throw new Error('[[error:plugins-set-in-configuration]]');
+		}
+		if (!pluginNamePattern.test(id)) {
+			throw new Error('[[error:invalid-plugin-id]]');
+		}
+		if (typeof active === 'string') {
+			active = active === '1';
+		}
+		const isActivating = active ?? !await Plugins.isActive(id);
+		if (!isActivating) {
 			await db.sortedSetRemove('plugins:active', id);
 		} else {
 			const count = await db.sortedSetCard('plugins:active');
 			await db.sortedSetAdd('plugins:active', count, id);
 		}
+		cache.set(`plugin:isActive:${id}`, isActivating);
 		meta.reloadRequired = true;
-		Plugins.hooks.fire(isActive ? 'action:plugin.deactivate' : 'action:plugin.activate', { id: id });
-		return { id: id, active: !isActive };
+		const hook = isActivating ? 'activate' : 'deactivate';
+		Plugins.hooks.fire(`action:plugin.${hook}`, { id: id });
+		return { id: id, active: isActivating };
 	};
 
 	Plugins.checkWhitelist = async function (id, version) {
-		const body = await request({
-			method: 'GET',
-			url: `https://packages.nodebb.org/api/v1/plugins/${encodeURIComponent(id)}`,
-			json: true,
-		});
-
+		const { response, body } = await request.get(`https://packages.nodebb.org/api/v1/plugins/${encodeURIComponent(id)}`);
+		if (!response.ok) {
+			throw new Error(`[[error:cant-connect-to-nbbpm]]`);
+		}
 		if (body && body.code === 'ok' && (version === 'latest' || body.payload.valid.includes(version))) {
 			return;
 		}
@@ -83,45 +101,92 @@ module.exports = function (Plugins) {
 		throw new Error('[[error:plugin-not-whitelisted]]');
 	};
 
-	Plugins.toggleInstall = async function (id, version) {
-		pubsub.publish('plugins:toggleInstall', { hostname: os.hostname(), id: id, version: version });
-		return await toggleInstall(id, version);
+	Plugins.suggest = async function (pluginId, nbbVersion) {
+		const { response, body } = await request.get(`https://packages.nodebb.org/api/v1/suggest?package=${encodeURIComponent(pluginId)}&version=${encodeURIComponent(nbbVersion)}`);
+		if (!response.ok) {
+			throw new Error(`[[error:cant-connect-to-nbbpm]]`);
+		}
+		return body;
+	};
+
+	Plugins.toggleInstall = async function (id, version, type) {
+		if (!pluginNamePattern.test(id)) {
+			throw new Error('[[error:invalid-plugin-id]]');
+		}
+		pubsub.publish('plugins:toggleInstall', { hostname: os.hostname(), id, version, type });
+		return await toggleInstall(id, version, type);
 	};
 
 	const runPackageManagerCommandAsync = util.promisify(runPackageManagerCommand);
 
-	async function toggleInstall(id, version) {
+	async function toggleInstall(id, version, type) {
 		const [installed, active] = await Promise.all([
 			Plugins.isInstalled(id),
 			Plugins.isActive(id),
 		]);
-		const type = installed ? 'uninstall' : 'install';
-		if (active) {
+		if (type && type !== 'install' && type !== 'uninstall') {
+			throw new Error('[[error:invalid-data]]');
+		}
+		type = type ?? (installed ? 'uninstall' : 'install');
+		if (active && !nconf.get('plugins:active')) {
 			await Plugins.toggleActive(id);
 		}
+
 		await runPackageManagerCommandAsync(type, id, version || 'latest');
 		const pluginData = await Plugins.get(id);
-		Plugins.hooks.fire(`action:plugin.${type}`, { id: id, version: version });
+		Plugins.hooks.fire(`action:plugin.${type}`, { id, version });
 		return pluginData;
 	}
 
 	function runPackageManagerCommand(command, pkgName, version, callback) {
-		cproc.execFile(packageManagerExecutable, [
+		if (!pluginNamePattern.test(pkgName)) {
+			throw new Error('[[error:invalid-plugin-id]]');
+		}
+		const args = [
 			packageManagerCommands[packageManager][command],
-			pkgName + (command === 'install' ? `@${version}` : ''),
+			pkgName + (command === 'install' && version ? `@${version}` : ''),
 			'--save',
-		], (err, stdout) => {
-			if (err) {
-				return callback(err);
-			}
+			'--ignore-scripts',
+		];
 
-			winston.verbose(`[plugins/${command}] ${stdout}`);
-			callback();
-		});
+		if (process.platform === 'win32') {
+			const child = cproc.spawn(packageManagerExecutable, args, { shell: true });
+			let stdout = '';
+			let stderr = '';
+
+			child.stdout.on('data', (data) => {
+				stdout += data;
+			});
+			child.stderr.on('data', (data) => {
+				stderr += data;
+			});
+
+			child.on('close', (code) => {
+				if (code !== 0) {
+					const err = new Error(stderr || `Process exited with code ${code}`);
+					return callback(err);
+				}
+				winston.verbose(`[plugins/${command}] ${stdout}`);
+				callback();
+			});
+			child.on('error', callback);
+		} else {
+			cproc.execFile(packageManagerExecutable, args, (err, stdout) => {
+				if (err) {
+					return callback(err);
+				}
+
+				winston.verbose(`[plugins/${command}] ${stdout}`);
+				callback();
+			});
+		}
 	}
 
 
 	Plugins.upgrade = async function (id, version) {
+		if (!pluginNamePattern.test(id)) {
+			throw new Error('[[error:invalid-plugin-id]]');
+		}
 		pubsub.publish('plugins:upgrade', { hostname: os.hostname(), id: id, version: version });
 		return await upgrade(id, version);
 	};
@@ -136,18 +201,45 @@ module.exports = function (Plugins) {
 	Plugins.isInstalled = async function (id) {
 		const pluginDir = path.join(paths.nodeModules, id);
 		try {
-			const stats = await fs.promises.stat(pluginDir);
+			const stats = await fs.stat(pluginDir);
 			return stats.isDirectory();
 		} catch (err) {
 			return false;
 		}
 	};
 
+	Plugins.isSystemPlugin = async function (id) {
+		const pluginDir = path.join(paths.nodeModules, id, 'plugin.json');
+		try {
+			const pluginData = JSON.parse(await fs.readFile(pluginDir, 'utf8'));
+			return pluginData && pluginData.system === true;
+		} catch (err) {
+			return false;
+		}
+	};
+
 	Plugins.isActive = async function (id) {
-		return await db.isSortedSetMember('plugins:active', id);
+		if (nconf.get('plugins:active')) {
+			return nconf.get('plugins:active').includes(id);
+		}
+		const isActive = await cache.get(`plugin:isActive:${id}`, async () => {
+			return await db.isSortedSetMember('plugins:active', id);
+		});
+		return isActive;
 	};
 
 	Plugins.getActive = async function () {
+		if (nconf.get('plugins:active')) {
+			return nconf.get('plugins:active');
+		}
 		return await db.getSortedSetRange('plugins:active', 0, -1);
+	};
+
+	Plugins.autocomplete = async (fragment) => {
+		const pluginDir = paths.nodeModules;
+		const plugins = (await fs.readdir(pluginDir)).filter(filename => filename.startsWith(fragment));
+
+		// Autocomplete only if single match
+		return plugins.length === 1 ? plugins.pop() : fragment;
 	};
 };

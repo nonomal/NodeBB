@@ -2,7 +2,6 @@
 'use strict';
 
 const async = require('async');
-const validator = require('validator');
 const _ = require('lodash');
 
 const db = require('../database');
@@ -26,7 +25,7 @@ module.exports = function (Topics) {
 		);
 		await db.sortedSetsAdd(topicSets, timestamp, tid);
 		await Topics.updateCategoryTagsCount([cid], tags);
-		await Promise.all(tags.map(updateTagCount));
+		await updateTagCount(tags);
 	};
 
 	Topics.filterTags = async function (tags, cid) {
@@ -113,19 +112,27 @@ module.exports = function (Topics) {
 			await db.sortedSetAdd('tags:topic:count', 0, tag);
 			cache.del('tags:topic:count');
 		}
+		const allCids = await categories.getAllCidsFromSet('categories:cid');
+		const isMembers = await db.isMemberOfSortedSets(
+			allCids.map(cid => `cid:${cid}:tags`), tag
+		);
+		const bulkAdd = allCids.filter((cid, index) => !isMembers[index])
+			.map(cid => ([`cid:${cid}:tags`, 0, tag]));
+		await db.sortedSetAddBulk(bulkAdd);
 	};
 
 	Topics.renameTags = async function (data) {
-		await async.eachSeries(data, async (tagData) => {
+		for (const tagData of data) {
+			// eslint-disable-next-line no-await-in-loop
 			await renameTag(tagData.value, tagData.newName);
-		});
+		}
 	};
 
 	async function renameTag(tag, newTagName) {
+		newTagName = utils.cleanUpTag(newTagName, meta.config.maximumTagLength);
 		if (!newTagName || tag === newTagName) {
 			return;
 		}
-		newTagName = utils.cleanUpTag(newTagName, meta.config.maximumTagLength);
 
 		await Topics.createEmptyTag(newTagName);
 		const allCids = {};
@@ -154,20 +161,41 @@ module.exports = function (Topics) {
 				}
 			});
 			await db.setObjectBulk(
-				topicData.map(t => `topic:${t.tid}`),
-				topicData.map(t => ({ tags: t.tags.join(',') }))
+				topicData.map(t => [`topic:${t.tid}`, { tags: t.tags.join(',') }]),
 			);
 		}, {});
+		const followers = await db.getSortedSetRangeWithScores(`tag:${tag}:followers`, 0, -1);
+		if (followers.length) {
+			const userKeys = followers.map(item => `uid:${item.value}:followed_tags`);
+			const scores = await db.sortedSetsScore(userKeys, tag);
+			await db.sortedSetsRemove(userKeys, tag);
+			await db.sortedSetsAdd(userKeys, scores, newTagName);
+			await db.sortedSetAdd(
+				`tag:${newTagName}:followers`,
+				followers.map(item => item.score),
+				followers.map(item => item.value),
+			);
+		}
 		await Topics.deleteTag(tag);
 		await updateTagCount(newTagName);
 		await Topics.updateCategoryTagsCount(Object.keys(allCids), [newTagName]);
 	}
 
-	async function updateTagCount(tag) {
-		const count = await Topics.getTagTopicCount(tag);
-		await db.sortedSetAdd('tags:topic:count', count || 0, tag);
+	async function updateTagCount(tags) {
+		if (!Array.isArray(tags)) {
+			tags = [tags];
+		}
+		if (!tags.length) return;
+
+		const counts = await Promise.all(tags.map(tag => Topics.getTagTopicCount(tag)));
+		await db.sortedSetAdd(
+			'tags:topic:count',
+			tags.map((tag, index) => counts[index] || 0),
+			tags
+		);
 		cache.del('tags:topic:count');
 	}
+	Topics.updateTagCount = updateTagCount;
 
 	Topics.getTagTids = async function (tag, start, stop) {
 		const tids = await db.getSortedSetRevRange(`tag:${tag}:topics`, start, stop);
@@ -183,7 +211,7 @@ module.exports = function (Topics) {
 	};
 
 	Topics.getTagTopicCount = async function (tag, cids = []) {
-		let count = 0;
+		let count;
 		if (cids.length) {
 			count = await db.sortedSetsCardSum(
 				cids.map(cid => `cid:${cid}:tag:${tag}:topics`)
@@ -200,7 +228,10 @@ module.exports = function (Topics) {
 		if (!Array.isArray(tags) || !tags.length) {
 			return;
 		}
-		await removeTagsFromTopics(tags);
+		await Promise.all([
+			removeTagsFromTopics(tags),
+			removeTagsFromUsers(tags),
+		]);
 		const keys = tags.map(tag => `tag:${tag}:topics`);
 		await db.deleteAll(keys);
 		await db.sortedSetRemove('tags:topic:count', tags);
@@ -212,6 +243,7 @@ module.exports = function (Topics) {
 		const deleteKeys = [];
 		tags.forEach((tag) => {
 			deleteKeys.push(`tag:${tag}`);
+			deleteKeys.push(`tag:${tag}:followers`);
 			cids.forEach((cid) => {
 				deleteKeys.push(`cid:${cid}:tag:${tag}:topics`);
 			});
@@ -220,16 +252,35 @@ module.exports = function (Topics) {
 	};
 
 	async function removeTagsFromTopics(tags) {
-		await async.eachLimit(tags, 50, async (tag) => {
-			const tids = await db.getSortedSetRange(`tag:${tag}:topics`, 0, -1);
-			if (!tids.length) {
-				return;
-			}
+		const uniqTids = new Set();
+		const tagsToRemove = new Set(tags);
 
-			await db.deleteObjectFields(
-				tids.map(tid => `topic:${tid}`),
-				['tags'],
+		await batch.processArray(tags, async (tags) => {
+			await Promise.all(tags.map(async (tag) => {
+				await batch.processSortedSet(`tag:${tag}:topics`, async (tids) => {
+					tids.forEach(tid => uniqTids.add(tid));
+				}, { batch: 500 });
+			}));
+		}, { batch: 50 });
+
+		await batch.processArray(Array.from(uniqTids), async (tids) => {
+			let topicsTags = await Topics.getTopicsTags(tids);
+			topicsTags = topicsTags.map(
+				topicTags => topicTags.filter(tag => tag && !tagsToRemove.has(tag))
 			);
+
+			await db.setObjectBulk(
+				tids.map((tid, index) => ([
+					`topic:${tid}`, { tags: topicsTags[index].join(',') },
+				]))
+			);
+		}, { batch: 500 });
+	}
+
+	async function removeTagsFromUsers(tags) {
+		await async.eachLimit(tags, 50, async (tag) => {
+			const uids = await db.getSortedSetRange(`tag:${tag}:followers`, 0, -1);
+			await db.sortedSetsRemove(uids.map(uid => `uid:${uid}:followed_tags`), tag);
 		});
 	}
 
@@ -276,15 +327,16 @@ module.exports = function (Topics) {
 		const payload = await plugins.hooks.fire('filter:tags.getAll', {
 			tags: tags,
 		});
-		return await Topics.getTagData(payload.tags);
+		return Topics.getTagData(payload.tags);
 	}
 
-	Topics.getTagData = async function (tags) {
-		if (!tags.length) {
+	Topics.getTagData = function (tags) {
+		if (!tags || !tags.length) {
 			return [];
 		}
 		tags.forEach((tag) => {
-			tag.valueEscaped = validator.escape(String(tag.value));
+			tag.valueEncoded = encodeURIComponent(tag.value);
+			tag.class = tag.value.replace(/\s/g, '-');
 		});
 		return tags;
 	};
@@ -309,7 +361,7 @@ module.exports = function (Topics) {
 		const uniqueTopicTags = _.uniq(_.flatten(topicTags));
 
 		const tags = uniqueTopicTags.map(tag => ({ value: tag }));
-		const tagData = await Topics.getTagData(tags);
+		const tagData = Topics.getTagData(tags);
 		const tagDataMap = _.zipObject(uniqueTopicTags, tagData);
 
 		topicTags.forEach((tags, index) => {
@@ -334,17 +386,14 @@ module.exports = function (Topics) {
 					topicTags.push(tag);
 				}
 			});
-			bulkSet.push({ tags: topicTags.join(',') });
+			bulkSet.push([`topic:${t.tid}`, { tags: topicTags.join(',') }]);
 		});
 		await Promise.all([
 			db.sortedSetAddBulk(bulkAdd),
-			db.setObjectBulk(
-				topicData.map(t => `topic:${t.tid}`),
-				bulkSet,
-			),
+			db.setObjectBulk(bulkSet),
 		]);
 
-		await Promise.all(tags.map(updateTagCount));
+		await updateTagCount(tags);
 		await Topics.updateCategoryTagsCount(_.uniq(topicData.map(t => t.cid)), tags);
 	};
 
@@ -362,17 +411,14 @@ module.exports = function (Topics) {
 					topicTags.splice(topicTags.indexOf(tag), 1);
 				}
 			});
-			bulkSet.push({ tags: topicTags.join(',') });
+			bulkSet.push([`topic:${t.tid}`, { tags: topicTags.join(',') }]);
 		});
 		await Promise.all([
 			db.sortedSetRemoveBulk(bulkRemove),
-			db.setObjectBulk(
-				topicData.map(t => `topic:${t.tid}`),
-				bulkSet,
-			),
+			db.setObjectBulk(bulkSet),
 		]);
 
-		await Promise.all(tags.map(updateTagCount));
+		await updateTagCount(tags);
 		await Topics.updateCategoryTagsCount(_.uniq(topicData.map(t => t.cid)), tags);
 	};
 
@@ -382,6 +428,7 @@ module.exports = function (Topics) {
 
 		tags = await Topics.filterTags(tags, cid);
 		await Topics.addTags(tags, [tid]);
+		plugins.hooks.fire('action:topic.updateTags', { tags, tid });
 	};
 
 	Topics.deleteTopicTags = async function (tid) {
@@ -395,7 +442,7 @@ module.exports = function (Topics) {
 		await db.sortedSetsRemove(sets, tid);
 
 		await Topics.updateCategoryTagsCount([cid], tags);
-		await Promise.all(tags.map(updateTagCount));
+		await updateTagCount(tags);
 	};
 
 	Topics.searchTags = async function (data) {
@@ -426,22 +473,20 @@ module.exports = function (Topics) {
 	};
 
 	async function getAllTags() {
-		const cached = cache.get('tags:topic:count');
-		if (cached !== undefined) {
-			return cached;
-		}
-		const tags = await db.getSortedSetRevRangeWithScores('tags:topic:count', 0, -1);
-		cache.set('tags:topic:count', tags);
-		return tags;
+		const cached = await cache.get(
+			'tags:topic:count',
+			() => db.getSortedSetRevRangeWithScores('tags:topic:count', 0, -1)
+		);
+		return cached;
 	}
 
 	async function findMatches(data) {
-		let { query } = data;
+		const { query } = data;
 		let tagWhitelist = [];
 		if (parseInt(data.cid, 10)) {
 			tagWhitelist = await categories.getTagWhitelist([data.cid]);
 		}
-		let tags = [];
+		let tags;
 		if (Array.isArray(tagWhitelist[0]) && tagWhitelist[0].length) {
 			const scores = await db.sortedSetScores(`cid:${data.cid}:tags`, tagWhitelist[0]);
 			tags = tagWhitelist[0].map((tag, index) => ({ value: tag, score: scores[index] }));
@@ -456,11 +501,14 @@ module.exports = function (Topics) {
 			tags = await getAllTags();
 		}
 
-		query = query.toLowerCase();
+		const lowerQuery = meta.config.caseSensitiveTags ? query : query.toLowerCase();
 
 		const matches = [];
 		for (let i = 0; i < tags.length; i += 1) {
-			if (tags[i].value && tags[i].value.toLowerCase().startsWith(query)) {
+			if (tags[i].value && (meta.config.caseSensitiveTags ?
+				tags[i].value :
+				tags[i].value.toLowerCase()).startsWith(lowerQuery)
+			) {
 				matches.push(tags[i]);
 				if (matches.length > 39) {
 					break;
@@ -491,7 +539,7 @@ module.exports = function (Topics) {
 		}
 		const tags = await Topics.searchTags(data);
 
-		const tagData = await Topics.getTagData(tags.map(tag => ({ value: tag.value })));
+		const tagData = Topics.getTagData(tags.map(tag => ({ value: tag.value })));
 
 		tagData.forEach((tag, index) => {
 			tag.score = tags[index].score;
@@ -519,5 +567,40 @@ module.exports = function (Topics) {
 		tids = _.shuffle(_.uniq(_.flatten(tids))).slice(0, maximumTopics);
 		const topics = await Topics.getTopics(tids, uid);
 		return topics.filter(t => t && !t.deleted && parseInt(t.uid, 10) !== parseInt(uid, 10));
+	};
+
+	Topics.isFollowingTag = async function (tag, uid) {
+		return await db.isSortedSetMember(`tag:${tag}:followers`, uid);
+	};
+
+	Topics.getTagFollowers = async function (tag, start = 0, stop = -1) {
+		return await db.getSortedSetRange(`tag:${tag}:followers`, start, stop);
+	};
+
+	Topics.getTagsFollowers = async function (tags) {
+		return await db.getSortedSetsMembers(tags.map(tag => `tag:${tag}:followers`));
+	};
+
+	Topics.followTag = async (tag, uid) => {
+		if (!(parseInt(uid, 10) > 0)) {
+			throw new Error('[[error:not-logged-in]]');
+		}
+		const now = Date.now();
+		await db.sortedSetAddBulk([
+			[`tag:${tag}:followers`, now, uid],
+			[`uid:${uid}:followed_tags`, now, tag],
+		]);
+		plugins.hooks.fire('action:tags.follow', { tag, uid });
+	};
+
+	Topics.unfollowTag = async (tag, uid) => {
+		if (!(parseInt(uid, 10) > 0)) {
+			throw new Error('[[error:not-logged-in]]');
+		}
+		await db.sortedSetRemoveBulk([
+			[`tag:${tag}:followers`, uid],
+			[`uid:${uid}:followed_tags`, tag],
+		]);
+		plugins.hooks.fire('action:tags.unfollow', { tag, uid });
 	};
 };

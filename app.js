@@ -1,7 +1,7 @@
 /*
 	NodeBB - A better forum platform for the modern web
 	https://github.com/NodeBB/NodeBB/
-	Copyright (C) 2013-2017  NodeBB Inc.
+	Copyright (C) 2013-2021  NodeBB Inc.
 
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 'use strict';
 
 require('./require-main');
+require('./nodebb-global');
 
 const nconf = require('nconf');
 
@@ -33,7 +34,6 @@ const path = require('path');
 const file = require('./src/file');
 
 process.env.NODE_ENV = process.env.NODE_ENV || 'production';
-global.env = process.env.NODE_ENV || 'production';
 
 // Alternate configuration file support
 const configFile = path.resolve(__dirname, nconf.any(['config', 'CONFIG']) || 'config.json');
@@ -71,7 +71,7 @@ if (nconf.get('setup') || nconf.get('install')) {
 	});
 } else if (nconf.get('activate')) {
 	require('./src/cli/manage').activate(nconf.get('activate'));
-} else if (nconf.get('plugins')) {
+} else if (nconf.get('plugins') && typeof nconf.get('plugins') !== 'object') {
 	require('./src/cli/manage').listPlugins();
 } else if (nconf.get('build')) {
 	require('./src/cli/manage').build(nconf.get('build'));

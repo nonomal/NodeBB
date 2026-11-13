@@ -6,83 +6,63 @@ define('forum/account/header', [
 	'pictureCropper',
 	'components',
 	'translator',
-	'benchpress',
 	'accounts/delete',
+	'accounts/moderate',
+	'accounts/picture',
 	'api',
-], function (coverPhoto, pictureCropper, components, translator, Benchpress, AccountsDelete, api) {
-	var AccountHeader = {};
-	var isAdminOrSelfOrGlobalMod;
+	'modals',
+	'alerts',
+], function (coverPhoto, pictureCropper, components, translator,
+	AccountsDelete, AccountsModerate, AccountsPicture, api, modals, alerts) {
+	const AccountHeader = {};
+	let isAdminOrSelfOrGlobalMod;
 
 	AccountHeader.init = function () {
 		isAdminOrSelfOrGlobalMod = ajaxify.data.isAdmin || ajaxify.data.isSelf || ajaxify.data.isGlobalModerator;
 
-		hidePrivateLinks();
-		selectActivePill();
+		handleImageChange();
 
 		if (isAdminOrSelfOrGlobalMod) {
 			setupCoverPhoto();
 		}
 
-		components.get('account/follow').on('click', function () {
-			toggleFollow('follow');
+		components.get('account/follow').on('click', () => toggleFollow('follow'));
+		components.get('account/unfollow').on('click', () => toggleFollow('unfollow'));
+
+		components.get('account/chat').on('click', async function () {
+			const { roomId } = await api.get(`/users/${encodeURIComponent(ajaxify.data.uid)}/chat`);
+			const chat = await app.require('chat');
+			if (roomId) {
+				chat.openChat(roomId);
+			} else {
+				chat.newChat(ajaxify.data.uid);
+			}
 		});
 
-		components.get('account/unfollow').on('click', function () {
-			toggleFollow('unfollow');
-		});
-
-		components.get('account/chat').on('click', function () {
-			socket.emit('modules.chats.hasPrivateChat', ajaxify.data.uid, function (err, roomId) {
-				if (err) {
-					return app.alertError(err.message);
-				}
-				if (roomId) {
-					app.openChat(roomId);
-				} else {
-					app.newChat(ajaxify.data.uid);
-				}
-			});
-		});
-
-		components.get('account/new-chat').on('click', function () {
-			app.newChat(ajaxify.data.uid, function () {
+		components.get('account/new-chat').on('click', async function () {
+			const chat = await app.require('chat');
+			chat.newChat(ajaxify.data.uid, function () {
 				components.get('account/chat').parent().removeClass('hidden');
 			});
 		});
 
-
-		components.get('account/ban').on('click', function () {
-			banAccount(ajaxify.data.theirid);
-		});
-		components.get('account/unban').on('click', unbanAccount);
-		components.get('account/delete-account').on('click', handleDeleteEvent.bind(null, 'account'));
-		components.get('account/delete-content').on('click', handleDeleteEvent.bind(null, 'content'));
-		components.get('account/delete-all').on('click', handleDeleteEvent.bind(null, 'purge'));
+		components.get('account/ban').on('click', () => AccountsModerate.banAccount(ajaxify.data.theirid));
+		components.get('account/mute').on('click', () => AccountsModerate.muteAccount(ajaxify.data.theirid));
+		components.get('account/unban').on('click', () => AccountsModerate.unbanAccount(ajaxify.data.theirid));
+		components.get('account/unmute').on('click', () => AccountsModerate.unmuteAccount(ajaxify.data.theirid));
+		components.get('account/delete-account').on('click', () => AccountsDelete.account(ajaxify.data.theirid));
+		components.get('account/delete-content').on('click', () => AccountsDelete.content(ajaxify.data.theirid));
+		components.get('account/delete-all').on('click', () => AccountsDelete.purge(ajaxify.data.theirid));
 		components.get('account/flag').on('click', flagAccount);
-		components.get('account/block').on('click', toggleBlockAccount);
+		components.get('account/already-flagged').on('click', rescindAccountFlag);
+		components.get('account/block').on('click', () => toggleBlockAccount('block'));
+		components.get('account/unblock').on('click', () => toggleBlockAccount('unblock'));
 	};
 
-	function handleDeleteEvent(type) {
-		AccountsDelete[type](ajaxify.data.theirid);
-	}
-
-	// TODO: This exported method is used in forum/flags/detail -- refactor??
-	AccountHeader.banAccount = banAccount;
-
-	function hidePrivateLinks() {
-		if (!app.user.uid || app.user.uid !== parseInt(ajaxify.data.theirid, 10)) {
-			$('.account-sub-links .plugin-link.private').addClass('hide');
-		}
-	}
-
-	function selectActivePill() {
-		$('.account-sub-links li').removeClass('active').each(function () {
-			var href = $(this).find('a').attr('href');
-
-			if (decodeURIComponent(href) === decodeURIComponent(window.location.pathname)) {
-				$(this).addClass('active');
-				return false;
-			}
+	function handleImageChange() {
+		$('[component="profile/change/picture"]').on('click', function () {
+			AccountsPicture.openChangeModal();
+			return false;
 		});
 	}
 
@@ -98,7 +78,7 @@ define('forum/account/header', [
 			},
 			function () {
 				pictureCropper.show({
-					title: '[[user:upload_cover_picture]]',
+					title: '[[user:upload-cover-picture]]',
 					socketMethod: 'user.updateCover',
 					aspectRatio: NaN,
 					allowSkippingCrop: true,
@@ -116,65 +96,30 @@ define('forum/account/header', [
 	}
 
 	function toggleFollow(type) {
-		api[type === 'follow' ? 'put' : 'del']('/users/' + ajaxify.data.uid + '/follow', undefined, function (err) {
+		if (!app.user.uid) {
+			let objectId;
+			if (utils.isNumber(ajaxify.data.uid)) {
+				objectId = config.url + '/user/' + ajaxify.data.uid;
+			} else {
+				objectId = ajaxify.data.userslug;
+			}
+			import('modules/intents').then(({ trigger }) => {
+				trigger('follow', { object: objectId });
+			});
+			return false;
+		}
+
+		const target = isFinite(ajaxify.data.uid) ? ajaxify.data.uid : encodeURIComponent(ajaxify.data.userslug);
+		api[type === 'follow' ? 'put' : 'del']('/users/' + target + '/follow', undefined, function (err) {
 			if (err) {
-				return app.alertError(err);
+				return alerts.error(err);
 			}
 			components.get('account/follow').toggleClass('hide', type === 'follow');
 			components.get('account/unfollow').toggleClass('hide', type === 'unfollow');
-			app.alertSuccess('[[global:alert.' + type + ', ' + ajaxify.data.username + ']]');
+			alerts.success('[[global:alert.' + type + ', ' + ajaxify.data.username + ']]');
 		});
 
 		return false;
-	}
-
-	function banAccount(theirid, onSuccess) {
-		theirid = theirid || ajaxify.data.theirid;
-
-		Benchpress.render('admin/partials/temporary-ban', {}).then(function (html) {
-			bootbox.dialog({
-				className: 'ban-modal',
-				title: '[[user:ban_account]]',
-				message: html,
-				show: true,
-				buttons: {
-					close: {
-						label: '[[global:close]]',
-						className: 'btn-link',
-					},
-					submit: {
-						label: '[[user:ban_account]]',
-						callback: function () {
-							var formData = $('.ban-modal form').serializeArray().reduce(function (data, cur) {
-								data[cur.name] = cur.value;
-								return data;
-							}, {});
-
-							var until = formData.length > 0 ? (
-								Date.now() + (formData.length * 1000 * 60 * 60 * (parseInt(formData.unit, 10) ? 24 : 1))
-							) : 0;
-
-							api.put('/users/' + theirid + '/ban', {
-								until: until,
-								reason: formData.reason || '',
-							}).then(() => {
-								if (typeof onSuccess === 'function') {
-									return onSuccess();
-								}
-
-								ajaxify.refresh();
-							}).catch(app.alertError);
-						},
-					},
-				},
-			});
-		});
-	}
-
-	function unbanAccount() {
-		api.del('/users/' + ajaxify.data.theirid + '/ban').then(() => {
-			ajaxify.refresh();
-		}).catch(app.alertError);
 	}
 
 	function flagAccount() {
@@ -186,19 +131,29 @@ define('forum/account/header', [
 		});
 	}
 
-	function toggleBlockAccount() {
-		var targetEl = this;
+	function rescindAccountFlag() {
+		const flagId = $(this).data('flag-id');
+		require(['flags'], function (flags) {
+			modals.confirm('[[flags:modal-confirm-rescind]]', function (confirm) {
+				if (!confirm) {
+					return;
+				}
+				flags.rescind(flagId);
+			});
+		});
+	}
+
+	function toggleBlockAccount(action) {
 		socket.emit('user.toggleBlock', {
 			blockeeUid: ajaxify.data.uid,
 			blockerUid: app.user.uid,
+			action,
 		}, function (err, blocked) {
 			if (err) {
-				return app.alertError(err.message);
+				return alerts.error(err);
 			}
-
-			translator.translate('[[user:' + (blocked ? 'unblock' : 'block') + '_user]]', function (label) {
-				$(targetEl).text(label);
-			});
+			components.get('account/block').toggleClass('hidden', blocked);
+			components.get('account/unblock').toggleClass('hidden', !blocked);
 		});
 
 		// Keep dropdown open
@@ -206,21 +161,19 @@ define('forum/account/header', [
 	}
 
 	function removeCover() {
-		translator.translate('[[user:remove_cover_picture_confirm]]', function (translated) {
-			bootbox.confirm(translated, function (confirm) {
-				if (!confirm) {
-					return;
-				}
+		modals.confirm('[[user:remove-cover-picture-confirm]]', function (confirm) {
+			if (!confirm) {
+				return;
+			}
 
-				socket.emit('user.removeCover', {
-					uid: ajaxify.data.uid,
-				}, function (err) {
-					if (!err) {
-						ajaxify.refresh();
-					} else {
-						app.alertError(err.message);
-					}
-				});
+			socket.emit('user.removeCover', {
+				uid: ajaxify.data.uid,
+			}, function (err) {
+				if (!err) {
+					ajaxify.refresh();
+				} else {
+					alerts.error(err);
+				}
 			});
 		});
 	}

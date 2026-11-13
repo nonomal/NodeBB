@@ -1,17 +1,17 @@
 
 'use strict';
 
-const async = require('async');
-
 const db = require('../database');
 const posts = require('../posts');
 const categories = require('../categories');
 const privileges = require('../privileges');
 const plugins = require('../plugins');
 const meta = require('../meta');
+const activitypub = require('../activitypub');
+const utils = require('../utils');
 
 module.exports = function (Topics) {
-	Topics.createTopicFromPosts = async function (uid, title, pids, fromTid) {
+	Topics.createTopicFromPosts = async function (uid, title, pids, fromTid, cid) {
 		if (title) {
 			title = title.trim();
 		}
@@ -25,61 +25,88 @@ module.exports = function (Topics) {
 		if (!pids || !pids.length) {
 			throw new Error('[[error:invalid-pid]]');
 		}
-
-		pids.sort((a, b) => a - b);
+		const sourcePosts = await posts.getPostsFields(pids, ['pid', 'tid', 'timestamp']);
+		if (sourcePosts.some(p => !p?.tid || String(p.tid) !== String(fromTid))) {
+			throw new Error('[[error:invalid-pid]]');
+		}
+		pids = sourcePosts.sort((a, b) => a.timestamp - b.timestamp).map(p => p.pid);
 
 		const mainPid = pids[0];
-		const cid = await posts.getCidByPid(mainPid);
+		if (!cid) {
+			cid = await posts.getCidByPid(mainPid);
+		}
+		// A one-element array cid would make isModerator return a (truthy) array,
+		// bypassing the isAdminOrMod gate below. Coerce to a scalar.
+		if (Array.isArray(cid)) {
+			cid = cid[0];
+		}
 
-		const [postData, isAdminOrMod] = await Promise.all([
+		const [mainPost, isAdminOrMod] = await Promise.all([
 			posts.getPostData(mainPid),
 			privileges.categories.isAdminOrMod(cid, uid),
 		]);
+		let lastPost = mainPost;
+		if (pids.length > 1) {
+			lastPost = await posts.getPostData(pids[pids.length - 1]);
+		}
 
 		if (!isAdminOrMod) {
 			throw new Error('[[error:no-privileges]]');
 		}
-
-		const scheduled = postData.timestamp > Date.now();
+		const now = Date.now();
+		const scheduled = mainPost.timestamp > now;
 		const params = {
-			uid: postData.uid,
+			uid: mainPost.uid,
 			title: title,
 			cid: cid,
-			timestamp: scheduled && postData.timestamp,
+			timestamp: mainPost.timestamp,
 		};
 		const result = await plugins.hooks.fire('filter:topic.fork', {
 			params: params,
-			tid: postData.tid,
+			tid: mainPost.tid,
 		});
+
+		const canEditAll = await Promise.all(pids.map(pid => privileges.posts.canEdit(pid, uid)));
+		const failed = canEditAll.find(canEdit => !canEdit.flag);
+		if (failed) {
+			throw new Error(failed.message);
+		}
 
 		const tid = await Topics.create(result.params);
 		await Topics.updateTopicBookmarks(fromTid, pids);
 
-		await async.eachSeries(pids, async (pid) => {
-			const canEdit = await privileges.posts.canEdit(pid, uid);
-			if (!canEdit.flag) {
-				throw new Error(canEdit.message);
-			}
+		for (const pid of pids) {
+			/* eslint-disable no-await-in-loop */
 			await Topics.movePostToTopic(uid, pid, tid, scheduled);
-		});
+		}
 
-		await Topics.updateLastPostTime(tid, scheduled ? (postData.timestamp + 1) : Date.now());
+		await Topics.updateLastPostTime(tid, scheduled ? (mainPost.timestamp + 1) : lastPost.timestamp);
 
 		await Promise.all([
 			Topics.setTopicFields(tid, {
-				upvotes: postData.upvotes,
-				downvotes: postData.downvotes,
+				upvotes: mainPost.upvotes,
+				downvotes: mainPost.downvotes,
+				forkedFromTid: fromTid,
+				forkerUid: uid,
+				forkTimestamp: now,
 			}),
-			db.sortedSetsAdd(['topics:votes', `cid:${cid}:tids:votes`], postData.votes, tid),
+			db.sortedSetsAdd(['topics:votes', `cid:${cid}:tids:votes`], mainPost.votes, tid),
+			Topics.events.log(fromTid, { type: 'fork', uid, toCid: cid, href: `/topic/${tid}` }),
 		]);
 
-		plugins.hooks.fire('action:topic.fork', { tid: tid, fromTid: fromTid, uid: uid });
+		// ideally we should federate a "move" activity instead, then can capture remote posts too. tbd
+		if (utils.isNumber(pids[0])) {
+			const { activity } = await activitypub.mocks.activities.create(pids[0], uid);
+			await activitypub.feps.announce(pids[0], activity);
+		}
+
+		plugins.hooks.fire('action:topic.fork', { tid, fromTid, uid });
 
 		return await Topics.getTopicData(tid);
 	};
 
 	Topics.movePostToTopic = async function (callerUid, pid, tid, forceScheduled = false) {
-		tid = parseInt(tid, 10);
+		tid = String(tid);
 		const topicData = await Topics.getTopicFields(tid, ['tid', 'scheduled']);
 		if (!topicData.tid) {
 			throw new Error('[[error:no-topic]]');
@@ -97,7 +124,7 @@ module.exports = function (Topics) {
 			throw new Error('[[error:cant-move-from-scheduled-to-existing]]');
 		}
 
-		if (postData.tid === tid) {
+		if (String(postData.tid) === String(tid)) {
 			throw new Error('[[error:cant-move-to-same-topic]]');
 		}
 
@@ -145,8 +172,12 @@ module.exports = function (Topics) {
 			db.sortedSetRemove(removeFrom, postData.pid),
 			db.sortedSetAdd(`cid:${topicData[1].cid}:pids`, postData.timestamp, postData.pid),
 			db.sortedSetAdd(`cid:${topicData[1].cid}:uid:${postData.uid}:pids`, postData.timestamp, postData.pid),
+			db.sortedSetIncrByBulk([
+				[`uid:${postData.uid}:cids`, -1, topicData[0].cid],
+				[`uid:${postData.uid}:cids`, 1, topicData[1].cid],
+			]),
 		];
-		if (postData.votes > 0) {
+		if (postData.votes > 0 || postData.votes < 0) {
 			tasks.push(db.sortedSetAdd(`cid:${topicData[1].cid}:uid:${postData.uid}:pids:votes`, postData.votes, postData.pid));
 		}
 

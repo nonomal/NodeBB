@@ -8,6 +8,8 @@ const events = require('../events');
 const db = require('../database');
 const privileges = require('../privileges');
 const websockets = require('./index');
+const batch = require('../batch');
+const plugins = require('../plugins');
 const index = require('./index');
 const getAdminSearchDict = require('../admin/search').getDictionary;
 
@@ -15,12 +17,10 @@ const SocketAdmin = module.exports;
 SocketAdmin.user = require('./admin/user');
 SocketAdmin.categories = require('./admin/categories');
 SocketAdmin.settings = require('./admin/settings');
-SocketAdmin.groups = require('./admin/groups');
 SocketAdmin.tags = require('./admin/tags');
 SocketAdmin.rewards = require('./admin/rewards');
 SocketAdmin.navigation = require('./admin/navigation');
 SocketAdmin.rooms = require('./admin/rooms');
-SocketAdmin.social = require('./admin/social');
 SocketAdmin.themes = require('./admin/themes');
 SocketAdmin.plugins = require('./admin/plugins');
 SocketAdmin.widgets = require('./admin/widgets');
@@ -30,27 +30,48 @@ SocketAdmin.email = require('./admin/email');
 SocketAdmin.analytics = require('./admin/analytics');
 SocketAdmin.logs = require('./admin/logs');
 SocketAdmin.errors = require('./admin/errors');
-SocketAdmin.uploads = require('./admin/uploads');
 SocketAdmin.digest = require('./admin/digest');
 SocketAdmin.cache = require('./admin/cache');
 
-SocketAdmin.before = async function (socket, method) {
+async function checkAdminPrivileges(socket, method) {
 	const isAdmin = await user.isAdministrator(socket.uid);
 	if (isAdmin) {
-		return;
+		return true;
 	}
-
 	// Check admin privileges mapping (if not in mapping, deny access)
-	const privilegeSet = privileges.admin.socketMap.hasOwnProperty(method) ? privileges.admin.socketMap[method].split(';') : [];
+	const privilegeSet = privileges.admin.socketMap.hasOwnProperty(method) ?
+		privileges.admin.socketMap[method].split(';') :
+		[];
 	const hasPrivilege = (await Promise.all(privilegeSet.map(
 		async privilege => privileges.admin.can(privilege, socket.uid)
 	))).some(Boolean);
+
 	if (privilegeSet.length && hasPrivilege) {
+		return true;
+	}
+	return false;
+}
+
+SocketAdmin.before = async function (socket, method) {
+	if (!await checkAdminPrivileges(socket, method)) {
+		winston.warn(`[socket.io] Call to admin method ( ${method} ) blocked (accessed by uid ${socket.uid})`);
+		throw new Error('[[error:no-privileges]]');
+	}
+
+	// match src/middleware/admin.js checkPrivileges behaviour
+	const hasPassword = await user.hasPassword(socket.uid);
+	if (!hasPassword) {
 		return;
 	}
 
-	winston.warn(`[socket.io] Call to admin method ( ${method} ) blocked (accessed by uid ${socket.uid})`);
-	throw new Error('[[error:no-privileges]]');
+	const session = socket.request?.session || {};
+	const loginTime = session?.meta ? session.meta.datetime : 0;
+	const adminReloginDuration = meta.config.adminReloginDuration * 60000;
+	const disabled = meta.config.adminReloginDuration === 0;
+	if (!disabled && (!loginTime || parseInt(loginTime, 10) <= Date.now() - adminReloginDuration)) {
+		socket.emit('event:admin.reloginRequired');
+		throw new Error('[[login:logged-out-due-to-inactivity]]');
+	}
 };
 
 SocketAdmin.restart = async function (socket) {
@@ -102,8 +123,8 @@ SocketAdmin.getSearchDict = async function (socket) {
 	return await getAdminSearchDict(lang);
 };
 
-SocketAdmin.deleteAllSessions = function (socket, data, callback) {
-	user.auth.deleteAllSessions(callback);
+SocketAdmin.deleteAllSessions = async function () {
+	await user.auth.deleteAllSessions();
 };
 
 SocketAdmin.reloadAllSessions = function (socket, data, callback) {
@@ -118,6 +139,18 @@ SocketAdmin.getServerTime = function (socket, data, callback) {
 		timestamp: now.getTime(),
 		offset: now.getTimezoneOffset(),
 	});
+};
+
+SocketAdmin.clearSearchHistory = async function () {
+	const keys = await db.scan({ match: 'searches:*' });
+	await batch.processArray(keys, db.deleteAll, {
+		batch: 500,
+		interval: 0,
+	});
+};
+
+SocketAdmin.parseRaw = async function (socket, text) {
+	return await plugins.hooks.fire('filter:parse.raw', text);
 };
 
 require('../promisify')(SocketAdmin);

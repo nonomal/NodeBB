@@ -2,27 +2,18 @@
 
 const SocketCache = module.exports;
 
+const tracker = require('../../cache/tracker');
+
 SocketCache.clear = async function (socket, data) {
-	if (data.name === 'post') {
-		require('../../posts/cache').reset();
-	} else if (data.name === 'object') {
-		require('../../database').objectCache.reset();
-	} else if (data.name === 'group') {
-		require('../../groups').cache.reset();
-	} else if (data.name === 'local') {
-		require('../../cache').reset();
+	const foundCache = await tracker.findCacheByName(data.name);
+	if (foundCache && foundCache.reset) {
+		foundCache.reset();
 	}
 };
 
 SocketCache.toggle = async function (socket, data) {
-	const caches = {
-		post: require('../../posts/cache'),
-		object: require('../../database').objectCache,
-		group: require('../../groups').cache,
-		local: require('../../cache'),
-	};
-	if (!caches[data.name]) {
-		return;
+	const foundCache = await tracker.findCacheByName(data.name);
+	if (foundCache) {
+		foundCache.enabled = data.enabled;
 	}
-	caches[data.name].enabled = data.enabled;
 };

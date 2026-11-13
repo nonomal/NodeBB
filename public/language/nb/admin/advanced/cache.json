@@ -1,6 +1,6 @@
 {
-	"post-cache": "Post Cache",
-	"percent-full": "%1% Full",
-	"post-cache-size": "Post Cache Size",
-	"items-in-cache": "Items in Cache"
+	"cache": "Cache",
+	"percent-full": "%1% fullt",
+	"post-cache-size": "Størrelse på innleggsbuffer",
+	"items-in-cache": "Element i buffer"
 }

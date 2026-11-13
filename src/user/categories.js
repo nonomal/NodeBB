@@ -3,24 +3,40 @@
 const _ = require('lodash');
 
 const db = require('../database');
+const meta = require('../meta');
 const categories = require('../categories');
+const activitypub = require('../activitypub');
 const plugins = require('../plugins');
+const utils = require('../utils');
 
 module.exports = function (User) {
 	User.setCategoryWatchState = async function (uid, cids, state) {
-		if (!(parseInt(uid, 10) > 0)) {
+		if (utils.isNumber(uid) && parseInt(uid, 10) <= 0) {
 			return;
 		}
+
 		const isStateValid = Object.values(categories.watchStates).includes(parseInt(state, 10));
 		if (!isStateValid) {
 			throw new Error('[[error:invalid-watch-state]]');
 		}
-		cids = Array.isArray(cids) ? cids : [cids];
+
+		cids = new Set(Array.isArray(cids) ? cids : [cids]);
+		cids.delete(-1); // cannot watch cid -1
+		cids.delete('-1');
+		cids = Array.from(cids);
+
 		const exists = await categories.exists(cids);
 		if (exists.includes(false)) {
 			throw new Error('[[error:no-category]]');
 		}
-		await db.sortedSetsAdd(cids.map(cid => `cid:${cid}:uid:watch:state`), state, uid);
+
+		const apiMethod = state >= categories.watchStates.tracking ? activitypub.out.follow : activitypub.out.undo.follow;
+		const follows = cids.filter(cid => !utils.isNumber(cid)).map(cid => apiMethod('uid', uid, cid)); // returns promises
+
+		await Promise.all([
+			db.sortedSetsAdd(cids.map(cid => `cid:${cid}:uid:watch:state`), state, uid),
+			...follows,
+		]);
 	};
 
 	User.getCategoryWatchState = async function (uid) {
@@ -49,7 +65,9 @@ module.exports = function (User) {
 		if (!(parseInt(uid, 10) > 0)) {
 			return [];
 		}
-		const cids = await User.getCategoriesByStates(uid, [categories.watchStates.watching]);
+		let cids = await User.getCategoriesByStates(uid, [categories.watchStates.watching]);
+		const categoryData = await categories.getCategoriesFields(cids, ['disabled']);
+		cids = cids.filter((cid, index) => categoryData[index] && !categoryData[index].disabled);
 		const result = await plugins.hooks.fire('filter:user.getWatchedCategories', {
 			uid: uid,
 			cids: cids,
@@ -58,10 +76,14 @@ module.exports = function (User) {
 	};
 
 	User.getCategoriesByStates = async function (uid, states) {
+		const [localCids, remoteCids] = await Promise.all([
+			categories.getAllCidsFromSet('categories:cid'),
+			meta.config.activitypubEnabled ? db.getObjectValues('handle:cid') : [],
+		]);
+		const cids = localCids.concat(remoteCids);
 		if (!(parseInt(uid, 10) > 0)) {
-			return await categories.getAllCidsFromSet('categories:cid');
+			return cids;
 		}
-		const cids = await categories.getAllCidsFromSet('categories:cid');
 		const userState = await categories.getWatchState(cids, uid);
 		return cids.filter((cid, index) => states.includes(userState[index]));
 	};

@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const winston = require('winston');
+const { fileTypeFromBuffer } = require('file-type');
 
 const file = require('./file');
 const plugins = require('./plugins');
@@ -28,7 +29,7 @@ image.isFileTypeAllowed = async function (path) {
 	}
 	const sharp = require('sharp');
 	await sharp(path, {
-		failOnError: true,
+		failOn: 'error',
 	}).metadata();
 };
 
@@ -40,20 +41,41 @@ image.resizeImage = async function (data) {
 			width: data.width,
 			height: data.height,
 			quality: data.quality,
+			type: data.type,
 		});
 	} else {
 		const sharp = requireSharp();
 		const buffer = await fs.promises.readFile(data.path);
 		const sharpImage = sharp(buffer, {
-			failOnError: true,
+			failOn: 'error',
+			animated: data.type === 'image/gif',
 		});
 		const metadata = await sharpImage.metadata();
 
 		sharpImage.rotate(); // auto-orients based on exif data
-		sharpImage.resize(data.hasOwnProperty('width') ? data.width : null, data.hasOwnProperty('height') ? data.height : null);
+		// don't resize if width/height not changing or not specificied
+		if ((data.width && metadata.width !== data.width) || (data.height && metadata.height !== data.height)) {
+			sharpImage.resize(data.width || null, data.height || null);
+		}
 
-		if (data.quality && metadata.format === 'jpeg') {
-			sharpImage.jpeg({ quality: data.quality });
+		if (data.quality) {
+			switch (metadata.format) {
+				case 'jpeg': {
+					sharpImage.jpeg({
+						quality: data.quality,
+						mozjpeg: true,
+					});
+					break;
+				}
+
+				case 'png': {
+					sharpImage.png({
+						quality: data.quality,
+						compressionLevel: 9,
+					});
+					break;
+				}
+			}
 		}
 
 		await sharpImage.toFile(data.target || data.path);
@@ -67,7 +89,7 @@ image.normalise = async function (path) {
 		});
 	} else {
 		const sharp = requireSharp();
-		await sharp(path, { failOnError: true }).png().toFile(`${path}.png`);
+		await sharp(path, { failOn: 'error' }).png().toFile(`${path}.png`);
 	}
 	return `${path}.png`;
 };
@@ -80,26 +102,32 @@ image.size = async function (path) {
 		});
 	} else {
 		const sharp = requireSharp();
-		imageData = await sharp(path, { failOnError: true }).metadata();
+		imageData = await sharp(path, { failOn: 'error' }).metadata();
 	}
 	return imageData ? { width: imageData.width, height: imageData.height } : undefined;
 };
 
-image.stripEXIF = async function (path) {
-	if (!meta.config.stripEXIFData || path.endsWith('.gif') || path.endsWith('.svg')) {
+image.stripEXIF = async function ({ path, type }) {
+	if (!meta.config.stripEXIFData || type === 'image/gif' || type === 'image/svg+xml') {
 		return;
 	}
 	try {
+		if (plugins.hooks.hasListeners('filter:image.stripEXIF')) {
+			await plugins.hooks.fire('filter:image.stripEXIF', {
+				path: path,
+				type: type,
+			});
+			return;
+		}
 		const buffer = await fs.promises.readFile(path);
 		const sharp = requireSharp();
-		await sharp(buffer, { failOnError: true }).rotate().toFile(path);
+		await sharp(buffer, { failOn: 'error', pages: -1 }).rotate().toFile(path);
 	} catch (err) {
 		winston.error(err.stack);
 	}
 };
 
 image.checkDimensions = async function (path) {
-	const meta = require('./meta');
 	const result = await image.size(path);
 
 	if (result.width > meta.config.rejectImageWidth || result.height > meta.config.rejectImageHeight) {
@@ -113,25 +141,33 @@ image.convertImageToBase64 = async function (path) {
 	return await fs.promises.readFile(path, 'base64');
 };
 
-image.mimeFromBase64 = function (imageData) {
-	return imageData.slice(5, imageData.indexOf('base64') - 1);
-};
+image.validateBase64 = async function (imageData, maxSize, allowedTypes) {
+	if (!imageData) {
+		throw new Error('[[error:invalid-data]]');
+	}
 
-image.extensionFromBase64 = function (imageData) {
-	return file.typeToExtension(image.mimeFromBase64(imageData));
+	const match = /^data:[^;,]+;base64,(.+)$/.exec(imageData);
+	if (!match) {
+		throw new Error('[[error:invalid-data]]');
+	}
+	const buffer = Buffer.from(match[1], 'base64');
+
+	if (buffer.length > maxSize * 1024) {
+		throw new Error(`[[error:file-too-big, ${maxSize}]]`);
+	}
+
+	const detected = await fileTypeFromBuffer(buffer);
+	if (!detected || !allowedTypes.includes(detected.mime)) {
+		throw new Error('[[error:invalid-image]]');
+	}
+
+	return { buffer, mime: detected.mime, extension: `.${detected.ext}` };
 };
 
 image.writeImageDataToTempFile = async function (imageData) {
-	const filename = crypto.createHash('md5').update(imageData).digest('hex');
-
-	const type = image.mimeFromBase64(imageData);
-	const extension = file.typeToExtension(type);
-
-	const filepath = path.join(os.tmpdir(), filename + extension);
-
-	const buffer = Buffer.from(imageData.slice(imageData.indexOf('base64') + 7), 'base64');
-
-	await fs.promises.writeFile(filepath, buffer, { encoding: 'base64' });
+	const filename = crypto.createHash('md5').update(imageData.buffer).digest('hex');
+	const filepath = path.join(os.tmpdir(), filename + imageData.extension);
+	await fs.promises.writeFile(filepath, imageData.buffer, { encoding: 'base64' });
 	return filepath;
 };
 

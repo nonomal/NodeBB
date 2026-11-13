@@ -1,18 +1,20 @@
 'use strict';
 
-define('admin/modules/search', ['mousetrap'], function (mousetrap) {
-	var search = {};
+define('admin/modules/search', ['mousetrap', 'alerts'], function (mousetrap, alerts) {
+	const search = {};
+
+	let dict;
 
 	function find(dict, term) {
-		var html = dict.filter(function (elem) {
+		const html = dict.filter(function (elem) {
 			return elem.translations.toLowerCase().includes(term);
 		}).map(function (params) {
-			var namespace = params.namespace;
-			var translations = params.translations;
-			var title = params.title;
-			var escaped = utils.escapeRegexChars(term);
+			const namespace = params.namespace;
+			const translations = params.translations;
+			let title = params.title;
+			const escaped = utils.escapeRegexChars(term);
 
-			var results = translations
+			const results = translations
 				// remove all lines without a match
 				.replace(new RegExp('^(?:(?!' + escaped + ').)*$', 'gmi'), '')
 				// remove lines that only match the title
@@ -21,7 +23,7 @@ define('admin/modules/search', ['mousetrap'], function (mousetrap) {
 				// and wrap the match in a `.search-match` element
 				.replace(
 					new RegExp('^[\\s\\S]*?(.{0,25})(' + escaped + ')(.{0,25})[\\s\\S]*?$', 'gmi'),
-					'...$1<span class="search-match">$2</span>$3...<br>'
+					'...$1<span class="search-match fw-bold">$2</span>$3...<br>'
 				)
 				// collapse whitespace
 				.replace(/(?:\n ?)+/g, '\n')
@@ -33,7 +35,7 @@ define('admin/modules/search', ['mousetrap'], function (mousetrap) {
 			);
 
 			return '<li role="presentation" class="result">' +
-				'<a role= "menuitem" href= "' + config.relative_path + '/' + namespace + '" >' +
+				'<a class="dropdown-item rounded-1" role="menuitem" href= "' + config.relative_path + '/' + namespace + '" >' +
 					title +
 					'<br>' + (!results ? '' :
 				('<small><code>' +
@@ -49,41 +51,49 @@ define('admin/modules/search', ['mousetrap'], function (mousetrap) {
 		if (!app.user.privileges['admin:settings']) {
 			return;
 		}
-
-		socket.emit('admin.getSearchDict', {}, function (err, dict) {
-			if (err) {
-				app.alertError(err);
-				throw err;
-			}
-			setupACPSearch(dict);
-		});
+		setupACPSearch();
 	};
 
-	function setupACPSearch(dict) {
-		var dropdown = $('#acp-search .dropdown');
-		var menu = $('#acp-search .dropdown-menu');
-		var input = $('#acp-search input');
+	function setupACPSearch() {
+		const searchEls = $('[component="acp/search"]');
+		searchEls.each((index, searchEl) => {
+			setupSearch($(searchEl));
+		});
+	}
 
+	async function lazyLoadDict() {
+		try {
+			dict = dict || await socket.emit('admin.getSearchDict', {});
+		} catch (err) {
+			alerts.error(err);
+			dict = [];
+		}
+	}
+
+	function setupSearch(searchEl) {
+		const dropdown = searchEl.find('.dropdown');
+		const menu = searchEl.find('.dropdown-menu');
+		const input = searchEl.find('input');
+		const placeholderText = dropdown.attr('data-text');
 		if (!config.searchEnabled) {
 			menu.addClass('search-disabled');
 		}
-
+		input.on('focus', lazyLoadDict);
 		input.on('keyup', function () {
 			dropdown.addClass('open');
 		});
 
-		$('#acp-search').parents('form').on('submit', function (ev) {
-			var selected = menu.find('li.result > a.focus').attr('href');
-			if (!selected.length) {
-				selected = menu.find('li.result > a').first().attr('href');
-			}
-			var href = selected || config.relative_path + '/search?in=titlesposts&term=' + escape(input.val());
+		searchEl.parents('form').on('submit', function (ev) {
+			const query = input.val();
+			const selected = menu.get(0).querySelector('li.result > a.focus') || menu.get(0).querySelector('li.result > a');
+			const href = selected ? selected.getAttribute('href') : config.relative_path + '/search?in=titlesposts&term=' + escape(query);
 
 			ajaxify.go(href.replace(/^\//, ''));
 
 			setTimeout(function () {
 				dropdown.removeClass('open');
 				input.blur();
+				dropdown.attr('data-text', query || placeholderText);
 			}, 150);
 
 			ev.preventDefault();
@@ -96,7 +106,7 @@ define('admin/modules/search', ['mousetrap'], function (mousetrap) {
 		});
 
 		mousetrap(input[0]).bind(['up', 'down'], function (ev, key) {
-			var next;
+			let next;
 			if (key === 'up') {
 				next = menu.find('li.result > a.focus').removeClass('focus').parent().prev('.result')
 					.children();
@@ -122,10 +132,10 @@ define('admin/modules/search', ['mousetrap'], function (mousetrap) {
 			ev.preventDefault();
 		});
 
-		var prevValue;
+		let prevValue;
 
 		input.on('keyup focus', function () {
-			var value = input.val().toLowerCase();
+			const value = input.val().toLowerCase();
 
 			if (value === prevValue) {
 				return;
@@ -134,8 +144,8 @@ define('admin/modules/search', ['mousetrap'], function (mousetrap) {
 
 			menu.children('.result').remove();
 
-			var len = /\W/.test(value) ? 3 : value.length;
-			var results;
+			const len = /\W/.test(value) ? 3 : value.length;
+			let results;
 
 			menu.toggleClass('state-start-typing', len === 0);
 			menu.toggleClass('state-keep-typing', len > 0 && len < 3);

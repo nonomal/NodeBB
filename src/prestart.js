@@ -1,9 +1,9 @@
 'use strict';
 
 const nconf = require('nconf');
-const url = require('url');
 const winston = require('winston');
 const path = require('path');
+const chalk = require('chalk').default;
 
 const pkg = require('../package.json');
 const { paths } = require('./constants');
@@ -14,7 +14,7 @@ function setupWinston() {
 	}
 
 	const formats = [];
-	if (nconf.get('log-colorize') !== 'false') {
+	if (nconf.get('log-colorize') !== 'false' && nconf.get('log-colorize') !== false) {
 		formats.push(winston.format.colorize());
 	}
 
@@ -57,15 +57,20 @@ function loadConfig(configFile) {
 		isCluster: false,
 		isPrimary: true,
 		jobsDisabled: false,
+		acpPluginInstallDisabled: false,
+		fontawesome: {
+			pro: false,
+			styles: '*',
+		},
 	});
 
 	// Explicitly cast as Bool, loader.js passes in isCluster as string 'true'/'false'
-	const castAsBool = ['isCluster', 'isPrimary', 'jobsDisabled'];
+	const castAsBool = ['isCluster', 'isPrimary', 'jobsDisabled', 'acpPluginInstallDisabled'];
 	nconf.stores.env.readOnly = false;
 	castAsBool.forEach((prop) => {
 		const value = nconf.get(prop);
 		if (value !== undefined) {
-			nconf.set(prop, typeof value === 'boolean' ? value : String(value).toLowerCase() === 'true');
+			nconf.set(prop, ['1', 1, 'true', true].includes(value));
 		}
 	});
 	nconf.stores.env.readOnly = true;
@@ -74,7 +79,6 @@ function loadConfig(configFile) {
 	// Ensure themes_path is a full filepath
 	nconf.set('themes_path', path.resolve(paths.baseDir, nconf.get('themes_path')));
 	nconf.set('core_templates_path', path.join(paths.baseDir, 'src/views'));
-	nconf.set('base_templates_path', path.join(nconf.get('themes_path'), 'nodebb-theme-persona/templates'));
 
 	nconf.set('upload_path', path.resolve(nconf.get('base_dir'), nconf.get('upload_path')));
 	nconf.set('upload_url', '/assets/uploads');
@@ -84,16 +88,29 @@ function loadConfig(configFile) {
 	if (!nconf.get('sessionKey')) {
 		nconf.set('sessionKey', 'express.sid');
 	}
+	const url = nconf.get('url');
+	if (url) {
+		const urlObject = new URL(url);
 
-	if (nconf.get('url')) {
-		nconf.set('url_parsed', url.parse(nconf.get('url')));
+		nconf.set('url', url.replace(/\/$/, ''));
+		nconf.set('url_parsed', {
+			href: urlObject.href,
+			origin: urlObject.origin,
+			protocol: urlObject.protocol,
+			host: urlObject.host,
+			hostname: urlObject.hostname,
+			port: urlObject.port,
+			pathname: urlObject.pathname,
+		});
 		// Parse out the relative_url and other goodies from the configured URL
-		const urlObject = url.parse(nconf.get('url'));
 		const relativePath = urlObject.pathname !== '/' ? urlObject.pathname.replace(/\/+$/, '') : '';
 		nconf.set('base_url', `${urlObject.protocol}//${urlObject.host}`);
 		nconf.set('secure', urlObject.protocol === 'https:');
 		nconf.set('use_port', !!urlObject.port);
 		nconf.set('relative_path', relativePath);
+		if (!nconf.get('asset_base_url')) {
+			nconf.set('asset_base_url', `${relativePath}/assets`);
+		}
 		nconf.set('port', nconf.get('PORT') || nconf.get('port') || urlObject.port || (nconf.get('PORT_ENV_VAR') ? nconf.get(nconf.get('PORT_ENV_VAR')) : false) || 4567);
 
 		// cookies don't provide isolation by port: http://stackoverflow.com/a/16328399/122353
@@ -111,7 +128,7 @@ function versionCheck() {
 
 	if (!compatible) {
 		winston.warn('Your version of Node.js is too outdated for NodeBB. Please update your version of Node.js.');
-		winston.warn(`Recommended ${range.green}${', '.reset}${version.yellow}${' provided\n'.reset}`);
+		winston.warn(`Recommended ${chalk.green(range)}, ${chalk.yellow(version)} provided\n`);
 	}
 }
 

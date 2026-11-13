@@ -8,7 +8,9 @@ const db = require('../database');
 const privileges = require('../privileges');
 const categories = require('../categories');
 const meta = require('../meta');
+const activitypub = require('../activitypub');
 const utils = require('../utils');
+const translator = require('../translator');
 
 const User = module.exports;
 
@@ -16,6 +18,8 @@ User.email = require('./email');
 User.notifications = require('./notifications');
 User.reset = require('./reset');
 User.digest = require('./digest');
+User.interstitials = require('./interstitials');
+User.customFields = require('./custom-fields');
 
 require('./data')(User);
 require('./auth')(User);
@@ -41,16 +45,24 @@ require('./blocks')(User);
 require('./uploads')(User);
 
 User.exists = async function (uids) {
-	return await (
-		Array.isArray(uids) ?
-			db.isSortedSetMembers('users:joindate', uids) :
-			db.isSortedSetMember('users:joindate', uids)
-	);
+	const singular = !Array.isArray(uids);
+	uids = singular ? [uids] : uids;
+
+	const [localExists, remoteExists] = await Promise.all([
+		db.isSortedSetMembers('users:joindate', uids),
+		meta.config.activitypubEnabled ? db.exists(uids.map(uid => `userRemote:${uid}`)) : uids.map(() => false),
+	]);
+	const results = localExists.map((local, idx) => local || remoteExists[idx]);
+	return singular ? results.pop() : results;
 };
 
 User.existsBySlug = async function (userslug) {
-	const exists = await User.getUidByUserslug(userslug);
-	return !!exists;
+	if (Array.isArray(userslug)) {
+		const uids = await User.getUidsByUserslugs(userslug);
+		return uids.map(uid => !!uid);
+	}
+	const uid = await User.getUidByUserslug(userslug);
+	return !!uid;
 };
 
 User.getUidsFromSet = async function (set, start, stop) {
@@ -76,11 +88,14 @@ User.getUsersWithFields = async function (uids, fields, uid) {
 };
 
 User.getUsers = async function (uids, uid) {
-	return await User.getUsersWithFields(uids, [
+	const userData = await User.getUsersWithFields(uids, [
 		'uid', 'username', 'userslug', 'picture', 'status',
 		'postcount', 'reputation', 'email:confirmed', 'lastonline',
 		'flags', 'banned', 'banned:expire', 'joindate',
+		'fullnameEmoji',
 	], uid);
+
+	return User.hidePrivateData(userData, uid);
 };
 
 User.getStatus = function (userData) {
@@ -88,7 +103,11 @@ User.getStatus = function (userData) {
 		return 'offline';
 	}
 	const isOnline = (Date.now() - userData.lastonline) < (meta.config.onlineCutoff * 60000);
-	return isOnline ? (userData.status || 'online') : 'offline';
+	let status = isOnline ? (userData.status || 'online') : 'offline';
+	if (!User.allowedStatus.includes(status)) {
+		status = 'offline';
+	}
+	return status;
 };
 
 User.getUidByUsername = async function (username) {
@@ -106,7 +125,47 @@ User.getUidByUserslug = async function (userslug) {
 	if (!userslug) {
 		return 0;
 	}
+
+	if (userslug.includes('@')) {
+		await activitypub.actors.assert(userslug);
+		return (await db.getObjectField('handle:uid', String(userslug).toLowerCase())) || null;
+	}
+
 	return await db.sortedSetScore('userslug:uid', userslug);
+};
+
+User.getUidsByUserslugs = async function (userslugs) {
+	const uniqueSlugs = _.uniq(userslugs);
+	const apSlugs = uniqueSlugs.filter(slug => slug.includes('@'));
+	const normalSlugs = uniqueSlugs.filter(slug => !slug.includes('@'));
+	const slugToUid = Object.create(null);
+	async function getApSlugs() {
+		await Promise.all(apSlugs.map(slug => activitypub.actors.assert(slug)));
+		const apUids = await db.getObjectFields(
+			'handle:uid',
+			apSlugs.map(slug => String(slug).toLowerCase()),
+		);
+		return apUids;
+	}
+
+	const [apUids, normalUids] = await Promise.all([
+		apSlugs.length ? getApSlugs() : [],
+		normalSlugs.length ? db.sortedSetScores('userslug:uid', normalSlugs) : [],
+	]);
+
+	apSlugs.forEach((slug) => {
+		if (apUids[slug]) {
+			slugToUid[slug] = apUids[slug];
+		}
+	});
+
+	normalSlugs.forEach((slug, i) => {
+		if (normalUids[i]) {
+			slugToUid[slug] = normalUids[i];
+		}
+	});
+
+	return userslugs.map(slug => slugToUid[slug] || null);
 };
 
 User.getUsernamesByUids = async function (uids) {
@@ -117,6 +176,23 @@ User.getUsernamesByUids = async function (uids) {
 User.getUsernameByUserslug = async function (slug) {
 	const uid = await User.getUidByUserslug(slug);
 	return await User.getUserField(uid, 'username');
+};
+
+User.getNotificationDisplayname = async function (uid) {
+	const isLocal = utils.isNumber(uid);
+	const fromCategory = !isLocal && await categories.exists(uid);
+
+	const userData = fromCategory ?
+		await categories.getCategoryFields(uid, ['name']) :
+		await User.getUserFields(uid, ['uid', 'username']);
+	if (fromCategory) {
+		return translator.escape(userData.name);
+	}
+
+	if (userData.uid === 0) {
+		return userData.displayname; // [[global:guest]] or [[global:former-user]]
+	}
+	return translator.escape(userData.displayname);
 };
 
 User.getUidByEmail = async function (email) {
@@ -210,6 +286,10 @@ User.getAdminsandGlobalModsandModerators = async function () {
 	return await User.getUsersData(_.union(...results));
 };
 
+User.getFirstAdminUid = async function () {
+	return (await db.getSortedSetRange('group:administrators:members', 0, 0))[0];
+};
+
 User.getModeratorUids = async function () {
 	const cids = await categories.getAllCidsFromSet('categories:cid');
 	const uids = await categories.getModeratorUids(cids);
@@ -229,77 +309,9 @@ User.addInterstitials = function (callback) {
 	plugins.hooks.register('core', {
 		hook: 'filter:register.interstitial',
 		method: [
-			// GDPR information collection/processing consent + email consent
-			async function (data) {
-				if (!meta.config.gdpr_enabled || (data.userData && data.userData.gdpr_consent)) {
-					return data;
-				}
-				if (!data.userData) {
-					throw new Error('[[error:invalid-data]]');
-				}
-
-				if (data.userData.uid) {
-					const consented = await db.getObjectField(`user:${data.userData.uid}`, 'gdpr_consent');
-					if (parseInt(consented, 10)) {
-						return data;
-					}
-				}
-
-				data.interstitials.push({
-					template: 'partials/gdpr_consent',
-					data: {
-						digestFrequency: meta.config.dailyDigestFreq,
-						digestEnabled: meta.config.dailyDigestFreq !== 'off',
-					},
-					callback: function (userData, formData, next) {
-						if (formData.gdpr_agree_data === 'on' && formData.gdpr_agree_email === 'on') {
-							userData.gdpr_consent = true;
-						}
-
-						next(userData.gdpr_consent ? null : new Error('[[register:gdpr_consent_denied]]'));
-					},
-				});
-				return data;
-			},
-
-			// Forum Terms of Use
-			async function (data) {
-				if (!data.userData) {
-					throw new Error('[[error:invalid-data]]');
-				}
-				if (!meta.config.termsOfUse || data.userData.acceptTos) {
-					// no ToS or ToS accepted, nothing to do
-					return data;
-				}
-
-				if (data.userData.uid) {
-					const accepted = await db.getObjectField(`user:${data.userData.uid}`, 'acceptTos');
-					if (parseInt(accepted, 10)) {
-						return data;
-					}
-				}
-
-				const termsOfUse = await plugins.hooks.fire('filter:parse.post', {
-					postData: {
-						content: meta.config.termsOfUse || '',
-					},
-				});
-
-				data.interstitials.push({
-					template: 'partials/acceptTos',
-					data: {
-						termsOfUse: termsOfUse.postData.content,
-					},
-					callback: function (userData, formData, next) {
-						if (formData['agree-terms'] === 'on') {
-							userData.acceptTos = true;
-						}
-
-						next(userData.acceptTos ? null : new Error('[[register:terms_of_use_error]]'));
-					},
-				});
-				return data;
-			},
+			User.interstitials.email, // Email address
+			User.interstitials.gdpr, // GDPR information collection/processing consent + email consent
+			User.interstitials.tou, // Forum Terms of Use
 		],
 	});
 

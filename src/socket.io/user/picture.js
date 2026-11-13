@@ -1,53 +1,20 @@
 'use strict';
 
+const nconf = require('nconf');
+
+const db = require('../../database');
 const user = require('../../user');
 const plugins = require('../../plugins');
+const privileges = require('../../privileges');
 
 module.exports = function (SocketUser) {
-	SocketUser.changePicture = async function (socket, data) {
-		if (!socket.uid) {
-			throw new Error('[[error:invalid-uid]]');
-		}
-
-		if (!data) {
-			throw new Error('[[error:invalid-data]]');
-		}
-
-		const { type } = data;
-		let picture = '';
-		await user.isAdminOrGlobalModOrSelf(socket.uid, data.uid);
-		if (type === 'default') {
-			picture = '';
-		} else if (type === 'uploaded') {
-			picture = await user.getUserField(data.uid, 'uploadedpicture');
-		} else {
-			const returnData = await plugins.hooks.fire('filter:user.getPicture', {
-				uid: socket.uid,
-				type: type,
-				picture: undefined,
-			});
-			picture = returnData && returnData.picture;
-		}
-
-		const validBackgrounds = await user.getIconBackgrounds(socket.uid);
-		if (!validBackgrounds.includes(data.bgColor)) {
-			data.bgColor = validBackgrounds[0];
-		}
-
-		await user.updateProfile(socket.uid, {
-			uid: data.uid,
-			picture: picture,
-			'icon:bgColor': data.bgColor,
-		}, ['picture', 'icon:bgColor']);
-	};
-
 	SocketUser.removeUploadedPicture = async function (socket, data) {
 		if (!socket.uid || !data || !data.uid) {
 			throw new Error('[[error:invalid-data]]');
 		}
 		await user.isAdminOrSelf(socket.uid, data.uid);
 		// 'keepAllUserImages' is ignored, since there is explicit user intent
-		const userData = await user.removeProfileImage(data.uid);
+		const userData = await user.removeProfileImage(data.uid, data.picture);
 		plugins.hooks.fire('action:user.removeUploadedPicture', {
 			callerUid: socket.uid,
 			uid: data.uid,
@@ -60,21 +27,42 @@ module.exports = function (SocketUser) {
 			throw new Error('[[error:invalid-data]]');
 		}
 
-		const [list, uploaded] = await Promise.all([
+		if (!socket.uid || !await privileges.users.canEdit(socket.uid, data.uid)) {
+			throw new Error('[[error:no-privileges]]');
+		}
+
+		const [list, userObj, userPictures] = await Promise.all([
 			plugins.hooks.fire('filter:user.listPictures', {
 				uid: data.uid,
 				pictures: [],
 			}),
-			user.getUserField(data.uid, 'uploadedpicture'),
+			user.getUserData(data.uid),
+			db.getSortedSetRevRange(`uid:${data.uid}:profile:pictures`, 0, 2),
 		]);
 
-		if (uploaded) {
+		userPictures.forEach((picture) => {
 			list.pictures.push({
 				type: 'uploaded',
-				url: uploaded,
-				text: '[[user:uploaded_picture]]',
+				url: picture.startsWith('http') ? picture : `${nconf.get('relative_path')}${picture}`,
+				text: '[[user:uploaded-picture]]',
 			});
-		}
+		});
+
+		// Normalize list into "user object" format
+		list.pictures = list.pictures.map(({ type, url, text }) => ({
+			type,
+			username: text,
+			picture: url,
+			selected: url === userObj.picture,
+		}));
+
+		list.pictures.unshift({
+			type: 'default',
+			'icon:text': userObj['icon:text'],
+			'icon:bgColor': userObj['icon:bgColor'],
+			username: '[[user:default-picture]]',
+			selected: !userObj.picture,
+		});
 
 		return list.pictures;
 	};

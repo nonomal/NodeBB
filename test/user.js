@@ -1,25 +1,28 @@
 'use strict';
 
 const assert = require('assert');
-const async = require('async');
 const fs = require('fs');
 const path = require('path');
 const nconf = require('nconf');
-const request = require('request');
-const requestAsync = require('request-promise-native');
 const jwt = require('jsonwebtoken');
+const { setTimeout } = require('node:timers/promises');
 
 const db = require('./mocks/databasemock');
 const User = require('../src/user');
 const Topics = require('../src/topics');
 const Categories = require('../src/categories');
 const Posts = require('../src/posts');
-const Password = require('../src/password');
 const groups = require('../src/groups');
+const messaging = require('../src/messaging');
 const helpers = require('./helpers');
 const meta = require('../src/meta');
-const plugins = require('../src/plugins');
+const file = require('../src/file');
 const socketUser = require('../src/socket.io/user');
+const apiUser = require('../src/api/users');
+const utils = require('../src/utils');
+const commonUtils = require('../public/src/utils.common');
+const privileges = require('../src/privileges');
+const request = require('../src/request');
 
 describe('User', () => {
 	let userData;
@@ -34,7 +37,7 @@ describe('User', () => {
 	before((done) => {
 		// Attach an emailer hook so related requests do not error
 		plugins.hooks.register('emailer-test', {
-			hook: 'filter:email.send',
+			hook: 'static:email.send',
 			method: dummyEmailerHook,
 		});
 
@@ -52,7 +55,7 @@ describe('User', () => {
 		});
 	});
 	after(() => {
-		plugins.hooks.unregister('emailer-test', 'filter:email.send');
+		plugins.hooks.unregister('emailer-test', 'static:email.send');
 	});
 
 	beforeEach(() => {
@@ -69,14 +72,23 @@ describe('User', () => {
 
 	describe('.create(), when created', () => {
 		it('should be created properly', async () => {
-			testUid = await User.create({ username: userData.username, password: userData.password, email: userData.email });
+			testUid = await User.create({
+				username: userData.username, password: userData.password, email: userData.email,
+			}, {
+				emailVerification: 'verify',
+			});
 			assert.ok(testUid);
 		});
 
 		it('should be created properly', async () => {
-			const uid = await User.create({ username: 'weirdemail', email: '<h1>test</h1>@gmail.com' });
+			const email = '<h1>test</h1>@gmail.com';
+			const uid = await User.create({ username: 'weirdemail', email: email });
 			const data = await User.getUserData(uid);
-			assert.equal(data.email, '&lt;h1&gt;test&lt;&#x2F;h1&gt;@gmail.com');
+
+			const validationPending = await User.email.isValidationPending(uid, email);
+			assert.strictEqual(validationPending, true);
+
+			assert.equal(data.email, '');
 			assert.strictEqual(data.profileviews, 0);
 			assert.strictEqual(data.reputation, 0);
 			assert.strictEqual(data.postcount, 0);
@@ -95,7 +107,7 @@ describe('User', () => {
 
 		it('should error with invalid password', (done) => {
 			User.create({ username: 'test', password: '1' }, (err) => {
-				assert.equal(err.message, '[[reset_password:password_too_short]]');
+				assert.equal(err.message, '[[reset_password:password-too-short]]');
 				done();
 			});
 		});
@@ -159,10 +171,27 @@ describe('User', () => {
 			]);
 			assert.strictEqual(err.message, '[[error:email-taken]]');
 		});
+
+		it('should fail to create user with invalid slug', async () => {
+			await assert.rejects(User.create({
+				username: '-.-', // slug becomes .
+				password: '123456',
+			}), { message: '[[error:invalid-username]]' });
+		});
+
+		it('should create user with valid slug (-.-.- => .-.)', async () => {
+			const uid = await User.create({
+				username: '-.-.-', // slug becomes .-.
+				password: '123456',
+			});
+			const data = await User.getUserData(uid);
+			assert.strictEqual(data.username, '-.-.-');
+			assert.strictEqual(data.userslug, '.-.');
+		});
 	});
 
 	describe('.uniqueUsername()', () => {
-		it('should deal with collisions', (done) => {
+		it('should deal with collisions', async () => {
 			const users = [];
 			for (let i = 0; i < 10; i += 1) {
 				users.push({
@@ -170,53 +199,35 @@ describe('User', () => {
 					email: `jane.doe${i}@example.com`,
 				});
 			}
+			for (const user of users) {
+				// eslint-disable-next-line no-await-in-loop
+				await User.create(user);
+			}
 
-			async.series([
-				function (next) {
-					async.eachSeries(users, (user, next) => {
-						User.create(user, next);
-					}, next);
-				},
-				function (next) {
-					User.uniqueUsername({
-						username: 'Jane Doe',
-						userslug: 'jane-doe',
-					}, (err, username) => {
-						assert.ifError(err);
-
-						assert.strictEqual(username, 'Jane Doe 9');
-						next();
-					});
-				},
-			], done);
+			const username = await User.uniqueUsername({
+				username: 'Jane Doe',
+				userslug: 'jane-doe',
+			});
+			assert.strictEqual(username, 'Jane Doe 9');
 		});
 	});
 
 	describe('.isModerator()', () => {
-		it('should return false', (done) => {
-			User.isModerator(testUid, testCid, (err, isModerator) => {
-				assert.equal(err, null);
-				assert.equal(isModerator, false);
-				done();
-			});
+		it('should return false', async () => {
+			const isModerator = await User.isModerator(testUid, testCid);
+			assert.strictEqual(isModerator, false);
 		});
 
-		it('should return two false results', (done) => {
-			User.isModerator([testUid, testUid], testCid, (err, isModerator) => {
-				assert.equal(err, null);
-				assert.equal(isModerator[0], false);
-				assert.equal(isModerator[1], false);
-				done();
-			});
+		it('should return two false results', async () => {
+			const isModerator = await User.isModerator([testUid, testUid], testCid);
+			assert.strictEqual(isModerator[0], false);
+			assert.strictEqual(isModerator[1], false);
 		});
 
-		it('should return two false results', (done) => {
-			User.isModerator(testUid, [testCid, testCid], (err, isModerator) => {
-				assert.equal(err, null);
-				assert.equal(isModerator[0], false);
-				assert.equal(isModerator[1], false);
-				done();
-			});
+		it('should return two false results', async () => {
+			const isModerator = await User.isModerator(testUid, [testCid, testCid]);
+			assert.strictEqual(isModerator[0], false);
+			assert.strictEqual(isModerator[1], false);
 		});
 	});
 
@@ -240,12 +251,10 @@ describe('User', () => {
 	});
 
 	describe('.getModeratorUids()', () => {
-		before((done) => {
-			async.series([
-				async.apply(groups.create, { name: 'testGroup' }),
-				async.apply(groups.join, 'cid:1:privileges:groups:moderate', 'testGroup'),
-				async.apply(groups.join, 'testGroup', 1),
-			], done);
+		before(async () => {
+			await groups.create({ name: 'testGroup' });
+			await groups.join('cid:1:privileges:groups:moderate', 'testGroup');
+			await groups.join('testGroup', 1);
 		});
 
 		it('should retrieve all users with moderator bit in category privilege', (done) => {
@@ -257,38 +266,13 @@ describe('User', () => {
 			});
 		});
 
-		after((done) => {
-			async.series([
-				async.apply(groups.leave, 'cid:1:privileges:groups:moderate', 'testGroup'),
-				async.apply(groups.destroy, 'testGroup'),
-			], done);
+		after(async () => {
+			groups.leave('cid:1:privileges:groups:moderate', 'testGroup');
+			groups.destroy('testGroup');
 		});
 	});
 
 	describe('.isReadyToPost()', () => {
-		it('should error when a user makes two posts in quick succession', (done) => {
-			meta.config = meta.config || {};
-			meta.config.postDelay = '10';
-
-			async.series([
-				async.apply(Topics.post, {
-					uid: testUid,
-					title: 'Topic 1',
-					content: 'lorem ipsum',
-					cid: testCid,
-				}),
-				async.apply(Topics.post, {
-					uid: testUid,
-					title: 'Topic 2',
-					content: 'lorem ipsum',
-					cid: testCid,
-				}),
-			], (err) => {
-				assert(err);
-				done();
-			});
-		});
-
 		it('should allow a post if the last post time is > 10 seconds', (done) => {
 			User.setUserField(testUid, 'lastposttime', +new Date() - (11 * 1000), () => {
 				Topics.post({
@@ -305,7 +289,7 @@ describe('User', () => {
 
 		it('should error when a new user posts if the last post time is 10 < 30 seconds', (done) => {
 			meta.config.newbiePostDelay = 30;
-			meta.config.newbiePostDelayThreshold = 3;
+			meta.config.newbieReputationThreshold = 3;
 
 			User.setUserField(testUid, 'lastposttime', +new Date() - (20 * 1000), () => {
 				Topics.post({
@@ -336,6 +320,27 @@ describe('User', () => {
 				});
 			});
 		});
+
+		it('should only post 1 topic out of 10', async () => {
+			await User.create({ username: 'flooder', password: '123456' });
+			const { jar } = await helpers.loginUser('flooder', '123456');
+			const titles = new Array(10).fill('topic title');
+			const res = await Promise.allSettled(titles.map(async (title) => {
+				const { body } = await helpers.request('post', '/api/v3/topics', {
+					body: {
+						cid: testCid,
+						title: title,
+						content: 'the content',
+					},
+					jar: jar,
+				});
+				return body.status;
+			}));
+			const failed = res.filter(res => res.value.code === 'bad-request');
+			const success = res.filter(res => res.value.code === 'ok');
+			assert.strictEqual(failed.length, 9);
+			assert.strictEqual(success.length, 1);
+		});
 	});
 
 	describe('.search()', () => {
@@ -356,69 +361,75 @@ describe('User', () => {
 			});
 		});
 
-		it('should search user', (done) => {
-			socketUser.search({ uid: testUid }, { query: 'john' }, (err, searchData) => {
-				assert.ifError(err);
-				assert.equal(searchData.users[0].username, 'John Smith');
-				done();
-			});
+		it('should search user', async () => {
+			const searchData = await apiUser.search({ uid: testUid }, { query: 'john' });
+			assert.equal(searchData.users[0].username, 'John Smith');
 		});
 
-		it('should error for guest', (done) => {
-			socketUser.search({ uid: 0 }, { query: 'john' }, (err) => {
-				assert.equal(err.message, '[[error:no-privileges]]');
-				done();
-			});
+		it('should error for guest', async () => {
+			await assert.rejects(
+				apiUser.search({ uid: 0 }, { query: 'john' }),
+				{ message: '[[error:no-privileges]]' }
+			);
 		});
 
-		it('should error with invalid data', (done) => {
-			socketUser.search({ uid: testUid }, null, (err) => {
-				assert.equal(err.message, '[[error:invalid-data]]');
-				done();
-			});
+		it('should error with invalid data', async () => {
+			await assert.rejects(
+				apiUser.search({ uid: testUid }, null),
+				{ message: '[[error:invalid-data]]' }
+			);
 		});
 
-		it('should error for unprivileged user', (done) => {
-			socketUser.search({ uid: testUid }, { searchBy: 'ip', query: '123' }, (err) => {
-				assert.equal(err.message, '[[error:no-privileges]]');
-				done();
-			});
+		it('should error for unprivileged user', async () => {
+			await assert.rejects(
+				apiUser.search({ uid: testUid }, { searchBy: 'ip', query: '123' }),
+				{ message: '[[error:no-privileges]]' }
+			);
 		});
 
-		it('should error for unprivileged user', (done) => {
-			socketUser.search({ uid: testUid }, { filters: ['banned'], query: '123' }, (err) => {
-				assert.equal(err.message, '[[error:no-privileges]]');
-				done();
-			});
+		it('should error for unprivileged user', async () => {
+			await assert.rejects(
+				apiUser.search({ uid: testUid }, { searchBy: ['email'], query: 'john' }),
+				{ message: '[[error:no-privileges]]' },
+			);
+
+			await assert.rejects(
+				apiUser.search({ uid: testUid }, { searchBy: ['ip'], query: 'john' }),
+				{ message: '[[error:no-privileges]]' },
+			);
 		});
 
-		it('should error for unprivileged user', (done) => {
-			socketUser.search({ uid: testUid }, { filters: ['flagged'], query: '123' }, (err) => {
-				assert.equal(err.message, '[[error:no-privileges]]');
-				done();
-			});
+		it('should error for unprivileged user', async () => {
+			await assert.rejects(
+				apiUser.search({ uid: testUid }, { filters: ['banned'], query: '123' }),
+				{ message: '[[error:no-privileges]]' }
+			);
+		});
+
+		it('should error for unprivileged user', async () => {
+			await assert.rejects(
+				apiUser.search({ uid: testUid }, { filters: ['flagged'], query: '123' }),
+				{ message: '[[error:no-privileges]]' }
+			);
 		});
 
 		it('should search users by ip', async () => {
 			const uid = await User.create({ username: 'ipsearch' });
 			await db.sortedSetAdd('ip:1.1.1.1:uid', [1, 1], [testUid, uid]);
-			const data = await socketUser.search({ uid: adminUid }, { query: '1.1.1.1', searchBy: 'ip' });
+			const data = await apiUser.search({ uid: adminUid }, { query: '1.1.1.1', searchBy: 'ip' });
 			assert(Array.isArray(data.users));
 			assert.equal(data.users.length, 2);
 		});
 
-		it('should search users by uid', (done) => {
-			socketUser.search({ uid: testUid }, { query: uid, searchBy: 'uid' }, (err, data) => {
-				assert.ifError(err);
-				assert(Array.isArray(data.users));
-				assert.equal(data.users[0].uid, uid);
-				done();
-			});
+		it('should search users by uid', async () => {
+			const data = await apiUser.search({ uid: testUid }, { query: uid, searchBy: 'uid' });
+			assert(Array.isArray(data.users));
+			assert.equal(data.users[0].uid, uid);
 		});
 
 		it('should search users by fullname', async () => {
 			const uid = await User.create({ username: 'fullnamesearch1', fullname: 'Mr. Fullname' });
-			const data = await socketUser.search({ uid: adminUid }, { query: 'mr', searchBy: 'fullname' });
+			const data = await apiUser.search({ uid: adminUid }, { query: 'mr', searchBy: 'fullname' });
 			assert(Array.isArray(data.users));
 			assert.equal(data.users.length, 1);
 			assert.equal(uid, data.users[0].uid);
@@ -426,91 +437,69 @@ describe('User', () => {
 
 		it('should search users by fullname', async () => {
 			const uid = await User.create({ username: 'fullnamesearch2', fullname: 'Baris:Usakli' });
-			const data = await socketUser.search({ uid: adminUid }, { query: 'baris:', searchBy: 'fullname' });
+			const data = await apiUser.search({ uid: adminUid }, { query: 'baris:', searchBy: 'fullname' });
 			assert(Array.isArray(data.users));
 			assert.equal(data.users.length, 1);
 			assert.equal(uid, data.users[0].uid);
 		});
 
-		it('should return empty array if query is empty', (done) => {
-			socketUser.search({ uid: testUid }, { query: '' }, (err, data) => {
-				assert.ifError(err);
-				assert.equal(data.users.length, 0);
-				done();
-			});
+		it('should return empty array if query is empty', async () => {
+			const data = await apiUser.search({ uid: testUid }, { query: '' });
+			assert.equal(data.users.length, 0);
 		});
 
-		it('should filter users', (done) => {
-			User.create({ username: 'ipsearch_filter' }, (err, uid) => {
-				assert.ifError(err);
-				User.bans.ban(uid, 0, '', (err) => {
-					assert.ifError(err);
-					User.setUserFields(uid, { flags: 10 }, (err) => {
-						assert.ifError(err);
-						socketUser.search({ uid: adminUid }, {
-							query: 'ipsearch',
-							filters: ['online', 'banned', 'flagged'],
-						}, (err, data) => {
-							assert.ifError(err);
-							assert.equal(data.users[0].username, 'ipsearch_filter');
-							done();
-						});
-					});
-				});
+		it('should filter users', async () => {
+			const uid = await User.create({ username: 'ipsearch_filter' });
+			await User.bans.ban(uid, 0, '');
+			await User.setUserFields(uid, { flags: 10 });
+			const data = await apiUser.search({ uid: adminUid }, {
+				query: 'ipsearch',
+				filters: ['online', 'banned', 'flagged'],
 			});
+			assert.equal(data.users[0].username, 'ipsearch_filter');
 		});
 
-		it('should sort results by username', (done) => {
-			async.waterfall([
-				function (next) {
-					User.create({ username: 'brian' }, next);
-				},
-				function (uid, next) {
-					User.create({ username: 'baris' }, next);
-				},
-				function (uid, next) {
-					User.create({ username: 'bzari' }, next);
-				},
-				function (uid, next) {
-					User.search({
-						uid: testUid,
-						query: 'b',
-						sortBy: 'username',
-						paginate: false,
-					}, next);
-				},
-			], (err, data) => {
-				assert.ifError(err);
-				assert.equal(data.users[0].username, 'baris');
-				assert.equal(data.users[1].username, 'brian');
-				assert.equal(data.users[2].username, 'bzari');
-				done();
+		it('should sort results by username', async () => {
+			await User.create({ username: 'brian' });
+			await User.create({ username: 'baris' });
+			await User.create({ username: 'bzari' });
+			const data = await User.search({
+				uid: testUid,
+				query: 'b',
+				sortBy: 'username',
+				paginate: false,
 			});
+			assert.equal(data.users[0].username, 'baris');
+			assert.equal(data.users[1].username, 'brian');
+			assert.equal(data.users[2].username, 'bzari');
+		});
+
+		it('should not sort users by email', async () => {
+			await User.create({ username: 'crian1', email: 'd@c.com' }, { emailVerification: 'verify' });
+			await User.create({ username: 'caris2', email: 'c@c.com' }, { emailVerification: 'verify' });
+			await User.create({ username: 'czari3', email: 'a@c.com' }, { emailVerification: 'verify' });
+			const data = await User.search({
+				uid: testUid,
+				query: 'c',
+				sortBy: 'email',
+				paginate: false,
+			});
+			// sorted by username
+			assert.equal(data.users[0].username, 'caris2');
+			assert.equal(data.users[1].username, 'crian1');
+			assert.equal(data.users[2].username, 'czari3');
 		});
 	});
 
 	describe('.delete()', () => {
-		let uid;
-		before((done) => {
-			User.create({ username: 'usertodelete', password: '123456', email: 'delete@me.com' }, (err, newUid) => {
-				assert.ifError(err);
-				uid = newUid;
-				done();
-			});
+		it('should delete a user account', async () => {
+			const uid = await User.create({ username: 'usertodelete', password: '123456', email: 'delete@me.com' });
+			await User.delete(1, uid);
+			const exists = await User.existsBySlug('usertodelete');
+			assert.strictEqual(exists, false);
 		});
 
-		it('should delete a user account', (done) => {
-			User.delete(1, uid, (err) => {
-				assert.ifError(err);
-				User.existsBySlug('usertodelete', (err, exists) => {
-					assert.ifError(err);
-					assert.equal(exists, false);
-					done();
-				});
-			});
-		});
-
-		it('should not re-add user to users:postcount if post is deleted after user deletion', async () => {
+		it('should not re-add user to users:postcount if post is purged after user account deletion', async () => {
 			const uid = await User.create({ username: 'olduserwithposts' });
 			assert(await db.isSortedSetMember('users:postcount', uid));
 
@@ -527,7 +516,7 @@ describe('User', () => {
 			assert(!await db.isSortedSetMember('users:postcount', uid));
 		});
 
-		it('should not re-add user to users:reputation if post is upvoted after user deletion', async () => {
+		it('should not re-add user to users:reputation if post is upvoted after user account deletion', async () => {
 			const uid = await User.create({ username: 'olduserwithpostsupvote' });
 			assert(await db.isSortedSetMember('users:reputation', uid));
 
@@ -545,116 +534,52 @@ describe('User', () => {
 		});
 
 		it('should delete user even if they started a chat', async () => {
-			const socketModules = require('../src/socket.io/modules');
 			const uid1 = await User.create({ username: 'chatuserdelete1' });
 			const uid2 = await User.create({ username: 'chatuserdelete2' });
-			const roomId = await socketModules.chats.newRoom({ uid: uid1 }, { touid: uid2 });
-			await socketModules.chats.send({ uid: uid1 }, { roomId: roomId, message: 'hello' });
-			await socketModules.chats.leave({ uid: uid2 }, roomId);
+			const roomId = await messaging.newRoom(uid1, { uids: [uid2] });
+			await messaging.addMessage({
+				uid: uid1,
+				content: 'hello',
+				roomId,
+			});
+			await messaging.leaveRoom([uid2], roomId);
 			await User.delete(1, uid1);
 			assert.strictEqual(await User.exists(uid1), false);
 		});
-	});
 
-	describe('passwordReset', () => {
-		let uid;
-		let code;
-		before((done) => {
-			User.create({ username: 'resetuser', password: '123456', email: 'reset@me.com' }, (err, newUid) => {
-				assert.ifError(err);
-				uid = newUid;
-				done();
+		it('should properly update global post counters after user account deletion with a topic that has replies from other users', async () => {
+			const global = await db.getObject('global');
+
+			const uid1 = await User.create({ username: 'chatuserdelete1' });
+			const uid2 = await User.create({ username: 'chatuserdelete2' });
+			const uid3 = await User.create({ username: 'chatuserdelete3' });
+			const topic = await Topics.post({
+				uid: uid1,
+				title: 'topic with replies',
+				content: 'initial post content',
+				cid: testCid,
 			});
-		});
 
-		it('.generate() should generate a new reset code', (done) => {
-			User.reset.generate(uid, (err, _code) => {
-				assert.ifError(err);
-				assert(_code);
-
-				code = _code;
-				done();
+			await Topics.reply({
+				uid: uid2,
+				tid: topic.topicData.tid,
+				content: 'reply content',
 			});
-		});
-
-		it('.generate() should invalidate a previous generated reset code', async () => {
-			const _code = await User.reset.generate(uid);
-			const valid = await User.reset.validate(code);
-			assert.strictEqual(valid, false);
-
-			code = _code;
-		});
-
-		it('.validate() should ensure that this new code is valid', (done) => {
-			User.reset.validate(code, (err, valid) => {
-				assert.ifError(err);
-				assert.strictEqual(valid, true);
-				done();
+			await Topics.reply({
+				uid: uid3,
+				tid: topic.topicData.tid,
+				content: 'reply content 2',
 			});
-		});
+			const afterPosting = await db.getObject('global');
+			assert.strictEqual(Number(afterPosting.postCount), Number(global.postCount) + 3); // initial post + 2 replies
+			assert.strictEqual(Number(afterPosting.topicCount), Number(global.topicCount) + 1); // just one new topic
 
-		it('.validate() should correctly identify an invalid code', (done) => {
-			User.reset.validate(`${code}abcdef`, (err, valid) => {
-				assert.ifError(err);
-				assert.strictEqual(valid, false);
-				done();
-			});
-		});
+			await User.deleteContent(uid1, uid1);
 
-		it('.send() should create a new reset code and reset password', async () => {
-			code = await User.reset.send('reset@me.com');
-		});
+			const afterUserDelete = await db.getObject('global');
 
-		it('.commit() should update the user\'s password and confirm their email', (done) => {
-			User.reset.commit(code, 'newpassword', (err) => {
-				assert.ifError(err);
-
-				async.parallel({
-					userData: function (next) {
-						User.getUserData(uid, next);
-					},
-					password: function (next) {
-						db.getObjectField(`user:${uid}`, 'password', next);
-					},
-				}, (err, results) => {
-					assert.ifError(err);
-					Password.compare('newpassword', results.password, true, (err, match) => {
-						assert.ifError(err);
-						assert(match);
-						assert.strictEqual(results.userData['email:confirmed'], 1);
-						done();
-					});
-				});
-			});
-		});
-
-		it('.should error if same password is used for reset', async () => {
-			const uid = await User.create({ username: 'badmemory', email: 'bad@memory.com', password: '123456' });
-			const code = await User.reset.generate(uid);
-			let err;
-			try {
-				await User.reset.commit(code, '123456');
-			} catch (_err) {
-				err = _err;
-			}
-			assert.strictEqual(err.message, '[[error:reset-same-password]]');
-		});
-
-		it('should not validate email if password reset is due to expiry', async () => {
-			const uid = await User.create({ username: 'resetexpiry', email: 'reset@expiry.com', password: '123456' });
-			let confirmed = await User.getUserField(uid, 'email:confirmed');
-			let [verified, unverified] = await groups.isMemberOfGroups(uid, ['verified-users', 'unverified-users']);
-			assert.strictEqual(confirmed, 0);
-			assert.strictEqual(verified, false);
-			assert.strictEqual(unverified, true);
-			await User.setUserField(uid, 'passwordExpiry', Date.now());
-			const code = await User.reset.generate(uid);
-			await User.reset.commit(code, '654321');
-			confirmed = await User.getUserField(uid, 'email:confirmed');
-			[verified, unverified] = await groups.isMemberOfGroups(uid, ['verified-users', 'unverified-users']);
-			assert.strictEqual(confirmed, 0);
-			assert.strictEqual(verified, false);
-			assert.strictEqual(unverified, true);
+			assert.strictEqual(Number(afterUserDelete.postCount), Number(global.postCount)); // back to original postcount
+			assert.strictEqual(Number(afterUserDelete.topicCount), Number(global.topicCount)); // back to original topic count
 		});
 	});
 
@@ -722,9 +647,15 @@ describe('User', () => {
 			});
 		});
 
+		it('should not modify the fields array passed in', async () => {
+			const fields = ['username', 'email'];
+			await User.getUserFields(testUid, fields);
+			assert.deepStrictEqual(fields, ['username', 'email']);
+		});
+
 		it('should return an icon text and valid background if username and picture is explicitly requested', async () => {
 			const payload = await User.getUserFields(testUid, ['username', 'picture']);
-			const validBackgrounds = await User.getIconBackgrounds(testUid);
+			const validBackgrounds = await User.getIconBackgrounds();
 			assert.strictEqual(payload['icon:text'], userData.username.slice(0, 1).toUpperCase());
 			assert(payload['icon:bgColor']);
 			assert(validBackgrounds.includes(payload['icon:bgColor']));
@@ -733,7 +664,7 @@ describe('User', () => {
 		it('should return a valid background, even if an invalid background colour is set', async () => {
 			await User.setUserField(testUid, 'icon:bgColor', 'teal');
 			const payload = await User.getUserFields(testUid, ['username', 'picture']);
-			const validBackgrounds = await User.getIconBackgrounds(testUid);
+			const validBackgrounds = await User.getIconBackgrounds();
 
 			assert(payload['icon:bgColor']);
 			assert(validBackgrounds.includes(payload['icon:bgColor']));
@@ -797,124 +728,181 @@ describe('User', () => {
 				done();
 			});
 		});
-	});
 
-	describe('not logged in', () => {
-		it('should return error if not logged in', (done) => {
-			socketUser.updateProfile({ uid: 0 }, { uid: 1 }, (err) => {
-				assert.equal(err.message, '[[error:invalid-uid]]');
-				done();
-			});
+		it('should return null if field or user doesn not exist', async () => {
+			assert.strictEqual(await User.getUserField('1', 'doesnotexist'), null);
+			assert.strictEqual(await User.getUserField('doesnotexistkey', 'doesnotexist'), null);
+			assert.strictEqual(await User.getUserField('0', 'doesnotexist'), null);
 		});
 	});
 
 	describe('profile methods', () => {
 		let uid;
 		let jar;
+		let csrf_token;
 
-		before((done) => {
-			User.create({ username: 'updateprofile', email: 'update@me.com', password: '123456' }, (err, newUid) => {
-				assert.ifError(err);
-				uid = newUid;
-				helpers.loginUser('updateprofile', '123456', (err, _jar) => {
-					assert.ifError(err);
-					jar = _jar;
-					done();
+		before(async () => {
+			const newUid = await User.create({
+				username: 'updateprofile', email: 'update@me.com', password: '123456',
+			}, {
+				emailVerification: 'verify',
+			});
+			uid = newUid;
+			({ jar, csrf_token } = await helpers.loginUser('updateprofile', '123456'));
+		});
+
+		it('should return error if not logged in', async () => {
+			try {
+				await apiUser.update({ uid: 0 }, { uid: 1 });
+				assert(false);
+			} catch (err) {
+				assert.equal(err.message, '[[error:invalid-uid]]');
+			}
+		});
+
+		it('should return error if data is invalid', async () => {
+			try {
+				await apiUser.update({ uid: uid }, null);
+				assert(false);
+			} catch (err) {
+				assert.equal(err.message, '[[error:invalid-data]]');
+			}
+		});
+
+		it('should return error if data is missing uid', async () => {
+			try {
+				await apiUser.update({ uid: uid }, { username: 'bip', email: 'bop' });
+				assert(false);
+			} catch (err) {
+				assert.equal(err.message, '[[error:invalid-data]]');
+			}
+		});
+
+		describe('.updateProfile()', () => {
+			let uid;
+			let group;
+
+			it('should update a user\'s profile', async () => {
+				uid = await User.create({
+					username: 'justforupdate', email: 'just@for.updated', password: '123456',
+				}, {
+					emailVerification: 'verify',
 				});
-			});
-		});
 
-		it('should return error if data is invalid', (done) => {
-			socketUser.updateProfile({ uid: uid }, null, (err) => {
-				assert.equal(err.message, '[[error:invalid-data]]');
-				done();
-			});
-		});
+				group = await groups.create({ name: 'updateProfileGroup' });
+				await groups.join(group.name, uid);
 
-		it('should return error if data is missing uid', (done) => {
-			socketUser.updateProfile({ uid: uid }, { username: 'bip', email: 'bop' }, (err) => {
-				assert.equal(err.message, '[[error:invalid-data]]');
-				done();
-			});
-		});
-
-		it('should update a user\'s profile', (done) => {
-			User.create({ username: 'justforupdate', email: 'just@for.updated', password: '123456' }, (err, uid) => {
-				assert.ifError(err);
 				const data = {
 					uid: uid,
 					username: 'updatedUserName',
 					email: 'updatedEmail@me.com',
 					fullname: 'updatedFullname',
-					website: 'http://nodebb.org',
-					location: 'izmir',
-					groupTitle: 'testGroup',
+					groupTitle: group.name,
 					birthday: '01/01/1980',
 					signature: 'nodebb is good',
 					password: '123456',
 				};
-				socketUser.updateProfile({ uid: uid }, { ...data, password: '123456', invalid: 'field' }, (err, result) => {
-					assert.ifError(err);
-
-					assert.equal(result.username, 'updatedUserName');
-					assert.equal(result.userslug, 'updatedusername');
-					assert.equal(result.email, 'updatedEmail@me.com');
-
-					db.getObject(`user:${uid}`, (err, userData) => {
-						assert.ifError(err);
-						Object.keys(data).forEach((key) => {
-							if (key !== 'password') {
-								assert.equal(data[key], userData[key]);
-							} else {
-								assert(userData[key].startsWith('$2a$'));
-							}
-						});
-						// updateProfile only saves valid fields
-						assert.strictEqual(userData.invalid, undefined);
-						done();
-					});
+				const result = await apiUser.update({ uid: uid }, {
+					...data, password: '123456', invalid: 'field',
 				});
+				assert.equal(result.username, 'updatedUserName');
+				assert.equal(result.userslug, 'updatedusername');
+				assert.equal(result.fullname, 'updatedFullname');
+
+				const userData = await db.getObject(`user:${uid}`);
+				Object.keys(data).forEach((key) => {
+					if (key === 'email') {
+						assert.strictEqual(userData.email, 'just@for.updated'); // email remains the same until confirmed
+					} else if (key !== 'password') {
+						assert.equal(data[key], userData[key]);
+					} else {
+						assert(userData[key].startsWith('$2b$'));
+					}
+				});
+				// updateProfile only saves valid fields
+				assert.strictEqual(userData.invalid, undefined);
+			});
+
+			it('should not change the username to escaped version', async () => {
+				const uid = await User.create({
+					username: 'ex\'ample_user', email: '13475@test.com', password: '123456',
+				}, {
+					emailVerification: 'verify',
+				});
+
+				const data = {
+					uid: uid,
+					username: 'ex\'ample_user',
+					password: '123456',
+				};
+				const result = await apiUser.update({ uid: uid }, {
+					...data, password: '123456', invalid: 'field',
+				});
+				const storedUsername = await db.getObjectField(`user:${uid}`, 'username');
+				assert.equal(result.username, 'ex\'ample_user');
+				assert.equal(storedUsername, 'ex\'ample_user');
+				assert.equal(result.userslug, 'ex-ample_user');
+			});
+
+			it('should also generate an email confirmation code for the changed email', async () => {
+				const confirmSent = await User.email.isValidationPending(uid, 'updatedemail@me.com');
+				assert.strictEqual(confirmSent, true);
+			});
+
+			it('should reject a groupTitle for a group the user is not a member of', async () => {
+				const otherGroup = await groups.create({ name: 'notAMemberGroup' });
+				await assert.rejects(
+					apiUser.update({ uid: uid }, { uid: uid, groupTitle: otherGroup.name }),
+					{ message: '[[error:invalid-group-title]]' },
+				);
+				await groups.destroy(otherGroup.name);
+			});
+
+			after(async () => {
+				await groups.destroy(group.name);
 			});
 		});
 
-		it('should change a user\'s password', (done) => {
-			User.create({ username: 'changepassword', password: '123456' }, (err, uid) => {
-				assert.ifError(err);
-				socketUser.changePassword({ uid: uid }, { uid: uid, newPassword: '654321', currentPassword: '123456' }, (err) => {
-					assert.ifError(err);
-					User.isPasswordCorrect(uid, '654321', '127.0.0.1', (err, correct) => {
-						assert.ifError(err);
-						assert(correct);
-						done();
-					});
-				});
-			});
+		it('should change a user\'s password', async () => {
+			const uid = await User.create({ username: 'changepassword', password: '123456' });
+			await apiUser.changePassword({ uid: uid }, { uid: uid, newPassword: '654321', currentPassword: '123456' });
+			const correct = await User.isPasswordCorrect(uid, '654321', '127.0.0.1');
+			assert(correct);
+		});
+
+		it('should not let user change their password to their current password', async () => {
+			const uid = await User.create({ username: 'changepasswordsame', password: '123456' });
+			await assert.rejects(
+				apiUser.changePassword({ uid: uid }, {
+					uid: uid,
+					newPassword: '123456',
+					currentPassword: '123456',
+				}),
+				{ message: '[[user:change-password-error-same-password]]' },
+			);
 		});
 
 		it('should not let user change another user\'s password', async () => {
 			const regularUserUid = await User.create({ username: 'regularuserpwdchange', password: 'regularuser1234' });
 			const uid = await User.create({ username: 'changeadminpwd1', password: '123456' });
-			let err;
 			try {
-				await socketUser.changePassword({ uid: uid }, { uid: regularUserUid, newPassword: '654321', currentPassword: '123456' });
-			} catch (_err) {
-				err = _err;
+				await apiUser.changePassword({ uid: uid }, { uid: regularUserUid, newPassword: '654321', currentPassword: '123456' });
+				assert(false);
+			} catch (err) {
+				assert.equal(err.message, '[[user:change-password-error-privileges]]');
 			}
-			assert.equal(err.message, '[[user:change_password_error_privileges]]');
 		});
 
 		it('should not let user change admin\'s password', async () => {
 			const adminUid = await User.create({ username: 'adminpwdchange', password: 'admin1234' });
 			await groups.join('administrators', adminUid);
 			const uid = await User.create({ username: 'changeadminpwd2', password: '123456' });
-
-			let err;
 			try {
-				await socketUser.changePassword({ uid: uid }, { uid: adminUid, newPassword: '654321', currentPassword: '123456' });
-			} catch (_err) {
-				err = _err;
+				await apiUser.changePassword({ uid: uid }, { uid: adminUid, newPassword: '654321', currentPassword: '123456' });
+				assert(false);
+			} catch (err) {
+				assert.equal(err.message, '[[user:change-password-error-privileges]]');
 			}
-			assert.equal(err.message, '[[user:change_password_error_privileges]]');
 		});
 
 		it('should let admin change another users password', async () => {
@@ -922,7 +910,7 @@ describe('User', () => {
 			await groups.join('administrators', adminUid);
 			const uid = await User.create({ username: 'forgotmypassword', password: '123456' });
 
-			await socketUser.changePassword({ uid: adminUid }, { uid: uid, newPassword: '654321' });
+			await apiUser.changePassword({ uid: adminUid }, { uid: uid, newPassword: '654321' });
 			const correct = await User.isPasswordCorrect(uid, '654321', '127.0.0.1');
 			assert(correct);
 		});
@@ -931,28 +919,22 @@ describe('User', () => {
 			const adminUid = await User.create({ username: 'adminforgotpwd', password: 'admin1234' });
 			await groups.join('administrators', adminUid);
 
-			let err;
 			try {
-				await socketUser.changePassword({ uid: adminUid }, { uid: adminUid, newPassword: '654321', currentPassword: 'wrongpwd' });
-			} catch (_err) {
-				err = _err;
+				await apiUser.changePassword({ uid: adminUid }, { uid: adminUid, newPassword: '654321', currentPassword: 'wrongpwd' });
+				assert(false);
+			} catch (err) {
+				assert.equal(err.message, '[[user:change-password-error-wrong-current]]');
 			}
-			assert.equal(err.message, '[[user:change_password_error_wrong_current]]');
 		});
 
-		it('should change username', (done) => {
-			socketUser.changeUsernameEmail({ uid: uid }, { uid: uid, username: 'updatedAgain', password: '123456' }, (err) => {
-				assert.ifError(err);
-				db.getObjectField(`user:${uid}`, 'username', (err, username) => {
-					assert.ifError(err);
-					assert.equal(username, 'updatedAgain');
-					done();
-				});
-			});
+		it('should change username', async () => {
+			await apiUser.update({ uid: uid }, { uid: uid, username: 'updatedAgain', password: '123456' });
+			const username = await db.getObjectField(`user:${uid}`, 'username');
+			assert.equal(username, 'updatedAgain');
 		});
 
 		it('should not let setting an empty username', async () => {
-			await socketUser.changeUsernameEmail({ uid: uid }, { uid: uid, username: '', password: '123456' });
+			await apiUser.update({ uid: uid }, { uid: uid, username: '', password: '123456' });
 			const username = await db.getObjectField(`user:${uid}`, 'username');
 			assert.strictEqual(username, 'updatedAgain');
 		});
@@ -961,69 +943,53 @@ describe('User', () => {
 			const maxLength = meta.config.maximumUsernameLength + 1;
 			const longName = new Array(maxLength).fill('a').join('');
 			const uid = await User.create({ username: longName });
-			await socketUser.changeUsernameEmail({ uid: uid }, { uid: uid, username: longName, email: 'verylong@name.com' });
+			await apiUser.update({ uid: uid }, { uid: uid, username: longName, email: 'verylong@name.com' });
 			const userData = await db.getObject(`user:${uid}`);
+			const awaitingValidation = await User.email.isValidationPending(uid, 'verylong@name.com');
+
 			assert.strictEqual(userData.username, longName);
-			assert.strictEqual(userData.email, 'verylong@name.com');
+			assert.strictEqual(awaitingValidation, true);
 		});
 
-		it('should not update a user\'s username if it did not change', (done) => {
-			socketUser.changeUsernameEmail({ uid: uid }, { uid: uid, username: 'updatedAgain', password: '123456' }, (err) => {
-				assert.ifError(err);
-				db.getSortedSetRevRange(`user:${uid}:usernames`, 0, -1, (err, data) => {
-					assert.ifError(err);
-					assert.equal(data.length, 2);
-					assert(data[0].startsWith('updatedAgain'));
-					done();
-				});
-			});
+		it('should not update a user\'s username if it did not change', async () => {
+			await apiUser.update({ uid: uid }, { uid: uid, username: 'updatedAgain', password: '123456' });
+			const data = await db.getSortedSetRevRange(`user:${uid}:usernames`, 0, -1);
+			assert.equal(data.length, 2);
+			assert(data[0].startsWith('updatedAgain'));
 		});
 
 		it('should not update a user\'s username if a password is not supplied', async () => {
-			let _err;
 			try {
-				await socketUser.updateProfile({ uid: uid }, { uid: uid, username: 'updatedAgain', password: '' });
+				await apiUser.update({ uid: uid }, { uid: uid, username: 'updatedAgain', password: '' });
+				assert(false);
 			} catch (err) {
-				_err = err;
+				assert.strictEqual(err.message, '[[error:invalid-password]]');
 			}
-
-			assert(_err);
-			assert.strictEqual(_err.message, '[[error:invalid-password]]');
 		});
 
-		it('should change email', (done) => {
-			User.create({ username: 'pooremailupdate', email: 'poor@update.me', password: '123456' }, (err, uid) => {
-				assert.ifError(err);
-				socketUser.changeUsernameEmail({ uid: uid }, { uid: uid, email: 'updatedAgain@me.com', password: '123456' }, (err) => {
-					assert.ifError(err);
-					db.getObjectField(`user:${uid}`, 'email', (err, email) => {
-						assert.ifError(err);
-						assert.equal(email, 'updatedAgain@me.com');
-						done();
-					});
-				});
-			});
+		it('should properly change username and clean up old sorted sets', async () => {
+			const uid = await User.create({ username: 'DennyO', password: '123456' });
+			let usernames = await db.getSortedSetRevRangeWithScores('username:uid', 0, -1);
+			usernames = usernames.filter(d => d.score === uid);
+			assert.deepStrictEqual(usernames, [{ value: 'DennyO', score: uid }]);
+
+			await apiUser.update({ uid: uid }, { uid: uid, username: 'DennyO\'s', password: '123456' });
+			usernames = await db.getSortedSetRevRangeWithScores('username:uid', 0, -1);
+			usernames = usernames.filter(d => d.score === uid);
+			assert.deepStrictEqual(usernames, [{ value: 'DennyO\'s', score: uid }]);
+
+			await apiUser.update({ uid: uid }, { uid: uid, username: 'Denny O', password: '123456' });
+			usernames = await db.getSortedSetRevRangeWithScores('username:uid', 0, -1);
+			usernames = usernames.filter(d => d.score === uid);
+			assert.deepStrictEqual(usernames, [{ value: 'Denny O', score: uid }]);
 		});
 
-		it('should error if email is identical', async () => {
-			await User.create({
-				username: 'trimtest1',
-				email: 'trim1@trim.com',
-			});
-			const uid2 = await User.create({
-				username: 'trimtest2',
-				email: 'trim2@trim.com',
-			});
-			let err;
-			try {
-				await socketUser.changeUsernameEmail({ uid: uid2 }, {
-					uid: uid2,
-					email: '  trim1@trim.com',
-				});
-			} catch (_err) {
-				err = _err;
-			}
-			assert.strictEqual(err.message, '[[error:email-taken]]');
+		it('should send validation email', async () => {
+			const uid = await User.create({ username: 'pooremailupdate', email: 'poor@update.me', password: '123456' });
+			await User.email.expireValidation(uid);
+			await apiUser.update({ uid: uid }, { uid: uid, email: 'updatedAgain@me.com', password: '123456' });
+
+			assert.strictEqual(await User.email.isValidationPending(uid, 'updatedAgain@me.com'.toLowerCase()), true);
 		});
 
 		it('should update cover image', (done) => {
@@ -1072,43 +1038,61 @@ describe('User', () => {
 			});
 		});
 
-		it('should change user picture', (done) => {
-			socketUser.changePicture({ uid: uid }, { type: 'default', uid: uid }, (err) => {
-				assert.ifError(err);
-				User.getUserField(uid, 'picture', (err, picture) => {
-					assert.ifError(err);
-					assert.equal(picture, '');
-					done();
-				});
-			});
+		it('should change user picture', async () => {
+			await apiUser.changePicture({ uid: uid }, { type: 'default', uid: uid });
+			const picture = await User.getUserField(uid, 'picture');
+			assert.equal(picture, '');
 		});
 
-		it('should fail to change user picture with invalid data', (done) => {
-			socketUser.changePicture({ uid: uid }, null, (err) => {
+		it('should let you set an external image', async () => {
+			const token = await helpers.getCsrfToken(jar);
+			const { body } = await request.put(`${nconf.get('url')}/api/v3/users/${uid}/picture`, {
+				jar,
+				headers: {
+					'x-csrf-token': token,
+				},
+				body: {
+					type: 'external',
+					url: 'https://example.org/picture.jpg',
+				},
+			});
+
+			assert(body && body.status && body.response);
+			assert.strictEqual(body.status.code, 'ok');
+
+			const picture = await User.getUserField(uid, 'picture');
+			assert.strictEqual(picture, 'https://example.org/picture.jpg');
+		});
+
+		it('should fail to change user picture with invalid data', async () => {
+			try {
+				await apiUser.changePicture({ uid: uid }, null);
+				assert(false);
+			} catch (err) {
 				assert.equal(err.message, '[[error:invalid-data]]');
-				done();
-			});
+			}
 		});
 
-		it('should fail to change user picture with invalid uid', (done) => {
-			socketUser.changePicture({ uid: 0 }, null, (err) => {
-				assert.equal(err.message, '[[error:invalid-uid]]');
-				done();
-			});
+		it('should fail to change user picture with invalid uid', async () => {
+			try {
+				await apiUser.changePicture({ uid: 0 }, { uid: 1 });
+				assert(false);
+			} catch (err) {
+				assert.equal(err.message, '[[error:no-privileges]]');
+			}
 		});
 
-		it('should set user picture to uploaded', (done) => {
-			User.setUserField(uid, 'uploadedpicture', '/test', (err) => {
-				assert.ifError(err);
-				socketUser.changePicture({ uid: uid }, { type: 'uploaded', uid: uid }, (err) => {
-					assert.ifError(err);
-					User.getUserField(uid, 'picture', (err, picture) => {
-						assert.ifError(err);
-						assert.equal(picture, `${nconf.get('relative_path')}/test`);
-						done();
-					});
-				});
-			});
+		it('should return picture and uploaded picture as different values', async () => {
+			const userData = await User.getUserFields(uid, ['picture', 'uploadedpicture']);
+			assert.notStrictEqual(userData.picture, userData.uploadedpicture);
+		});
+
+		it('should set user picture to uploaded', async () => {
+			await User.setUserField(uid, 'uploadedpicture', '/assets/uploads/test');
+			await db.sortedSetAdd(`uid:${uid}:profile:pictures`, Date.now(), '/assets/uploads/test');
+			await apiUser.changePicture({ uid: uid }, { type: 'uploaded', picture: '/assets/uploads/test', uid: uid });
+			const picture = await User.getUserField(uid, 'picture');
+			assert.equal(picture, `${nconf.get('relative_path')}/assets/uploads/test`);
 		});
 
 		it('should return error if profile image uploads disabled', (done) => {
@@ -1130,20 +1114,70 @@ describe('User', () => {
 			});
 		});
 
-		it('should return error if profile image has no mime type', (done) => {
+		it('should return error if profile image has invalid data URI', async () => {
+			await assert.rejects(
+				User.uploadCroppedPicture({
+					callerUid: uid,
+					uid: uid,
+					imageData: 'data:;base64,R0lGODlhPQBEAPeoAJosM/',
+				}),
+				{ message: '[[error:invalid-data]]' }
+			);
+			await assert.rejects(
+				User.uploadCroppedPicture({
+					callerUid: uid,
+					uid: uid,
+					imageData: 'not-a-data-uri',
+				}),
+				{ message: '[[error:invalid-data]]' }
+			);
+		});
+
+		it('should detect the actual image type instead of trusting the data URI mime type', (done) => {
 			User.uploadCroppedPicture({
 				callerUid: uid,
 				uid: uid,
-				imageData: 'data:image/invalid;base64,R0lGODlhPQBEAPeoAJosM/',
+				imageData: 'data:image/png;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEAAUAmJaQAA3AA/v89WAAAAA==',
 			}, (err) => {
 				assert.equal(err.message, '[[error:invalid-image]]');
 				done();
 			});
 		});
 
-		describe('user.uploadCroppedPicture', () => {
-			const badImage = 'data:audio/mp3;base64,R0lGODlhPQBEAPeoAJosM//AwO/AwHVYZ/z595kzAP/s7P+goOXMv8+fhw/v739/f+8PD98fH/8mJl+fn/9ZWb8/PzWlwv///6wWGbImAPgTEMImIN9gUFCEm/gDALULDN8PAD6atYdCTX9gUNKlj8wZAKUsAOzZz+UMAOsJAP/Z2ccMDA8PD/95eX5NWvsJCOVNQPtfX/8zM8+QePLl38MGBr8JCP+zs9myn/8GBqwpAP/GxgwJCPny78lzYLgjAJ8vAP9fX/+MjMUcAN8zM/9wcM8ZGcATEL+QePdZWf/29uc/P9cmJu9MTDImIN+/r7+/vz8/P8VNQGNugV8AAF9fX8swMNgTAFlDOICAgPNSUnNWSMQ5MBAQEJE3QPIGAM9AQMqGcG9vb6MhJsEdGM8vLx8fH98AANIWAMuQeL8fABkTEPPQ0OM5OSYdGFl5jo+Pj/+pqcsTE78wMFNGQLYmID4dGPvd3UBAQJmTkP+8vH9QUK+vr8ZWSHpzcJMmILdwcLOGcHRQUHxwcK9PT9DQ0O/v70w5MLypoG8wKOuwsP/g4P/Q0IcwKEswKMl8aJ9fX2xjdOtGRs/Pz+Dg4GImIP8gIH0sKEAwKKmTiKZ8aB/f39Wsl+LFt8dgUE9PT5x5aHBwcP+AgP+WltdgYMyZfyywz78AAAAAAAD///8AAP9mZv///wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACH5BAEAAKgALAAAAAA9AEQAAAj/AFEJHEiwoMGDCBMqXMiwocAbBww4nEhxoYkUpzJGrMixogkfGUNqlNixJEIDB0SqHGmyJSojM1bKZOmyop0gM3Oe2liTISKMOoPy7GnwY9CjIYcSRYm0aVKSLmE6nfq05QycVLPuhDrxBlCtYJUqNAq2bNWEBj6ZXRuyxZyDRtqwnXvkhACDV+euTeJm1Ki7A73qNWtFiF+/gA95Gly2CJLDhwEHMOUAAuOpLYDEgBxZ4GRTlC1fDnpkM+fOqD6DDj1aZpITp0dtGCDhr+fVuCu3zlg49ijaokTZTo27uG7Gjn2P+hI8+PDPERoUB318bWbfAJ5sUNFcuGRTYUqV/3ogfXp1rWlMc6awJjiAAd2fm4ogXjz56aypOoIde4OE5u/F9x199dlXnnGiHZWEYbGpsAEA3QXYnHwEFliKAgswgJ8LPeiUXGwedCAKABACCN+EA1pYIIYaFlcDhytd51sGAJbo3onOpajiihlO92KHGaUXGwWjUBChjSPiWJuOO/LYIm4v1tXfE6J4gCSJEZ7YgRYUNrkji9P55sF/ogxw5ZkSqIDaZBV6aSGYq/lGZplndkckZ98xoICbTcIJGQAZcNmdmUc210hs35nCyJ58fgmIKX5RQGOZowxaZwYA+JaoKQwswGijBV4C6SiTUmpphMspJx9unX4KaimjDv9aaXOEBteBqmuuxgEHoLX6Kqx+yXqqBANsgCtit4FWQAEkrNbpq7HSOmtwag5w57GrmlJBASEU18ADjUYb3ADTinIttsgSB1oJFfA63bduimuqKB1keqwUhoCSK374wbujvOSu4QG6UvxBRydcpKsav++Ca6G8A6Pr1x2kVMyHwsVxUALDq/krnrhPSOzXG1lUTIoffqGR7Goi2MAxbv6O2kEG56I7CSlRsEFKFVyovDJoIRTg7sugNRDGqCJzJgcKE0ywc0ELm6KBCCJo8DIPFeCWNGcyqNFE06ToAfV0HBRgxsvLThHn1oddQMrXj5DyAQgjEHSAJMWZwS3HPxT/QMbabI/iBCliMLEJKX2EEkomBAUCxRi42VDADxyTYDVogV+wSChqmKxEKCDAYFDFj4OmwbY7bDGdBhtrnTQYOigeChUmc1K3QTnAUfEgGFgAWt88hKA6aCRIXhxnQ1yg3BCayK44EWdkUQcBByEQChFXfCB776aQsG0BIlQgQgE8qO26X1h8cEUep8ngRBnOy74E9QgRgEAC8SvOfQkh7FDBDmS43PmGoIiKUUEGkMEC/PJHgxw0xH74yx/3XnaYRJgMB8obxQW6kL9QYEJ0FIFgByfIL7/IQAlvQwEpnAC7DtLNJCKUoO/w45c44GwCXiAFB/OXAATQryUxdN4LfFiwgjCNYg+kYMIEFkCKDs6PKAIJouyGWMS1FSKJOMRB/BoIxYJIUXFUxNwoIkEKPAgCBZSQHQ1A2EWDfDEUVLyADj5AChSIQW6gu10bE/JG2VnCZGfo4R4d0sdQoBAHhPjhIB94v/wRoRKQWGRHgrhGSQJxCS+0pCZbEhAAOw==';
+		it('should upload a gif file as profile image', async () => {
+			const uid = await User.create({ username: 'giflover', password: '123456' });
+			const { jar, csrf_token } = await helpers.loginUser('giflover', '123456');
+			const pathToGif = path.join(__dirname, '../test/files/animated.gif');
 
+			const { response } = await helpers.uploadFile(
+				`${nconf.get('url')}/api/user/giflover/uploadpicture`,
+				pathToGif, { }, jar, csrf_token
+			);
+			assert.strictEqual(response.statusCode, 200);
+			const picture = await db.getObjectField(`user:${uid}`, 'picture');
+			const uploadedPath = path.join(
+				nconf.get('upload_path'), `${picture.replace(nconf.get('upload_url'), '')}`
+			);
+			const sharp = require('sharp');
+			const metadata = await sharp(uploadedPath).metadata();
+			assert.strictEqual(metadata.format, 'gif');
+			assert.ok(metadata.pages > 1);
+		});
+
+		it('should fail to upload a non-image file as profile image', async () => {
+			await User.create({ username: 'invalidpicture', password: '123456' });
+			const { jar, csrf_token } = await helpers.loginUser('invalidpicture', '123456');
+			const pathToHtml = path.join(__dirname, '../test/files/503.html');
+
+			const { response, body } = await helpers.uploadFile(
+				`${nconf.get('url')}/api/user/invalidpicture/uploadpicture`,
+				pathToHtml, { }, jar, csrf_token
+			);
+			assert.strictEqual(response.statusCode, 500);
+			assert.strictEqual(body.error, '[[error:invalid-image]]');
+		});
+
+		describe('user.uploadCroppedPicture', () => {
 			it('should upload cropped profile picture', async () => {
 				const result = await socketUser.uploadCroppedPicture({ uid: uid }, { uid: uid, imageData: goodImage });
 				assert(result.url);
@@ -1201,11 +1235,35 @@ describe('User', () => {
 				});
 			});
 
+			it('should normalize uploaded image to png', async () => {
+				const oldValue = meta.config['profile:convertProfileImageToPNG'];
+				meta.config['profile:convertProfileImageToPNG'] = 1;
+
+				const uid = await User.create({ username: 'pngnormalize', password: '123456' });
+				const { jar, csrf_token } = await helpers.loginUser('pngnormalize', '123456');
+				const pathToJpeg = path.join(__dirname, '../test/files/normalise.jpg');
+
+				const { response } = await helpers.uploadFile(
+					`${nconf.get('url')}/api/user/pngnormalize/uploadpicture`,
+					pathToJpeg, { }, jar, csrf_token
+				);
+				assert.strictEqual(response.statusCode, 200);
+				const picture = await db.getObjectField(`user:${uid}`, 'picture');
+				const uploadedPath = path.join(
+					nconf.get('upload_path'), `${picture.replace(nconf.get('upload_url'), '')}`
+				);
+				const sharp = require('sharp');
+				const metadata = await sharp(uploadedPath).metadata();
+				assert.strictEqual(metadata.format, 'png');
+
+				meta.config['profile:convertProfileImageToPNG'] = oldValue;
+			});
+
 			it('should not allow image data with bad MIME type to be passed in', (done) => {
 				User.uploadCroppedPicture({
 					callerUid: uid,
 					uid: 1,
-					imageData: badImage,
+					imageData: 'data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEAAUAmJaQAA3AA/v89WAAAAA==',
 				}, (err) => {
 					assert.equal('[[error:invalid-image]]', err.message);
 					done();
@@ -1217,10 +1275,25 @@ describe('User', () => {
 					assert.ifError(err);
 					assert(data);
 					assert(Array.isArray(data));
-					assert.equal(data[0].type, 'uploaded');
-					assert.equal(data[0].text, '[[user:uploaded_picture]]');
+					assert.equal(data[0].type, 'default');
+					assert.equal(data[0].username, '[[user:default-picture]]');
+					assert.equal(data[1].type, 'uploaded');
+					assert.equal(data[1].username, '[[user:uploaded-picture]]');
 					done();
 				});
+			});
+
+			it('should fail to get profile pictures of another user without privileges', async () => {
+				const anotherUid = await User.create({ username: 'anotheruser', password: '123456' });
+				await assert.rejects(
+					socketUser.getProfilePictures({ uid: uid }, { uid: anotherUid }),
+					{ message: '[[error:no-privileges]]' }
+				);
+
+				await assert.rejects(
+					socketUser.getProfilePictures({ uid: 0 }, { uid: anotherUid }),
+					{ message: '[[error:no-privileges]]' }
+				);
 			});
 
 			it('should get default profile avatar', (done) => {
@@ -1266,61 +1339,37 @@ describe('User', () => {
 			});
 		});
 
-		it('should load profile page', (done) => {
-			request(`${nconf.get('url')}/api/user/updatedagain`, { jar: jar, json: true }, (err, res, body) => {
-				assert.ifError(err);
-				assert.equal(res.statusCode, 200);
-				assert(body);
-				done();
-			});
+		it('should load profile page', async () => {
+			const { response, body } = await request.get(`${nconf.get('url')}/api/user/updatedagain`, { jar });
+			assert.equal(response.statusCode, 200);
+			assert(body);
 		});
 
-		it('should load settings page', (done) => {
-			request(`${nconf.get('url')}/api/user/updatedagain/settings`, { jar: jar, json: true }, (err, res, body) => {
-				assert.ifError(err);
-				assert.equal(res.statusCode, 200);
-				assert(body.settings);
-				assert(body.languages);
-				assert(body.homePageRoutes);
-				done();
-			});
+		it('should load settings page', async () => {
+			const { response, body } = await request.get(`${nconf.get('url')}/api/user/updatedagain/settings`, { jar });
+			assert.equal(response.statusCode, 200);
+			assert(body.settings);
+			assert(body.languages);
+			assert(body.homePageRoutes);
 		});
 
-		it('should load edit page', (done) => {
-			request(`${nconf.get('url')}/api/user/updatedagain/edit`, { jar: jar, json: true }, (err, res, body) => {
-				assert.ifError(err);
-				assert.equal(res.statusCode, 200);
-				assert(body);
-				done();
-			});
+		it('should load edit page', async () => {
+			const { response, body } = await request.get(`${nconf.get('url')}/api/user/updatedagain/edit`, { jar });
+			assert.equal(response.statusCode, 200);
+			assert(body);
 		});
 
-		it('should load edit/email page', (done) => {
-			request(`${nconf.get('url')}/api/user/updatedagain/edit/email`, { jar: jar, json: true }, (err, res, body) => {
-				assert.ifError(err);
-				assert.equal(res.statusCode, 200);
-				assert(body);
-				done();
-			});
-		});
-
-		it('should load user\'s groups page', (done) => {
-			groups.create({
+		it('should load user\'s groups page', async () => {
+			await groups.create({
 				name: 'Test',
 				description: 'Foobar!',
-			}, (err) => {
-				assert.ifError(err);
-				groups.join('Test', uid, (err) => {
-					assert.ifError(err);
-					request(`${nconf.get('url')}/api/user/updatedagain/groups`, { jar: jar, json: true }, (err, res, body) => {
-						assert.ifError(err);
-						assert.equal(res.statusCode, 200);
-						assert(Array.isArray(body.groups));
-						assert.equal(body.groups[0].name, 'Test');
-						done();
-					});
-				});
 			});
+
+			await groups.join('Test', uid);
+			const { body } = await request.get(`${nconf.get('url')}/api/user/updatedagain/groups`, { jar });
+
+			assert(Array.isArray(body.groups));
+			assert.equal(body.groups[0].name, 'Test');
 		});
 	});
 
@@ -1350,30 +1399,12 @@ describe('User', () => {
 			assert.equal(data[0].timestamp, now);
 		});
 
-		it('should return the correct ban reason', (done) => {
-			async.series([
-				function (next) {
-					User.bans.ban(testUserUid, 0, '', (err) => {
-						assert.ifError(err);
-						next(err);
-					});
-				},
-				function (next) {
-					User.getModerationHistory(testUserUid, (err, data) => {
-						assert.ifError(err);
-						assert.equal(data.bans.length, 1, 'one ban');
-						assert.equal(data.bans[0].reason, '[[user:info.banned-no-reason]]', 'no ban reason');
-
-						next(err);
-					});
-				},
-			], (err) => {
-				assert.ifError(err);
-				User.bans.unban(testUserUid, (err) => {
-					assert.ifError(err);
-					done();
-				});
-			});
+		it('should return the correct ban reason', async () => {
+			await User.bans.ban(testUserUid, 0, '');
+			const data = await User.getModerationHistory(testUserUid);
+			assert.equal(data.bans.length, 1, 'one ban');
+			assert.equal(data.bans[0].reason, '[[user:info.banned-no-reason]]', 'no ban reason');
+			await User.bans.unban(testUserUid);
 		});
 
 		it('should ban user permanently', (done) => {
@@ -1387,22 +1418,14 @@ describe('User', () => {
 			});
 		});
 
-		it('should ban user temporarily', (done) => {
-			User.bans.ban(testUserUid, Date.now() + 2000, (err) => {
-				assert.ifError(err);
-
-				User.bans.isBanned(testUserUid, (err, isBanned) => {
-					assert.ifError(err);
-					assert.equal(isBanned, true);
-					setTimeout(() => {
-						User.bans.isBanned(testUserUid, (err, isBanned) => {
-							assert.ifError(err);
-							assert.equal(isBanned, false);
-							User.bans.unban(testUserUid, done);
-						});
-					}, 3000);
-				});
-			});
+		it('should ban user temporarily', async () => {
+			await User.bans.ban(testUserUid, Date.now() + 2000);
+			let isBanned = await User.bans.isBanned(testUserUid);
+			assert.equal(isBanned, true);
+			await setTimeout(3000);
+			isBanned = await User.bans.isBanned(testUserUid);
+			assert.equal(isBanned, false);
+			await User.bans.unban(testUserUid);
 		});
 
 		it('should error if until is NaN', (done) => {
@@ -1449,31 +1472,71 @@ describe('User', () => {
 			assert.strictEqual(membership.get('verified-users'), true);
 			assert.strictEqual(membership.get('unverified-users'), false);
 		});
+
+		it('should be able to post in category for banned users', async () => {
+			const { cid } = await Categories.create({
+				name: 'Test Category',
+				description: 'A test',
+				order: 1,
+			});
+			const testUid = await User.create({ username: userData.username });
+			await User.bans.ban(testUid);
+			let _err;
+			try {
+				await Topics.post({ title: 'banned topic', content: 'tttttttttttt', cid: cid, uid: testUid });
+			} catch (err) {
+				_err = err;
+			}
+			assert.strictEqual(_err && _err.message, '[[error:no-privileges]]');
+
+			await Promise.all([
+				privileges.categories.give(['groups:topics:create', 'groups:topics:reply'], cid, 'banned-users'),
+				privileges.categories.rescind(['groups:topics:create', 'groups:topics:reply'], cid, 'registered-users'),
+			]);
+
+			const result = await Topics.post({ title: 'banned topic', content: 'tttttttttttt', cid: cid, uid: testUid });
+			assert(result);
+			assert.strictEqual(result.topicData.title, 'banned topic');
+		});
+
+		it('should unban user properly if only "banned" field is requested', async () => {
+			const testUid = await User.create({ username: 'bannedUser3' });
+			await User.bans.ban(testUid, Date.now() + 2000);
+			assert.strictEqual(await db.isSortedSetMember('users:banned', testUid), true);
+			await setTimeout(3000);
+			await User.getUserFields(testUid, ['uid', 'banned']); // loading their data unbans the user
+			assert.strictEqual(await db.isSortedSetMember('users:banned', testUid), false);
+		});
+
+		it('should not return ban reason if login is incorrect', async () => {
+			const testUid = await User.create({ username: 'bannedUser4', password: '654321' });
+			await User.bans.ban(testUid, 0, 'testing bans');
+			let { response, body } = await helpers.loginUser('bannedUser4', '5555555');
+			assert.strictEqual(response.status, 403);
+			assert.strictEqual(body, '[[error:invalid-login-credentials]]');
+
+			({ response, body } = await helpers.loginUser('bannedUser4', '654321'));
+			assert.strictEqual(response.status, 403);
+			assert.strictEqual(body.reason, 'testing bans');
+		});
 	});
 
-	describe('Digest.getSubscribers', (done) => {
+	describe('Digest.getSubscribers', () => {
 		const uidIndex = {};
 
-		before((done) => {
+		before(async () => {
 			const testUsers = ['daysub', 'offsub', 'nullsub', 'weeksub'];
-			async.each(testUsers, (username, next) => {
-				async.waterfall([
-					async.apply(User.create, { username: username, email: `${username}@example.com` }),
-					function (uid, next) {
-						if (username === 'nullsub') {
-							return setImmediate(next);
-						}
+			await Promise.all(testUsers.map(async (username) => {
+				const uid = await User.create({ username, email: `${username}@example.com` });
+				if (username === 'nullsub') {
+					return;
+				}
+				uidIndex[username] = uid;
 
-						uidIndex[username] = uid;
-
-						const sub = username.slice(0, -3);
-						async.parallel([
-							async.apply(User.updateDigestSetting, uid, sub),
-							async.apply(User.setSetting, uid, 'dailyDigestFreq', sub),
-						], next);
-					},
-				], next);
-			}, done);
+				const sub = username.slice(0, -3);
+				await User.updateDigestSetting(uid, sub);
+				await User.setSetting(uid, 'dailyDigestFreq', sub);
+			}));
 		});
 
 		it('should accurately build digest list given ACP default "null" (not set)', (done) => {
@@ -1485,188 +1548,144 @@ describe('User', () => {
 			});
 		});
 
-		it('should accurately build digest list given ACP default "day"', (done) => {
-			async.series([
-				async.apply(meta.configs.set, 'dailyDigestFreq', 'day'),
-				function (next) {
-					User.digest.getSubscribers('day', (err, subs) => {
-						assert.ifError(err);
-						assert.strictEqual(subs.includes(uidIndex.daysub.toString()), true);	// daysub does get emailed
-						assert.strictEqual(subs.includes(uidIndex.weeksub.toString()), false);	// weeksub does not get emailed
-						assert.strictEqual(subs.includes(uidIndex.offsub.toString()), false);	// offsub doesn't get emailed
+		it('should accurately build digest list given ACP default "day"', async () => {
+			await meta.configs.set('dailyDigestFreq', 'day');
+			const subs = await User.digest.getSubscribers('day');
 
-						next();
-					});
-				},
-			], done);
+			assert.strictEqual(subs.includes(uidIndex.daysub.toString()), true); // daysub does get emailed
+			assert.strictEqual(subs.includes(uidIndex.weeksub.toString()), false); // weeksub does not get emailed
+			assert.strictEqual(subs.includes(uidIndex.offsub.toString()), false); // offsub doesn't get emailed
 		});
 
-		it('should accurately build digest list given ACP default "week"', (done) => {
-			async.series([
-				async.apply(meta.configs.set, 'dailyDigestFreq', 'week'),
-				function (next) {
-					User.digest.getSubscribers('week', (err, subs) => {
-						assert.ifError(err);
-						assert.strictEqual(subs.includes(uidIndex.weeksub.toString()), true);	// weeksub gets emailed
-						assert.strictEqual(subs.includes(uidIndex.daysub.toString()), false);	// daysub gets emailed
-						assert.strictEqual(subs.includes(uidIndex.offsub.toString()), false);	// offsub does not get emailed
+		it('should accurately build digest list given ACP default "week"', async () => {
+			await meta.configs.set('dailyDigestFreq', 'week');
+			const subs = await User.digest.getSubscribers('week');
 
-						next();
-					});
-				},
-			], done);
+			assert.strictEqual(subs.includes(uidIndex.weeksub.toString()), true); // weeksub gets emailed
+			assert.strictEqual(subs.includes(uidIndex.daysub.toString()), false); // daysub gets emailed
+			assert.strictEqual(subs.includes(uidIndex.offsub.toString()), false); // offsub does not get emailed
 		});
 
-		it('should accurately build digest list given ACP default "off"', (done) => {
-			async.series([
-				async.apply(meta.configs.set, 'dailyDigestFreq', 'off'),
-				function (next) {
-					User.digest.getSubscribers('day', (err, subs) => {
-						assert.ifError(err);
-						assert.strictEqual(subs.length, 1);
-
-						next();
-					});
-				},
-			], done);
+		it('should accurately build digest list given ACP default "off"', async () => {
+			await meta.configs.set('dailyDigestFreq', 'off');
+			const subs = await User.digest.getSubscribers('day');
+			assert.strictEqual(subs.length, 1);
 		});
 	});
 
 	describe('digests', () => {
 		let uid;
-		before((done) => {
-			async.waterfall([
-				function (next) {
-					User.create({ username: 'digestuser', email: 'test@example.com' }, next);
-				},
-				function (_uid, next) {
-					uid = _uid;
-					User.updateDigestSetting(uid, 'day', next);
-				},
-				function (next) {
-					User.setSetting(uid, 'dailyDigestFreq', 'day', next);
-				},
-				function (next) {
-					User.setSetting(uid, 'notificationType_test', 'notificationemail', next);
-				},
-			], done);
+		before(async () => {
+			uid = await User.create({ username: 'digestuser', email: 'test@example.com' });
+			await User.updateDigestSetting(uid, 'day');
+			await User.setSetting(uid, 'dailyDigestFreq', 'day');
+			await User.setSetting(uid, 'notificationType_test', 'notificationemail');
 		});
 
-		it('should send digests', (done) => {
-			User.digest.execute({ interval: 'day' }, (err) => {
-				assert.ifError(err);
-				done();
+		it('should send digests', async () => {
+			const oldValue = meta.config.includeUnverifiedEmails;
+			meta.config.includeUnverifiedEmails = true;
+			const uid = await User.create({
+				username: 'digest', email: 'email@test.com',
+			}, {
+				emailVerification: 'verify',
 			});
+
+			await User.digest.execute({
+				interval: 'day',
+				subscribers: [uid],
+			});
+			meta.config.includeUnverifiedEmails = oldValue;
 		});
 
-		it('should not send digests', (done) => {
-			User.digest.execute({ interval: 'month' }, (err) => {
-				assert.ifError(err);
-				done();
-			});
+		it('should return 0', async () => {
+			const sent = await User.digest.send({ subscribers: [] });
+			assert.strictEqual(sent, 0);
+		});
+
+		it('should get users with single uid', async () => {
+			const res = await User.digest.getUsersInterval(1);
+			assert.strictEqual(res, false);
+		});
+
+		it('should not send digests', async () => {
+			const oldValue = meta.config.disableEmailSubsriptions;
+			meta.config.disableEmailSubsriptions = 1;
+			const res = await User.digest.execute({});
+			assert.strictEqual(res, false);
+			meta.config.disableEmailSubsriptions = oldValue;
+		});
+
+		it('should not send digests', async () => {
+			await User.digest.execute({ interval: 'month' });
+		});
+
+		it('should get delivery times', async () => {
+			const data = await User.digest.getDeliveryTimes(0, -1);
+			const users = data.users.filter(u => u.username === 'digestuser');
+			assert.strictEqual(users[0].setting, 'day');
 		});
 
 		describe('unsubscribe via POST', () => {
-			it('should unsubscribe from digest if one-click unsubscribe is POSTed', (done) => {
+			it('should unsubscribe from digest if one-click unsubscribe is POSTed', async () => {
 				const token = jwt.sign({
 					template: 'digest',
 					uid: uid,
 				}, nconf.get('secret'));
 
-				request({
-					method: 'post',
-					url: `${nconf.get('url')}/email/unsubscribe/${token}`,
-				}, (err, res) => {
-					assert.ifError(err);
-					assert.strictEqual(res.statusCode, 200);
-
-					db.getObjectField(`user:${uid}:settings`, 'dailyDigestFreq', (err, value) => {
-						assert.ifError(err);
-						assert.strictEqual(value, 'off');
-						done();
-					});
-				});
+				const { response } = await request.post(`${nconf.get('url')}/email/unsubscribe/${token}`);
+				assert.strictEqual(response.statusCode, 200);
+				const value = await db.getObjectField(`user:${uid}:settings`, 'dailyDigestFreq');
+				assert.strictEqual(value, 'off');
 			});
 
-			it('should unsubscribe from notifications if one-click unsubscribe is POSTed', (done) => {
+			it('should unsubscribe from notifications if one-click unsubscribe is POSTed', async () => {
 				const token = jwt.sign({
 					template: 'notification',
 					type: 'test',
 					uid: uid,
 				}, nconf.get('secret'));
 
-				request({
-					method: 'post',
-					url: `${nconf.get('url')}/email/unsubscribe/${token}`,
-				}, (err, res) => {
-					assert.ifError(err);
-					assert.strictEqual(res.statusCode, 200);
+				const { response } = await request.post(`${nconf.get('url')}/email/unsubscribe/${token}`);
+				assert.strictEqual(response.statusCode, 200);
 
-					db.getObjectField(`user:${uid}:settings`, 'notificationType_test', (err, value) => {
-						assert.ifError(err);
-						assert.strictEqual(value, 'notification');
-						done();
-					});
-				});
+				const value = await db.getObjectField(`user:${uid}:settings`, 'notificationType_test');
+				assert.strictEqual(value, 'notification');
 			});
 
-			it('should return errors on missing template in token', (done) => {
+			it('should return errors on missing template in token', async () => {
 				const token = jwt.sign({
 					uid: uid,
 				}, nconf.get('secret'));
 
-				request({
-					method: 'post',
-					url: `${nconf.get('url')}/email/unsubscribe/${token}`,
-				}, (err, res) => {
-					assert.ifError(err);
-					assert.strictEqual(res.statusCode, 404);
-					done();
-				});
+				const { response } = await request.post(`${nconf.get('url')}/email/unsubscribe/${token}`);
+				assert.strictEqual(response.statusCode, 404);
 			});
 
-			it('should return errors on wrong template in token', (done) => {
+			it('should return errors on wrong template in token', async () => {
 				const token = jwt.sign({
 					template: 'user',
 					uid: uid,
 				}, nconf.get('secret'));
 
-				request({
-					method: 'post',
-					url: `${nconf.get('url')}/email/unsubscribe/${token}`,
-				}, (err, res) => {
-					assert.ifError(err);
-					assert.strictEqual(res.statusCode, 404);
-					done();
-				});
+				const { response } = await request.post(`${nconf.get('url')}/email/unsubscribe/${token}`);
+				assert.strictEqual(response.statusCode, 404);
 			});
 
-			it('should return errors on missing token', (done) => {
-				request({
-					method: 'post',
-					url: `${nconf.get('url')}/email/unsubscribe/`,
-				}, (err, res) => {
-					assert.ifError(err);
-					assert.strictEqual(res.statusCode, 404);
-					done();
-				});
+			it('should return errors on missing token', async () => {
+				const { response } = await request.post(`${nconf.get('url')}/email/unsubscribe/`);
+				assert.strictEqual(response.statusCode, 404);
 			});
 
-			it('should return errors on token signed with wrong secret (verify-failure)', (done) => {
+			it('should return errors on token signed with wrong secret (verify-failure)', async () => {
 				const token = jwt.sign({
 					template: 'notification',
 					type: 'test',
 					uid: uid,
 				}, `${nconf.get('secret')}aababacaba`);
 
-				request({
-					method: 'post',
-					url: `${nconf.get('url')}/email/unsubscribe/${token}`,
-				}, (err, res) => {
-					assert.ifError(err);
-					assert.strictEqual(res.statusCode, 403);
-					done();
-				});
+				const { response } = await request.post(`${nconf.get('url')}/email/unsubscribe/${token}`);
+				assert.strictEqual(response.statusCode, 403);
 			});
 		});
 	});
@@ -1676,34 +1695,24 @@ describe('User', () => {
 		let delUid;
 
 		it('should fail with invalid data', (done) => {
-			socketUser.exists({ uid: testUid }, null, (err) => {
+			meta.userOrGroupExists(null, (err) => {
 				assert.equal(err.message, '[[error:invalid-data]]');
 				done();
 			});
 		});
 
-		it('should return true if user/group exists', (done) => {
-			socketUser.exists({ uid: testUid }, { username: 'registered-users' }, (err, exists) => {
-				assert.ifError(err);
-				assert(exists);
-				done();
-			});
-		});
+		it('should return true/false if user/group exists or not', async () => {
+			assert.strictEqual(await meta.userOrGroupExists('registered-users'), true);
+			assert.strictEqual(await meta.userOrGroupExists('John Smith'), true);
+			assert.strictEqual(await meta.userOrGroupExists('doesnot exist'), false);
+			assert.deepStrictEqual(await meta.userOrGroupExists(['doesnot exist', 'nope not here']), [false, false]);
+			assert.deepStrictEqual(await meta.userOrGroupExists(['doesnot exist', 'John Smith']), [false, true]);
+			assert.deepStrictEqual(await meta.userOrGroupExists(['administrators', 'John Smith']), [true, true]);
 
-		it('should return true if user/group exists', (done) => {
-			socketUser.exists({ uid: testUid }, { username: 'John Smith' }, (err, exists) => {
-				assert.ifError(err);
-				assert(exists);
-				done();
-			});
-		});
-
-		it('should return false if user/group does not exists', (done) => {
-			socketUser.exists({ uid: testUid }, { username: 'doesnot exist' }, (err, exists) => {
-				assert.ifError(err);
-				assert(!exists);
-				done();
-			});
+			await assert.rejects(
+				meta.userOrGroupExists(['', undefined]),
+				{ message: '[[error:invalid-data]]' },
+			);
 		});
 
 		it('should delete user', async () => {
@@ -1723,8 +1732,8 @@ describe('User', () => {
 			assert(result.url);
 			meta.config['profile:keepAllUserImages'] = 0;
 
-			await socketUser.deleteAccount({ uid: delUid }, {});
-			const exists = await socketUser.exists({ uid: testUid }, { username: 'willbedeleted' });
+			await apiUser.deleteAccount({ uid: delUid }, { uid: delUid });
+			const exists = await meta.userOrGroupExists('willbedeleted');
 			assert(!exists);
 		});
 
@@ -1738,71 +1747,32 @@ describe('User', () => {
 
 		it('should fail to delete user with wrong password', async () => {
 			const uid = await User.create({ username: 'willbedeletedpwd', password: '123456' });
-			let err;
 			try {
-				await socketUser.deleteAccount({ uid: uid }, { password: '654321' });
-			} catch (_err) {
-				err = _err;
+				await apiUser.deleteAccount({ uid: uid }, { uid: uid, password: '654321' });
+				assert(false);
+			} catch (err) {
+				assert.strictEqual(err.message, '[[error:invalid-password]]');
 			}
-			assert.strictEqual(err.message, '[[error:invalid-password]]');
 		});
 
 		it('should delete user with correct password', async () => {
 			const uid = await User.create({ username: 'willbedeletedcorrectpwd', password: '123456' });
-			await socketUser.deleteAccount({ uid: uid }, { password: '123456' });
+			await apiUser.deleteAccount({ uid: uid }, { uid: uid, password: '123456' });
 			const exists = await User.exists(uid);
 			assert(!exists);
 		});
 
 		it('should fail to delete user if account deletion is not allowed', async () => {
-			const oldValue = meta.config.allowAccountDeletion;
-			meta.config.allowAccountDeletion = 0;
+			const oldValue = meta.config.allowAccountDelete;
+			meta.config.allowAccountDelete = 0;
 			const uid = await User.create({ username: 'tobedeleted' });
 			try {
-				await socketUser.deleteAccount({ uid: uid }, {});
+				await apiUser.deleteAccount({ uid: uid }, { uid: uid });
+				assert(false);
 			} catch (err) {
-				assert.equal(err.message, '[[error:no-privileges]]');
+				assert.strictEqual(err.message, '[[error:account-deletion-disabled]]');
 			}
-			meta.config.allowAccountDeletion = oldValue;
-		});
-
-		it('should fail if data is invalid', (done) => {
-			socketUser.emailExists({ uid: testUid }, null, (err) => {
-				assert.equal(err.message, '[[error:invalid-data]]');
-				done();
-			});
-		});
-
-		it('should return true if email exists', (done) => {
-			socketUser.emailExists({ uid: testUid }, { email: 'john@example.com' }, (err, exists) => {
-				assert.ifError(err);
-				assert(exists);
-				done();
-			});
-		});
-
-		it('should return false if email does not exist', (done) => {
-			socketUser.emailExists({ uid: testUid }, { email: 'does@not.exist' }, (err, exists) => {
-				assert.ifError(err);
-				assert(!exists);
-				done();
-			});
-		});
-
-		it('should error if requireEmailConfirmation is disabled', (done) => {
-			socketUser.emailConfirm({ uid: testUid }, {}, (err) => {
-				assert.equal(err.message, '[[error:email-confirmations-are-disabled]]');
-				done();
-			});
-		});
-
-		it('should send email confirm', (done) => {
-			meta.config.requireEmailConfirmation = 1;
-			socketUser.emailConfirm({ uid: testUid }, {}, (err) => {
-				assert.ifError(err);
-				meta.config.requireEmailConfirmation = 0;
-				done();
-			});
+			meta.config.allowAccountDelete = oldValue;
 		});
 
 		it('should send reset email', (done) => {
@@ -1837,7 +1807,7 @@ describe('User', () => {
 			});
 		});
 
-		it('should save user settings', (done) => {
+		it('should save user settings', async () => {
 			const data = {
 				uid: testUid,
 				settings: {
@@ -1852,24 +1822,22 @@ describe('User', () => {
 					postsPerPage: '5',
 					showemail: 1,
 					showfullname: 1,
-					restrictChat: 0,
+					disableIncomingMessages: 0,
 					followTopicsOnCreate: 1,
 					followTopicsOnReply: 1,
 				},
 			};
-			socketUser.saveSettings({ uid: testUid }, data, (err) => {
-				assert.ifError(err);
-				User.getSettings(testUid, (err, data) => {
-					assert.ifError(err);
-					assert.equal(data.usePagination, true);
-					done();
-				});
-			});
+			await apiUser.updateSettings({ uid: testUid }, data);
+			const userSettings = await User.getSettings(testUid);
+			assert.strictEqual(userSettings.usePagination, true);
 		});
 
-		it('should properly escape homePageRoute', (done) => {
+		it('should properly escape homePageRoute', async () => {
+			const username = utils.generateUUID().slice(0, 6);
+			const uid = await User.create({ username, password: '123456' });
+			const { jar } = await helpers.loginUser(username, '123456');
 			const data = {
-				uid: testUid,
+				uid: uid,
 				settings: {
 					bootswatchSkin: 'default',
 					homePageRoute: 'category/6/testing-ground',
@@ -1882,23 +1850,29 @@ describe('User', () => {
 					postsPerPage: '5',
 					showemail: 1,
 					showfullname: 1,
-					restrictChat: 0,
+					disableIncomingMessages: 0,
 					followTopicsOnCreate: 1,
 					followTopicsOnReply: 1,
 				},
 			};
-			socketUser.saveSettings({ uid: testUid }, data, (err) => {
-				assert.ifError(err);
-				User.getSettings(testUid, (err, data) => {
-					assert.ifError(err);
-					assert.strictEqual(data.homePageRoute, 'category/6/testing-ground');
-					done();
-				});
-			});
+			await apiUser.updateSettings({ uid }, data);
+			const userSettings = await User.getSettings(uid);
+			assert.strictEqual(userSettings.homePageRoute, 'category/6/testing-ground');
+
+
+			data.settings.homePageRoute = '<script>alert(1);</script>';
+			await apiUser.updateSettings({ uid }, data);
+			const updatedSettings = await User.getSettings(uid);
+			// not escaped in api
+			assert.strictEqual(updatedSettings.homePageRoute, '<script>alert(1);</script>');
+
+			// escaped in html
+			const { body } = await request.get(`${nconf.get('url')}/user/${username}/settings`, { jar });
+			assert(body.includes('value="&lt;script&gt;alert(1);&lt;/script&gt;"'));
 		});
 
 
-		it('should error if language is invalid', (done) => {
+		it('should error if language is invalid', async () => {
 			const data = {
 				uid: testUid,
 				settings: {
@@ -1907,42 +1881,104 @@ describe('User', () => {
 					postsPerPage: '5',
 				},
 			};
-			socketUser.saveSettings({ uid: testUid }, data, (err) => {
+			try {
+				await apiUser.updateSettings({ uid: testUid }, data);
+				assert(false);
+			} catch (err) {
 				assert.equal(err.message, '[[error:invalid-language]]');
-				done();
+			}
+		});
+
+		it('should error if notificationType_upvote is invalid', async () => {
+			const data = {
+				uid: testUid,
+				settings: {
+					notificationType_upvote: '<invalid-string>',
+				},
+			};
+			await assert.rejects(
+				apiUser.updateSettings({ uid: testUid }, data),
+				{ message: '[[error:invalid-notification-type]]' }
+			);
+		});
+
+		it('should set moderation note', async () => {
+			const adminUid = await User.create({ username: 'noteadmin' });
+			await groups.join('administrators', adminUid);
+			await socketUser.setModerationNote({ uid: adminUid }, { uid: testUid, note: 'this is a test user' });
+			await setTimeout(50);
+			await socketUser.setModerationNote({ uid: adminUid }, { uid: testUid, note: '<svg/onload=alert(document.location);//' });
+			const notes = await User.getModerationNotes(testUid, 0, -1);
+			assert.equal(notes[0].note, '');
+			assert.equal(notes[0].uid, adminUid);
+			assert.equal(notes[1].note, 'this is a test user');
+			assert(notes[0].timestamp);
+		});
+
+		it('should get unread count 0 for guest', async () => {
+			const count = await socketUser.getUnreadCount({ uid: 0 });
+			assert.strictEqual(count, 0);
+		});
+
+		it('should get unread count for user', async () => {
+			const count = await socketUser.getUnreadCount({ uid: testUid });
+			assert.strictEqual(count, 4);
+		});
+
+		it('should get unread chat count 0 for guest', async () => {
+			const count = await socketUser.getUnreadChatCount({ uid: 0 });
+			assert.strictEqual(count, 0);
+		});
+
+		it('should get unread chat count for user', async () => {
+			const count = await socketUser.getUnreadChatCount({ uid: testUid });
+			assert.strictEqual(count, 0);
+		});
+
+		it('should get unread counts 0 for guest', async () => {
+			const counts = await socketUser.getUnreadCounts({ uid: 0 });
+			assert.deepStrictEqual(counts, {});
+		});
+
+		it('should get unread counts for user', async () => {
+			const counts = await socketUser.getUnreadCounts({ uid: testUid });
+			assert.deepStrictEqual(counts, {
+				unreadChatCount: 0,
+				unreadCounts: {
+					'': 4,
+					new: 4,
+					unreplied: 4,
+					watched: 0,
+				},
+				unreadNewTopicCount: 4,
+				unreadNotificationCount: 0,
+				unreadTopicCount: 4,
+				unreadUnrepliedTopicCount: 4,
+				unreadWatchedTopicCount: 0,
 			});
 		});
 
-		it('should set moderation note', (done) => {
-			let adminUid;
-			async.waterfall([
-				function (next) {
-					User.create({ username: 'noteadmin' }, next);
-				},
-				function (_adminUid, next) {
-					adminUid = _adminUid;
-					groups.join('administrators', adminUid, next);
-				},
-				function (next) {
-					socketUser.setModerationNote({ uid: adminUid }, { uid: testUid, note: 'this is a test user' }, next);
-				},
-				function (next) {
-					setTimeout(next, 50);
-				},
-				function (next) {
-					socketUser.setModerationNote({ uid: adminUid }, { uid: testUid, note: '<svg/onload=alert(document.location);//' }, next);
-				},
-				function (next) {
-					User.getModerationNotes(testUid, 0, -1, next);
-				},
-			], (err, notes) => {
-				assert.ifError(err);
-				assert.equal(notes[0].note, '&lt;svg&#x2F;onload=alert(document.location);&#x2F;&#x2F;');
-				assert.equal(notes[0].uid, adminUid);
-				assert.equal(notes[1].note, 'this is a test user');
-				assert(notes[0].timestamp);
-				done();
-			});
+		it('should get user data by uid', async () => {
+			const userData = await socketUser.getUserByUID({ uid: testUid }, testUid);
+			assert.strictEqual(userData.uid, testUid);
+		});
+
+		it('should get user data by username', async () => {
+			const userData = await socketUser.getUserByUsername({ uid: testUid }, 'John Smith');
+			assert.strictEqual(userData.uid, testUid);
+		});
+
+		it('should get user data by email', async () => {
+			const userData = await socketUser.getUserByEmail({ uid: testUid }, 'john@example.com');
+			assert.strictEqual(userData.uid, testUid);
+		});
+
+		it('should check/consent gdpr status', async () => {
+			const consent = await socketUser.gdpr.check({ uid: testUid }, { uid: testUid });
+			assert(!consent);
+			await socketUser.gdpr.consent({ uid: testUid });
+			const consentAfter = await socketUser.gdpr.check({ uid: testUid }, { uid: testUid });
+			assert(consentAfter);
 		});
 	});
 
@@ -1964,105 +2000,177 @@ describe('User', () => {
 			done();
 		});
 
-		it('should add user to approval queue', (done) => {
-			helpers.registerUser({
+		it('should add user to approval queue', async () => {
+			await helpers.registerUser({
 				username: 'rejectme',
 				password: '123456',
 				'password-confirm': '123456',
 				email: '<script>alert("ok")<script>reject@me.com',
 				gdpr_consent: true,
-			}, (err) => {
-				assert.ifError(err);
-				helpers.loginUser('admin', '123456', (err, jar) => {
-					assert.ifError(err);
-					request(`${nconf.get('url')}/api/admin/manage/registration`, { jar: jar, json: true }, (err, res, body) => {
-						assert.ifError(err);
-						assert.equal(body.users[0].username, 'rejectme');
-						assert.equal(body.users[0].email, '&lt;script&gt;alert(&quot;ok&quot;)&lt;script&gt;reject@me.com');
-						done();
-					});
+			});
+			const { jar } = await helpers.loginUser('admin', '123456');
+			const { body: { users } } = await request.get(`${nconf.get('url')}/api/registration-queue`, { jar });
+			assert.equal(users[0].username, 'rejectme');
+			// not escaped in api
+			assert.equal(users[0].email, '<script>alert("ok")<script>reject@me.com');
+
+			// escaped in html
+			const { body } = await request.get(`${nconf.get('url')}/registration-queue`, { jar });
+			assert(body.includes('&lt;script&gt;alert(&quot;ok&quot;)&lt;script&gt;reject@me.com'));
+		});
+
+		it('should split the queue into regular requests and suspected spam', async () => {
+			await helpers.registerUser({
+				username: 'spamqueued',
+				password: '123456',
+				email: 'spamqueued@me.com',
+				gdpr_consent: true,
+			});
+			const filterMethod = async (data) => {
+				data.users.forEach((user) => {
+					if (user.username === 'spamqueued') {
+						user.spamChecked = true;
+						user.ipSpam = true;
+					}
 				});
-			});
+				return data;
+			};
+			plugins.hooks.register('test-plugin', { hook: 'filter:user.getRegistrationQueue', method: filterMethod });
+			try {
+				const { jar } = await helpers.loginUser('admin', '123456');
+				const { body } = await request.get(`${nconf.get('url')}/api/registration-queue`, { jar });
+				assert.deepStrictEqual(body.spamUsers.map(u => u.username), ['spamqueued']);
+				assert(body.spamUsers.every(u => u.spamSuspected === true));
+				assert(!body.cleanUsers.some(u => u.username === 'spamqueued'));
+				assert(body.cleanUsers.every(u => u.spamSuspected === false));
+				assert.strictEqual(body.users.length, body.cleanUsers.length + body.spamUsers.length);
+			} finally {
+				plugins.hooks.unregister('test-plugin', 'filter:user.getRegistrationQueue', filterMethod);
+				await User.rejectRegistration('spamqueued');
+			}
 		});
 
-		it('should fail to add user to queue if username is taken', (done) => {
-			helpers.registerUser({
+		it('should fail to add user to queue if username is taken', async () => {
+			const { body } = await helpers.registerUser({
 				username: 'rejectme',
 				password: '123456',
 				'password-confirm': '123456',
 				email: '<script>alert("ok")<script>reject@me.com',
 				gdpr_consent: true,
-			}, (err, jar, res, body) => {
-				assert.ifError(err);
-				assert.equal(body, '[[error:username-taken]]');
-				done();
 			});
+			assert.equal(body, '[[error:username-taken]]');
 		});
 
-		it('should fail to add user to queue if email is taken', (done) => {
-			helpers.registerUser({
+		it('should fail to add user to queue if email is taken', async () => {
+			const { body } = await helpers.registerUser({
 				username: 'rejectmenew',
 				password: '123456',
 				'password-confirm': '123456',
 				email: '<script>alert("ok")<script>reject@me.com',
 				gdpr_consent: true,
-			}, (err, jar, res, body) => {
-				assert.ifError(err);
-				assert.equal(body, '[[error:email-taken]]');
-				done();
 			});
+			assert.equal(body, '[[error:email-taken]]');
 		});
 
-		it('should reject user registration', (done) => {
-			socketUser.rejectRegistration({ uid: adminUid }, { username: 'rejectme' }, (err) => {
-				assert.ifError(err);
-				User.getRegistrationQueue(0, -1, (err, users) => {
-					assert.ifError(err);
-					assert.equal(users.length, 0);
-					done();
-				});
-			});
+		it('should reject user registration', async () => {
+			await socketUser.rejectRegistration({ uid: adminUid }, { username: 'rejectme' });
+			const users = await User.getRegistrationQueue(0, -1);
+			assert.equal(users.length, 0);
 		});
 
-		it('should accept user registration', (done) => {
-			helpers.registerUser({
+		it('should accept user registration', async () => {
+			await helpers.registerUser({
 				username: 'acceptme',
 				password: '123456',
 				'password-confirm': '123456',
 				email: 'accept@me.com',
 				gdpr_consent: true,
-			}, (err) => {
-				assert.ifError(err);
-				socketUser.acceptRegistration({ uid: adminUid }, { username: 'acceptme' }, (err, uid) => {
-					assert.ifError(err);
-					User.exists(uid, (err, exists) => {
-						assert.ifError(err);
-						assert(exists);
-						User.getRegistrationQueue(0, -1, (err, users) => {
-							assert.ifError(err);
-							assert.equal(users.length, 0);
-							done();
-						});
-					});
-				});
 			});
+
+			const uid = await socketUser.acceptRegistration({ uid: adminUid }, { username: 'acceptme' });
+			const exists = await User.exists(uid);
+			assert(exists);
+			const users = await User.getRegistrationQueue(0, -1);
+			assert.equal(users.length, 0);
 		});
 
-		it('should trim username and add user to registration queue', (done) => {
-			helpers.registerUser({
+		it('should trim username and add user to registration queue', async () => {
+			await helpers.registerUser({
 				username: 'invalidname\r\n',
 				password: '123456',
 				'password-confirm': '123456',
 				email: 'invalidtest@test.com',
 				gdpr_consent: true,
-			}, (err) => {
-				assert.ifError(err);
-				db.getSortedSetRange('registration:queue', 0, -1, (err, data) => {
-					assert.ifError(err);
-					assert.equal(data[0], 'invalidname');
-					done();
-				});
 			});
+
+			const users = await db.getSortedSetRange('registration:queue', 0, -1);
+			assert.equal(users[0], 'invalidname');
+		});
+
+		it('should match queued users against IPv4-mapped IPv6 addresses', async () => {
+			const matchUid = await User.create({ username: 'ipmatchtarget' });
+			await User.logIP(matchUid, '::ffff:10.0.0.7');
+			await User.addToApprovalQueue({
+				username: 'ipmatchqueued',
+				email: 'ipmatch@test.com',
+				password: '123456',
+				ip: '::ffff:10.0.0.7',
+			});
+
+			const users = await User.getRegistrationQueue(0, -1);
+			const queued = users.find(u => u.username === 'ipmatchqueued');
+			assert(queued);
+			assert.equal(queued.ip, '10.0.0.7');
+			assert(queued.ipMatch.map(u => u.uid).includes(matchUid));
+		});
+	});
+
+	describe('custom profile fields', () => {
+		let fieldUid;
+		const keys = ['favnumber', 'favcolour', 'langs'];
+
+		before(async () => {
+			fieldUid = await User.create({ username: 'customfielduser' });
+			await db.sortedSetAdd('user-custom-fields', [0, 1, 2], keys);
+			await db.setObjectBulk([
+				['user-custom-field:favnumber', { key: 'favnumber', name: 'Favourite number', type: 'input-number' }],
+				['user-custom-field:favcolour', { key: 'favcolour', name: 'Favourite colour', type: 'select' }],
+				['user-custom-field:langs', { key: 'langs', name: 'Languages', type: 'select-multi' }],
+			]);
+			await User.reloadCustomFieldWhitelist();
+		});
+
+		after(async () => {
+			await db.delete('user-custom-fields');
+			await db.deleteAll(keys.map(k => `user-custom-field:${k}`));
+			await User.reloadCustomFieldWhitelist();
+		});
+
+		it('should allow a numeric field to be cleared', async () => {
+			await User.updateProfile(fieldUid, { uid: fieldUid, favnumber: '7' });
+			assert.strictEqual(await User.getUserField(fieldUid, 'favnumber'), '7');
+
+			await User.updateProfile(fieldUid, { uid: fieldUid, favnumber: '' });
+			assert.strictEqual(await User.getUserField(fieldUid, 'favnumber'), '');
+		});
+
+		it('should still reject a non-numeric value', async () => {
+			await assert.rejects(
+				User.updateProfile(fieldUid, { uid: fieldUid, favnumber: 'seven' }),
+				{ message: '[[error:custom-user-field-invalid-number, Favourite number]]' }
+			);
+		});
+
+		it('should not throw when a select field has no options configured', async () => {
+			await User.updateProfile(fieldUid, { uid: fieldUid, favcolour: '' });
+			assert.strictEqual(await User.getUserField(fieldUid, 'favcolour'), '');
+		});
+
+		it('should reject a select-multi value that is not valid json', async () => {
+			await assert.rejects(
+				User.updateProfile(fieldUid, { uid: fieldUid, langs: 'not json' }),
+				{ message: '[[error:custom-user-field-select-value-invalid, Languages]]' }
+			);
 		});
 	});
 
@@ -2078,59 +2186,46 @@ describe('User', () => {
 
 		const COMMON_PW = '123456';
 
-		before((done) => {
-			async.parallel({
-				publicGroup: async.apply(groups.create, { name: PUBLIC_GROUP, private: 0 }),
-				privateGroup: async.apply(groups.create, { name: PRIVATE_GROUP, private: 1 }),
-				hiddenGroup: async.apply(groups.create, { name: HIDDEN_GROUP, hidden: 1 }),
-				notAnInviter: async.apply(User.create, { username: 'notAnInviter', password: COMMON_PW, email: 'notaninviter@nodebb.org' }),
-				inviter: async.apply(User.create, { username: 'inviter', password: COMMON_PW, email: 'inviter@nodebb.org' }),
-				admin: async.apply(User.create, { username: 'adminInvite', password: COMMON_PW }),
-			}, (err, results) => {
-				assert.ifError(err);
-				notAnInviterUid = results.notAnInviter;
-				inviterUid = results.inviter;
-				adminUid = results.admin;
-				async.parallel([
-					async.apply(groups.create, { name: OWN_PRIVATE_GROUP, ownerUid: inviterUid, private: 1 }),
-					async.apply(groups.join, 'administrators', adminUid),
-					async.apply(groups.join, 'cid:0:privileges:invite', inviterUid),
-				], done);
+		before(async () => {
+			const results = await utils.promiseParallel({
+				publicGroup: groups.create({ name: PUBLIC_GROUP, private: 0 }),
+				privateGroup: groups.create({ name: PRIVATE_GROUP, private: 1 }),
+				hiddenGroup: groups.create({ name: HIDDEN_GROUP, hidden: 1 }),
+				notAnInviter: User.create({ username: 'notAnInviter', password: COMMON_PW }),
+				inviter: User.create({ username: 'inviter', password: COMMON_PW, email: 'invited@nodebb.org' }, { emailVerification: 'verify' }),
+				admin: User.create({ username: 'adminInvite', password: COMMON_PW }),
 			});
+
+			notAnInviterUid = results.notAnInviter;
+			inviterUid = results.inviter;
+			adminUid = results.admin;
+
+			await Promise.all([
+				groups.create({ name: OWN_PRIVATE_GROUP, ownerUid: inviterUid, private: 1 }),
+				groups.join('administrators', adminUid),
+				groups.join('cid:0:privileges:invite', inviterUid),
+			]);
 		});
 
 		describe('when inviter is not an admin and does not have invite privilege', () => {
 			let csrf_token;
 			let jar;
 
-			before((done) => {
-				helpers.loginUser('notAnInviter', COMMON_PW, (err, _jar) => {
-					assert.ifError(err);
-					jar = _jar;
-
-					request({
-						url: `${nconf.get('url')}/api/config`,
-						json: true,
-						jar: jar,
-					}, (err, response, body) => {
-						assert.ifError(err);
-						csrf_token = body.csrf_token;
-						done();
-					});
-				});
+			before(async () => {
+				({ jar, csrf_token } = await helpers.loginUser('notAnInviter', COMMON_PW));
 			});
 
 			it('should error if user does not have invite privilege', async () => {
-				const { res } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, notAnInviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 403);
-				assert.strictEqual(res.body.status.message, 'You do not have enough privileges for this action.');
+				const { response, body } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, notAnInviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 403);
+				assert.strictEqual(body.status.message, 'You do not have enough privileges for this action.');
 			});
 
 			it('should error out if user tries to use an inviter\'s uid via the API', async () => {
-				const { res } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
+				const { response, body } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
 				const numInvites = await User.getInvitesNumber(inviterUid);
-				assert.strictEqual(res.statusCode, 403);
-				assert.strictEqual(res.body.status.message, 'You do not have enough privileges for this action.');
+				assert.strictEqual(response.statusCode, 403);
+				assert.strictEqual(body.status.message, 'You do not have enough privileges for this action.');
 				assert.strictEqual(numInvites, 0);
 			});
 		});
@@ -2139,99 +2234,88 @@ describe('User', () => {
 			let csrf_token;
 			let jar;
 
-			before((done) => {
-				helpers.loginUser('inviter', COMMON_PW, (err, _jar) => {
-					assert.ifError(err);
-					jar = _jar;
-
-					request({
-						url: `${nconf.get('url')}/api/config`,
-						json: true,
-						jar: jar,
-					}, (err, response, body) => {
-						assert.ifError(err);
-						csrf_token = body.csrf_token;
-						done();
-					});
-				});
+			before(async () => {
+				({ jar, csrf_token } = await helpers.loginUser('inviter', COMMON_PW));
 			});
 
 			it('should error with invalid data', async () => {
-				const { res } = await helpers.invite({}, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 400);
-				assert.strictEqual(res.body.status.message, 'Invalid Data');
+				const { response, body } = await helpers.invite({}, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 400);
+				assert.strictEqual(body.status.message, 'Invalid Data');
 			});
 
 			it('should error if user is not admin and type is admin-invite-only', async () => {
 				meta.config.registrationType = 'admin-invite-only';
-				const { res } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 403);
-				assert.strictEqual(res.body.status.message, 'You do not have enough privileges for this action.');
+				const { response, body } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 403);
+				assert.strictEqual(body.status.message, 'You do not have enough privileges for this action.');
 			});
 
 			it('should send invitation email (without groups to be joined)', async () => {
 				meta.config.registrationType = 'normal';
-				const { res } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 200);
+				const { response } = await helpers.invite({ emails: 'invite1@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 200);
 			});
 
 			it('should send multiple invitation emails (with a public group to be joined)', async () => {
-				const { res } = await helpers.invite({ emails: 'invite2@test.com,invite3@test.com', groupsToJoin: [PUBLIC_GROUP] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 200);
+				const { response, body } = await helpers.invite({ emails: 'invite2@test.com,invite3@test.com', groupsToJoin: [PUBLIC_GROUP] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 200);
 			});
 
 			it('should error if the user has not permission to invite to the group', async () => {
-				const { res } = await helpers.invite({ emails: 'invite4@test.com', groupsToJoin: [PRIVATE_GROUP] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 403);
-				assert.strictEqual(res.body.status.message, 'You do not have enough privileges for this action.');
+				const { response, body } = await helpers.invite({ emails: 'invite4@test.com', groupsToJoin: [PRIVATE_GROUP] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 403);
+				assert.strictEqual(body.status.message, 'You do not have enough privileges for this action.');
 			});
 
 			it('should error if a non-admin tries to invite to the administrators group', async () => {
-				const { res } = await helpers.invite({ emails: 'invite4@test.com', groupsToJoin: ['administrators'] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 403);
-				assert.strictEqual(res.body.status.message, 'You do not have enough privileges for this action.');
+				const { response, body } = await helpers.invite({ emails: 'invite4@test.com', groupsToJoin: ['administrators'] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 403);
+				assert.strictEqual(body.status.message, 'You do not have enough privileges for this action.');
 			});
 
 			it('should to invite to own private group', async () => {
-				const { res } = await helpers.invite({ emails: 'invite4@test.com', groupsToJoin: [OWN_PRIVATE_GROUP] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 200);
+				const { response } = await helpers.invite({ emails: 'invite4@test.com', groupsToJoin: [OWN_PRIVATE_GROUP] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 200);
 			});
 
 			it('should to invite to multiple groups', async () => {
-				const { res } = await helpers.invite({ emails: 'invite5@test.com', groupsToJoin: [PUBLIC_GROUP, OWN_PRIVATE_GROUP] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 200);
+				const { response } = await helpers.invite({ emails: 'invite5@test.com', groupsToJoin: [PUBLIC_GROUP, OWN_PRIVATE_GROUP] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 200);
 			});
 
 			it('should error if tries to invite to hidden group', async () => {
-				const { res } = await helpers.invite({ emails: 'invite6@test.com', groupsToJoin: [HIDDEN_GROUP] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 403);
+				const { response } = await helpers.invite({ emails: 'invite6@test.com', groupsToJoin: [HIDDEN_GROUP] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 403);
 			});
 
-			it('should error if ouf of invitations', async () => {
+			it('should error if out of invitations', async () => {
 				meta.config.maximumInvites = 1;
-				const { res } = await helpers.invite({ emails: 'invite6@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 403);
-				assert.strictEqual(res.body.status.message, `You have invited the maximum amount of people (${5} out of ${1}).`);
+				const { response, body } = await helpers.invite({ emails: 'invite6@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 403);
+				assert.strictEqual(body.status.message, `You have invited the maximum amount of people (${5} out of ${1}).`);
 				meta.config.maximumInvites = 10;
 			});
 
 			it('should send invitation email after maximumInvites increased', async () => {
-				const { res } = await helpers.invite({ emails: 'invite6@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 200);
+				const { response } = await helpers.invite({ emails: 'invite6@test.com', groupsToJoin: [] }, inviterUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 200);
 			});
 
 			it('should error if invite is sent via API with a different UID', async () => {
-				const { res } = await helpers.invite({ emails: 'inviter@nodebb.org', groupsToJoin: [] }, adminUid, jar, csrf_token);
+				const { response, body } = await helpers.invite({ emails: 'inviter@nodebb.org', groupsToJoin: [] }, adminUid, jar, csrf_token);
 				const numInvites = await User.getInvitesNumber(adminUid);
-				assert.strictEqual(res.statusCode, 403);
-				assert.strictEqual(res.body.status.message, 'You do not have enough privileges for this action.');
+				assert.strictEqual(response.statusCode, 403);
+				assert.strictEqual(body.status.message, 'You do not have enough privileges for this action.');
 				assert.strictEqual(numInvites, 0);
 			});
 
-			it('should error if email exists', async () => {
-				const { res } = await helpers.invite({ emails: 'inviter@nodebb.org', groupsToJoin: [] }, inviterUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 400);
-				assert.strictEqual(res.body.status.message, 'Email taken');
+			it('should succeed if email exists but not actually send an invite', async () => {
+				const { response } = await helpers.invite({ emails: 'inviter@nodebb.org', groupsToJoin: [] }, inviterUid, jar, csrf_token);
+				const numInvites = await User.getInvitesNumber(adminUid);
+
+				assert.strictEqual(response.statusCode, 200);
+				assert.strictEqual(numInvites, 0);
 			});
 		});
 
@@ -2239,33 +2323,25 @@ describe('User', () => {
 			let csrf_token;
 			let jar;
 
-			before((done) => {
-				helpers.loginUser('adminInvite', COMMON_PW, (err, _jar) => {
-					assert.ifError(err);
-					jar = _jar;
-
-					request({
-						url: `${nconf.get('url')}/api/config`,
-						json: true,
-						jar: jar,
-					}, (err, response, body) => {
-						assert.ifError(err);
-						csrf_token = body.csrf_token;
-						done();
-					});
-				});
+			before(async () => {
+				({ jar, csrf_token } = await helpers.loginUser('adminInvite', COMMON_PW));
 			});
 
 			it('should escape email', async () => {
 				await helpers.invite({ emails: '<script>alert("ok");</script>', groupsToJoin: [] }, adminUid, jar, csrf_token);
 				const data = await User.getInvites(adminUid);
-				assert.strictEqual(data[0], '&lt;script&gt;alert(&quot;ok&quot;);&lt;&#x2F;script&gt;');
+				// not escaped in api
+				assert.strictEqual(data[0], '<script>alert("ok");</script>');
+
+				// escaped in html
+				const { body } = await request.get(`${nconf.get('url')}/registration-queue`, { jar });
+				assert(body.includes('&lt;script&gt;alert(&quot;ok&quot;);&lt;/script&gt;'));
 				await User.deleteInvitationKey('<script>alert("ok");</script>');
 			});
 
 			it('should invite to the administrators group if inviter is an admin', async () => {
-				const { res } = await helpers.invite({ emails: 'invite99@test.com', groupsToJoin: ['administrators'] }, adminUid, jar, csrf_token);
-				assert.strictEqual(res.statusCode, 200);
+				const { response } = await helpers.invite({ emails: 'invite99@test.com', groupsToJoin: ['administrators'] }, adminUid, jar, csrf_token);
+				assert.strictEqual(response.statusCode, 200);
 			});
 		});
 
@@ -2312,7 +2388,7 @@ describe('User', () => {
 
 			it('should verify installation with no errors', (done) => {
 				const email = 'invite1@test.com';
-				db.getObjectField(`invitation:email:${email}`, 'token', (err, token) => {
+				db.get(`invitation:uid:${inviterUid}:invited:${email}`, 'token', (err, token) => {
 					assert.ifError(err);
 					User.verifyInvitation({ token: token, email: 'invite1@test.com' }, (err) => {
 						assert.ifError(err);
@@ -2358,31 +2434,20 @@ describe('User', () => {
 			it('should joined the groups from invitation after registration', async () => {
 				const email = 'invite5@test.com';
 				const groupsToJoin = [PUBLIC_GROUP, OWN_PRIVATE_GROUP];
-				const token = await db.getObjectField(`invitation:email:${email}`, 'token');
+				const token = await db.get(`invitation:uid:${inviterUid}:invited:${email}`);
 
-				await new Promise((resolve, reject) => {
-					helpers.registerUser({
-						username: 'invite5',
-						password: '123456',
-						'password-confirm': '123456',
-						email: email,
-						gdpr_consent: true,
-						token: token,
-					}, async (err, jar, response, body) => {
-						if (err) {
-							reject(err);
-						}
-
-						const memberships = await groups.isMemberOfGroups(body.uid, groupsToJoin);
-						const joinedToAll = memberships.filter(Boolean);
-
-						if (joinedToAll.length !== groupsToJoin.length) {
-							reject(new Error('Not joined to the groups'));
-						}
-
-						resolve();
-					});
+				const { body } = await helpers.registerUser({
+					username: 'invite5',
+					password: '123456',
+					'password-confirm': '123456',
+					email: email,
+					gdpr_consent: true,
+					token: token,
 				});
+
+				const memberships = await groups.isMemberOfGroups(body.uid, groupsToJoin);
+				const joinedToAll = memberships.filter(Boolean);
+				assert.strictEqual(joinedToAll.length, groupsToJoin.length, 'Not joined to the groups');
 			});
 		});
 
@@ -2390,27 +2455,12 @@ describe('User', () => {
 			let csrf_token;
 			let jar;
 
-			before((done) => {
-				helpers.loginUser('inviter', COMMON_PW, (err, _jar) => {
-					assert.ifError(err);
-					jar = _jar;
-
-					request({
-						url: `${nconf.get('url')}/api/config`,
-						json: true,
-						jar: jar,
-					}, (err, response, body) => {
-						assert.ifError(err);
-						csrf_token = body.csrf_token;
-						done();
-					});
-				});
+			before(async () => {
+				({ jar, csrf_token } = await helpers.loginUser('inviter', COMMON_PW));
 			});
 
 			it('should show a list of groups for adding to an invite', async () => {
-				const body = await requestAsync({
-					url: `${nconf.get('url')}/api/v3/users/${inviterUid}/invites/groups`,
-					json: true,
+				const { body } = await helpers.request('get', `/api/v3/users/${inviterUid}/invites/groups`, {
 					jar,
 				});
 
@@ -2420,22 +2470,11 @@ describe('User', () => {
 			});
 
 			it('should error out if you request invite groups for another uid', async () => {
-				const res = await requestAsync({
-					url: `${nconf.get('url')}/api/v3/users/${adminUid}/invites/groups`,
-					json: true,
+				const { response } = await helpers.request('get', `/api/v3/users/${adminUid}/invites/groups`, {
 					jar,
-					simple: false,
-					resolveWithFullResponse: true,
 				});
 
-				assert.strictEqual(res.statusCode, 401);
-				assert.deepStrictEqual(res.body, {
-					status: {
-						code: 'not-authorised',
-						message: 'A valid login session was not found. Please log in and try again.',
-					},
-					response: {},
-				});
+				assert.strictEqual(response.statusCode, 403);
 			});
 		});
 	});
@@ -2455,7 +2494,7 @@ describe('User', () => {
 				email: email,
 			});
 
-			const code = await User.email.sendValidationEmail(uid, email);
+			const code = await User.email.sendValidationEmail(uid, { email, force: 1 });
 			const unverified = await groups.isMember(uid, 'unverified-users');
 			assert.strictEqual(unverified, true);
 			await User.email.confirmByCode(code);
@@ -2471,8 +2510,9 @@ describe('User', () => {
 			const email = 'confirm2@me.com';
 			const uid = await User.create({
 				username: 'confirme2',
-				email: email,
+				email,
 			});
+			await User.setUserField(uid, 'email', email);
 
 			const unverified = await groups.isMember(uid, 'unverified-users');
 			assert.strictEqual(unverified, true);
@@ -2484,17 +2524,27 @@ describe('User', () => {
 			assert.strictEqual(parseInt(confirmed, 10), 1);
 			assert.strictEqual(isVerified, true);
 		});
+
+		it('should remove the email from a different account if the email is already in use', async () => {
+			const email = 'confirm2@me.com';
+			const uid = await User.create({
+				username: 'confirme3',
+			});
+
+			const oldUid = await db.sortedSetScore('email:uid', email);
+			const code = await User.email.sendValidationEmail(uid, email);
+			await User.email.confirmByCode(code);
+
+			const oldUserData = await User.getUserData(oldUid);
+
+			assert.strictEqual((await db.sortedSetScore('email:uid', email)), uid);
+			assert.strictEqual(oldUserData.email, '');
+		});
 	});
 
 	describe('user jobs', () => {
-		it('should start user jobs', (done) => {
-			User.startJobs();
-			done();
-		});
-
-		it('should stop user jobs', (done) => {
-			User.stopJobs();
-			done();
+		it('should start user jobs', async () => {
+			await User.startJobs();
 		});
 
 		it('should send digest', (done) => {
@@ -2510,28 +2560,45 @@ describe('User', () => {
 
 	describe('hideEmail/hideFullname', () => {
 		const COMMON_PW = '123456';
-		let uid;
-		let jar;
-		let regularUserUid;
+		const hidingUser = {
+			username: 'hiddenemail',
+			email: 'should@be.hidden',
+			fullname: 'baris soner usakli',
+			password: COMMON_PW,
+		};
+		const regularUser = {
+			username: 'regularUser',
+			email: 'regular@example.com',
+			fullname: 'regular user',
+			password: COMMON_PW,
+		};
+		let hidingUserJar;
+		let adminUid;
+		let adminJar;
+		let globalModJar;
+		let regularUserJar;
 
 		before(async () => {
-			uid = await User.create({
-				username: 'hiddenemail',
-				email: 'should@be.hidden',
-				fullname: 'baris soner usakli',
-			});
-			regularUserUid = await User.create({
-				username: 'regularUser',
+			adminUid = await User.create({
+				username: 'adminhideemail',
 				password: COMMON_PW,
 			});
-			jar = await new Promise((resolve, reject) => {
-				helpers.loginUser('regularUser', COMMON_PW, async (err, _jar) => {
-					if (err) {
-						reject(err);
-					}
-					resolve(_jar);
-				});
+			await groups.join('administrators', adminUid);
+			({ jar: adminJar } = await helpers.loginUser('adminhideemail', COMMON_PW));
+
+			// Edge case: In a grepped test, this user should not be created as the first user to have its email not confirmed
+			hidingUser.uid = await User.create(hidingUser);
+			({ jar: hidingUserJar } = await helpers.loginUser(hidingUser.username, COMMON_PW));
+
+			const globalModUid = await User.create({
+				username: 'globalmodhideemail',
+				password: COMMON_PW,
 			});
+			await groups.join('Global Moderators', globalModUid);
+			({ jar: globalModJar } = await helpers.loginUser('globalmodhideemail', COMMON_PW));
+
+			regularUser.uid = await User.create(regularUser);
+			({ jar: regularUserJar } = await helpers.loginUser(regularUser.username, COMMON_PW));
 		});
 
 		after((done) => {
@@ -2540,229 +2607,183 @@ describe('User', () => {
 			done();
 		});
 
-		it('should hide email and fullname', async () => {
+		async function assertPrivacy({ expectVisible, jar, v3Api, emailOnly }) {
+			const path = v3Api ? `v3/users/${hidingUser.uid}` : `user/${hidingUser.username}`;
+			const { body } = await request.get(`${nconf.get('url')}/api/${path}`, { jar });
+			const userData = v3Api ? body.response : body;
+
+			assert.strictEqual(userData.email, expectVisible ? hidingUser.email : '');
+			if (!emailOnly) {
+				assert.strictEqual(userData.fullname, expectVisible ? hidingUser.fullname : '');
+			}
+		}
+
+		it('should hide unconfirmed emails on profile pages', async () => {
+			await assertPrivacy({ v3Api: false, emailOnly: true });
+			await assertPrivacy({ v3Api: false, jar: hidingUserJar, emailOnly: true });
+			await assertPrivacy({ v3Api: false, jar: adminJar, emailOnly: true });
+			await assertPrivacy({ v3Api: false, jar: globalModJar, emailOnly: true });
+			await assertPrivacy({ v3Api: false, jar: regularUserJar, emailOnly: true });
+
+			// Let's confirm for afterwards
+			await User.setUserField(hidingUser.uid, 'email', 'should@be.hidden');
+			await User.email.confirmByUid(hidingUser.uid);
+		});
+
+		it('should hide from guests by default', async () => {
+			await assertPrivacy({ v3Api: false });
+		});
+
+		it('should hide from unprivileged users by default', async () => {
+			await assertPrivacy({ v3Api: false, jar: regularUserJar });
+			await assertPrivacy({ v3Api: true, jar: regularUserJar });
+		});
+
+		it('should be visible to self by default', async () => {
+			await assertPrivacy({ v3Api: false, jar: hidingUserJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: hidingUserJar, expectVisible: true });
+		});
+
+		it('should be visible to privileged users by default', async () => {
+			await assertPrivacy({ v3Api: false, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: false, jar: globalModJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: globalModJar, expectVisible: true });
+		});
+
+		it('should hide from guests (system-wide: hide, by-user: hide)', async () => {
+			meta.config.hideEmail = 1;
+			meta.config.hideFullname = 1;
+			// Explicitly set user's privacy settings to hide its email and fullname
+			const data = { uid: hidingUser.uid, settings: { showemail: 0, showfullname: 0 } };
+			await apiUser.updateSettings({ uid: hidingUser.uid }, data);
+
+			await assertPrivacy({ v3Api: false });
+		});
+
+		it('should hide from unprivileged users (system-wide: hide, by-user: hide)', async () => {
+			await assertPrivacy({ v3Api: false, jar: regularUserJar });
+			await assertPrivacy({ v3Api: true, jar: regularUserJar });
+		});
+
+		it('should be visible to self (system-wide: hide, by-user: hide)', async () => {
+			await assertPrivacy({ v3Api: false, jar: hidingUserJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: hidingUserJar, expectVisible: true });
+		});
+
+		it('should be visible to privileged users (system-wide: hide, by-user: hide)', async () => {
+			await assertPrivacy({ v3Api: false, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: false, jar: globalModJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: globalModJar, expectVisible: true });
+		});
+
+		it('should hide from guests (system-wide: show, by-user: hide)', async () => {
+			meta.config.hideEmail = 0;
+			meta.config.hideFullname = 0;
+
+			await assertPrivacy({ v3Api: false });
+		});
+
+		it('should hide from unprivileged users (system-wide: show, by-user: hide)', async () => {
+			await assertPrivacy({ v3Api: false, jar: regularUserJar });
+			await assertPrivacy({ v3Api: true, jar: regularUserJar });
+		});
+
+		it('should be visible to self (system-wide: show, by-user: hide)', async () => {
+			await assertPrivacy({ v3Api: false, jar: hidingUserJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: hidingUserJar, expectVisible: true });
+		});
+
+		it('should be visible to privileged users (system-wide: show, by-user: hide)', async () => {
+			await assertPrivacy({ v3Api: false, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: false, jar: globalModJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: globalModJar, expectVisible: true });
+		});
+
+		it('should be visible to guests (system-wide: show, by-user: show)', async () => {
+			meta.config.hideEmail = 0;
+			meta.config.hideFullname = 0;
+
+			// Set user's individual privacy settings to show its email and fullname
+			const data = { uid: hidingUser.uid, settings: { showemail: 1, showfullname: 1 } };
+			await apiUser.updateSettings({ uid: hidingUser.uid }, data);
+
+			await assertPrivacy({ v3Api: false, expectVisible: true });
+		});
+
+		it('should be visible to unprivileged users (system-wide: show, by-user: show)', async () => {
+			await assertPrivacy({ v3Api: false, jar: regularUserJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: regularUserJar, expectVisible: true });
+		});
+
+		// System-wide "hide" prioritized over individual users' settings
+		it('should hide from guests (system-wide: hide, by-user: show)', async () => {
 			meta.config.hideEmail = 1;
 			meta.config.hideFullname = 1;
 
-			const userData1 = await requestAsync(`${nconf.get('url')}/api/user/hiddenemail`, { json: true });
-			assert.strictEqual(userData1.fullname, '');
-			assert.strictEqual(userData1.email, '');
-
-			const { response } = await requestAsync(`${nconf.get('url')}/api/v3/users/${uid}`, { json: true, jar: jar });
-			assert.strictEqual(response.fullname, '');
-			assert.strictEqual(response.email, '');
+			await assertPrivacy({ v3Api: false });
 		});
 
-		it('should hide fullname in topic list and topic', (done) => {
-			Topics.post({
-				uid: uid,
+		it('should hide from unprivileged users (system-wide: hide, by-user: show)', async () => {
+			await assertPrivacy({ v3Api: false, jar: regularUserJar });
+			await assertPrivacy({ v3Api: true, jar: regularUserJar });
+		});
+
+		it('should be visible to self (system-wide: hide, by-user: show)', async () => {
+			await assertPrivacy({ v3Api: false, jar: hidingUserJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: hidingUserJar, expectVisible: true });
+		});
+
+		it('should be visible to privileged users (system-wide: hide, by-user: show)', async () => {
+			await assertPrivacy({ v3Api: false, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: adminJar, expectVisible: true });
+			await assertPrivacy({ v3Api: false, jar: globalModJar, expectVisible: true });
+			await assertPrivacy({ v3Api: true, jar: globalModJar, expectVisible: true });
+		});
+
+		it('should handle array of user data (system-wide: hide)', async () => {
+			const userData = await User.hidePrivateData([hidingUser, regularUser], hidingUser.uid);
+			assert.strictEqual(userData[0].fullname, hidingUser.fullname);
+			assert.strictEqual(userData[0].email, hidingUser.email);
+			assert.strictEqual(userData[1].fullname, '');
+			assert.strictEqual(userData[1].email, '');
+		});
+
+		it('should respect admin setting in api.user.listEmails', async () => {
+			assert.strictEqual(
+				await apiUser.listEmails({ uid: regularUser.uid }, { uid: hidingUser.uid }),
+				null,
+			);
+		});
+
+		it('should respect admin setting in api.user.getEmail', async () => {
+			assert.strictEqual(
+				await apiUser.getEmail({ uid: regularUser.uid }, { uid: hidingUser.uid, email: hidingUser.email }),
+				false,
+			);
+		});
+
+		it('should respect admin setting in userController.getUserDataByField', async () => {
+			const userController = require('../src/controllers/user');
+			const userData = await userController.getUserDataByField({ uid: regularUser.uid }, 'email', hidingUser.email);
+			assert.strictEqual(userData, null);
+		});
+
+		it('should hide fullname in topic list and topic', async () => {
+			await Topics.post({
+				uid: hidingUser.uid,
 				title: 'Topic hidden',
 				content: 'lorem ipsum',
 				cid: testCid,
-			}, (err) => {
-				assert.ifError(err);
-				request(`${nconf.get('url')}/api/recent`, { json: true }, (err, res, body) => {
-					assert.ifError(err);
-					assert(!body.topics[0].user.hasOwnProperty('fullname'));
-					request(`${nconf.get('url')}/api/topic/${body.topics[0].slug}`, { json: true }, (err, res, body) => {
-						assert.ifError(err);
-						assert(!body.posts[0].user.hasOwnProperty('fullname'));
-						done();
-					});
-				});
-			});
-		});
-	});
-
-	describe('user blocking methods', (done) => {
-		let blockeeUid;
-		before((done) => {
-			User.create({
-				username: 'blockee',
-				email: 'blockee@example.org',
-				fullname: 'Block me',
-			}, (err, uid) => {
-				blockeeUid = uid;
-				done(err);
-			});
-		});
-
-		describe('.toggle()', () => {
-			it('should toggle block', (done) => {
-				socketUser.toggleBlock({ uid: 1 }, { blockerUid: 1, blockeeUid: blockeeUid }, (err) => {
-					assert.ifError(err);
-					User.blocks.is(blockeeUid, 1, (err, blocked) => {
-						assert.ifError(err);
-						assert(blocked);
-						done();
-					});
-				});
 			});
 
-			it('should toggle block', (done) => {
-				socketUser.toggleBlock({ uid: 1 }, { blockerUid: 1, blockeeUid: blockeeUid }, (err) => {
-					assert.ifError(err);
-					User.blocks.is(blockeeUid, 1, (err, blocked) => {
-						assert.ifError(err);
-						assert(!blocked);
-						done();
-					});
-				});
-			});
-		});
+			const { body: body1 } = await request.get(`${nconf.get('url')}/api/recent`);
+			assert(!body1.topics[0].user.hasOwnProperty('fullname'));
 
-		describe('.add()', () => {
-			it('should block a uid', (done) => {
-				User.blocks.add(blockeeUid, 1, (err) => {
-					assert.ifError(err);
-					User.blocks.list(1, (err, blocked_uids) => {
-						assert.ifError(err);
-						assert.strictEqual(Array.isArray(blocked_uids), true);
-						assert.strictEqual(blocked_uids.length, 1);
-						assert.strictEqual(blocked_uids.includes(blockeeUid), true);
-						done();
-					});
-				});
-			});
-
-			it('should automatically increment corresponding user field', (done) => {
-				db.getObjectField('user:1', 'blocksCount', (err, count) => {
-					assert.ifError(err);
-					assert.strictEqual(parseInt(count, 10), 1);
-					done();
-				});
-			});
-
-			it('should error if you try to block the same uid again', (done) => {
-				User.blocks.add(blockeeUid, 1, (err) => {
-					assert.equal(err.message, '[[error:already-blocked]]');
-					done();
-				});
-			});
-		});
-
-		describe('.remove()', () => {
-			it('should unblock a uid', (done) => {
-				User.blocks.remove(blockeeUid, 1, (err) => {
-					assert.ifError(err);
-					User.blocks.list(1, (err, blocked_uids) => {
-						assert.ifError(err);
-						assert.strictEqual(Array.isArray(blocked_uids), true);
-						assert.strictEqual(blocked_uids.length, 0);
-						done();
-					});
-				});
-			});
-
-			it('should automatically decrement corresponding user field', (done) => {
-				db.getObjectField('user:1', 'blocksCount', (err, count) => {
-					assert.ifError(err);
-					assert.strictEqual(parseInt(count, 10), 0);
-					done();
-				});
-			});
-
-			it('should error if you try to unblock the same uid again', (done) => {
-				User.blocks.remove(blockeeUid, 1, (err) => {
-					assert.equal(err.message, '[[error:already-unblocked]]');
-					done();
-				});
-			});
-		});
-
-		describe('.is()', () => {
-			before((done) => {
-				User.blocks.add(blockeeUid, 1, done);
-			});
-
-			it('should return a Boolean with blocked status for the queried uid', (done) => {
-				User.blocks.is(blockeeUid, 1, (err, blocked) => {
-					assert.ifError(err);
-					assert.strictEqual(blocked, true);
-					done();
-				});
-			});
-		});
-
-		describe('.list()', () => {
-			it('should return a list of blocked uids', (done) => {
-				User.blocks.list(1, (err, blocked_uids) => {
-					assert.ifError(err);
-					assert.strictEqual(Array.isArray(blocked_uids), true);
-					assert.strictEqual(blocked_uids.length, 1);
-					assert.strictEqual(blocked_uids.includes(blockeeUid), true);
-					done();
-				});
-			});
-		});
-
-		describe('.filter()', () => {
-			it('should remove entries by blocked uids and return filtered set', (done) => {
-				User.blocks.filter(1, [{
-					foo: 'foo',
-					uid: blockeeUid,
-				}, {
-					foo: 'bar',
-					uid: 1,
-				}, {
-					foo: 'baz',
-					uid: blockeeUid,
-				}], (err, filtered) => {
-					assert.ifError(err);
-					assert.strictEqual(Array.isArray(filtered), true);
-					assert.strictEqual(filtered.length, 1);
-					assert.equal(filtered[0].uid, 1);
-					done();
-				});
-			});
-
-			it('should allow property argument to be passed in to customise checked property', (done) => {
-				User.blocks.filter(1, 'fromuid', [{
-					foo: 'foo',
-					fromuid: blockeeUid,
-				}, {
-					foo: 'bar',
-					fromuid: 1,
-				}, {
-					foo: 'baz',
-					fromuid: blockeeUid,
-				}], (err, filtered) => {
-					assert.ifError(err);
-					assert.strictEqual(Array.isArray(filtered), true);
-					assert.strictEqual(filtered.length, 1);
-					assert.equal(filtered[0].fromuid, 1);
-					done();
-				});
-			});
-
-			it('should not process invalid sets', (done) => {
-				User.blocks.filter(1, [{ foo: 'foo' }, { foo: 'bar' }, { foo: 'baz' }], (err, filtered) => {
-					assert.ifError(err);
-					assert.strictEqual(Array.isArray(filtered), true);
-					assert.strictEqual(filtered.length, 3);
-					filtered.forEach((obj) => {
-						assert.strictEqual(obj.hasOwnProperty('foo'), true);
-					});
-					done();
-				});
-			});
-
-			it('should process plain sets that just contain uids', (done) => {
-				User.blocks.filter(1, [1, blockeeUid], (err, filtered) => {
-					assert.ifError(err);
-					assert.strictEqual(filtered.length, 1);
-					assert.strictEqual(filtered[0], 1);
-					done();
-				});
-			});
-
-			it('should filter uids that are blocking targetUid', (done) => {
-				User.blocks.filterUids(blockeeUid, [1, 2], (err, filtered) => {
-					assert.ifError(err);
-					assert.deepEqual(filtered, [2]);
-					done();
-				});
-			});
+			const { body: body2 } = await request.get(`${nconf.get('url')}/api/topic/${body1.topics[0].slug}`);
+			assert(!body2.posts[0].user.hasOwnProperty('fullname'));
 		});
 	});
 
@@ -2819,15 +2840,45 @@ describe('User', () => {
 		});
 	});
 
-	it('should allow user to login even if password is weak', (done) => {
-		User.create({ username: 'weakpwd', password: '123456' }, (err) => {
-			assert.ifError(err);
-			const oldValue = meta.config.minimumPasswordStrength;
-			meta.config.minimumPasswordStrength = 3;
-			helpers.loginUser('weakpwd', '123456', (err, jar, csrfs_token) => {
-				assert.ifError(err);
-				meta.config.minimumPasswordStrength = oldValue;
-				done();
+	it('should allow user to login even if password is weak', async () => {
+		await User.create({ username: 'weakpwd', password: '123456' });
+		const oldValue = meta.config.minimumPasswordStrength;
+		meta.config.minimumPasswordStrength = 3;
+		await helpers.loginUser('weakpwd', '123456');
+		meta.config.minimumPasswordStrength = oldValue;
+	});
+
+	describe('getUsersCSV', () => {
+		it('should export user csv and sanitize csv formulas', async () => {
+			const suffix = Date.now();
+			const usernames = [
+				`+1+1-${suffix}`,
+				`-2+3-${suffix}`,
+			];
+
+			for (const username of usernames) {
+				// eslint-disable-next-line no-await-in-loop
+				await User.create({ username });
+			}
+
+			const csv = await User.getUsersCSV();
+			usernames.forEach((username) => {
+				assert(csv.includes(`'${username}`), `Expected exported CSV username to be neutralized: ${username}`);
+			});
+		});
+	});
+
+
+	describe('User\'s', async () => {
+		let files;
+
+		before(async () => {
+			files = await file.walk(path.resolve(__dirname, './user'));
+		});
+
+		it('subfolder tests', () => {
+			files.forEach((filePath) => {
+				require(filePath);
 			});
 		});
 	});

@@ -1,7 +1,8 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const winston = require('winston');
-const async = require('async');
 const nconf = require('nconf');
 const session = require('express-session');
 const semver = require('semver');
@@ -14,40 +15,40 @@ postgresModule.questions = [
 	{
 		name: 'postgres:host',
 		description: 'Host IP or address of your PostgreSQL instance',
-		default: nconf.get('postgres:host') || '127.0.0.1',
+		default: nconf.get('postgres:host') || nconf.get('defaults:postgres:host') || '127.0.0.1',
 	},
 	{
 		name: 'postgres:port',
 		description: 'Host port of your PostgreSQL instance',
-		default: nconf.get('postgres:port') || 5432,
+		default: nconf.get('postgres:port') || nconf.get('defaults:postgres:port') || 5432,
 	},
 	{
 		name: 'postgres:username',
 		description: 'PostgreSQL username',
-		default: nconf.get('postgres:username') || '',
+		default: nconf.get('postgres:username') || nconf.get('defaults:postgres:username') || '',
 	},
 	{
 		name: 'postgres:password',
 		description: 'Password of your PostgreSQL database',
 		hidden: true,
-		default: nconf.get('postgres:password') || '',
+		default: nconf.get('postgres:password') || nconf.get('defaults:postgres:password') || '',
 		before: function (value) { value = value || nconf.get('postgres:password') || ''; return value; },
 	},
 	{
 		name: 'postgres:database',
 		description: 'PostgreSQL database name',
-		default: nconf.get('postgres:database') || 'nodebb',
+		default: nconf.get('postgres:database') || nconf.get('defaults:postgres:database') || 'nodebb',
 	},
 	{
 		name: 'postgres:ssl',
 		description: 'Enable SSL for PostgreSQL database access',
-		default: nconf.get('postgres:ssl') || false,
+		default: nconf.get('postgres:ssl') || nconf.get('defaults:postgres:ssl') || false,
 	},
 ];
 
-postgresModule.init = async function () {
+postgresModule.init = async function (opts) {
 	const { Pool } = require('pg');
-	const connOptions = connection.getConnectionOptions();
+	const connOptions = connection.getConnectionOptions(opts);
 	const pool = new Pool(connOptions);
 	postgresModule.pool = pool;
 	postgresModule.client = pool;
@@ -78,9 +79,13 @@ SELECT EXISTS(SELECT *
        EXISTS(SELECT *
                 FROM "information_schema"."routines"
                WHERE "routine_schema" = 'public'
-                 AND "routine_name" = 'nodebb_get_sorted_set_members') c`);
+                 AND "routine_name" = 'nodebb_get_sorted_set_members') c,
+		EXISTS(SELECT *
+				FROM "information_schema"."routines"
+			   WHERE "routine_schema" = 'public'
+				 AND "routine_name" = 'nodebb_get_sorted_set_members_withscores') d`);
 
-	if (res.rows[0].a && res.rows[0].b && res.rows[0].c) {
+	if (res.rows[0].a && res.rows[0].b && res.rows[0].c && res.rows[0].d) {
 		return;
 	}
 
@@ -266,6 +271,7 @@ SELECT "_key", "type"
   FROM "legacy_object"
  WHERE "expireAt" IS NULL
     OR "expireAt" > CURRENT_TIMESTAMP`);
+			await createIndices(client);
 		}
 
 		if (!res.rows[0].c) {
@@ -281,6 +287,21 @@ $$ LANGUAGE sql
 STABLE
 STRICT
 PARALLEL SAFE`);
+		}
+
+		if (!res.rows[0].d) {
+			await client.query(`
+			CREATE FUNCTION "nodebb_get_sorted_set_members_withscores"(TEXT) RETURNS JSON AS $$
+				SELECT json_agg(json_build_object('value', z."value", 'score', z."score") ORDER BY z."score" ASC) as item
+				  FROM "legacy_object_live" o
+				 INNER JOIN "legacy_zset" z
+						 ON o."_key" = z."_key"
+						AND o."type" = z."type"
+					  WHERE o."_key" = $1
+			$$ LANGUAGE sql
+			STABLE
+			STRICT
+			PARALLEL SAFE`);
 		}
 	} catch (ex) {
 		await client.query(`ROLLBACK`);
@@ -325,30 +346,29 @@ ALTER TABLE "session"
 	return done(db);
 };
 
-postgresModule.createIndices = function (callback) {
+postgresModule.createIndices = async function () {
 	if (!postgresModule.pool) {
 		winston.warn('[database/createIndices] database not initialized');
-		return callback();
+		return;
 	}
-
-	const query = postgresModule.pool.query.bind(postgresModule.pool);
-
 	winston.info('[database] Checking database indices.');
-	async.series([
-		async.apply(query, `CREATE INDEX IF NOT EXISTS "idx__legacy_zset__key__score" ON "legacy_zset"("_key" ASC, "score" DESC)`),
-		async.apply(query, `CREATE INDEX IF NOT EXISTS "idx__legacy_object__expireAt" ON "legacy_object"("expireAt" ASC)`),
-	], (err) => {
-		if (err) {
-			winston.error(`Error creating index ${err.message}`);
-			return callback(err);
-		}
+	try {
+		await createIndices(postgresModule.pool);
 		winston.info('[database] Checking database indices done!');
-		callback();
-	});
+	} catch (err) {
+		winston.error(`Error creating index ${err.message}`);
+		throw err;
+	}
 };
 
+function createIndices(client) {
+	return client.query(`
+CREATE INDEX IF NOT EXISTS "idx__legacy_zset__key__score" ON "legacy_zset"("_key" ASC, "score" DESC);
+CREATE INDEX IF NOT EXISTS "idx__legacy_object__expireAt" ON "legacy_object"("expireAt" ASC);`);
+}
+
 postgresModule.checkCompatibility = function (callback) {
-	const postgresPkg = require('pg/package.json');
+	const postgresPkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../../node_modules/pg/package.json'), 'utf8'));
 	postgresModule.checkCompatibilityVersion(postgresPkg.version, callback);
 };
 
@@ -378,6 +398,9 @@ postgresModule.info = async function (db) {
 
 postgresModule.close = async function () {
 	await postgresModule.pool.end();
+	if (postgresModule.objectCache) {
+		postgresModule.objectCache.reset();
+	}
 };
 
 require('./postgres/main')(postgresModule);

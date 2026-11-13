@@ -5,15 +5,9 @@
     "month": "Månad",
     "year": "År",
     "alltime": "Alltid",
-    "no_recent_topics": "Det finns inga olästa ämnen.",
-    "no_popular_topics": "Det finns inga populära ämnen.",
-    "there-is-a-new-topic": "Det finns ett nytt ämne.",
-    "there-is-a-new-topic-and-a-new-post": "Det finns ett nytt ämne och ett nytt inlägg.",
-    "there-is-a-new-topic-and-new-posts": "Det finns ett nytt ämne och %1 nya inlägg.",
-    "there-are-new-topics": "Det finns %1 nya ämnen.",
-    "there-are-new-topics-and-a-new-post": "Det finns %1 nya ämnen och ett nytt inlägg.",
-    "there-are-new-topics-and-new-posts": "Det finns %1 nya ämnen och %2 nya inlägg.",
-    "there-is-a-new-post": "Det finns ett nytt inlägg.",
-    "there-are-new-posts": "Det finns %1 nya inlägg.",
-    "click-here-to-reload": "Klicka här för att ladda om."
+    "no-recent-topics": "Det finns inga olästa ämnen.",
+    "no-popular-topics": "Det finns inga populära ämnen.",
+    "load-new-posts": "Ladda nya inlägg",
+    "uncategorized.title": "All known topics",
+    "uncategorized.intro": "This page shows a chronological listing of every topic that this forum has received.<br />The views and opinions expressed in the topics below are not moderated and may not represent the views and opinions of this website."
 }

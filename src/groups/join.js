@@ -1,12 +1,12 @@
 'use strict';
 
-const async = require('async');
 const winston = require('winston');
 
 const db = require('../database');
 const user = require('../user');
 const plugins = require('../plugins');
 const cache = require('../cache');
+const utils = require('../utils');
 
 module.exports = function (Groups) {
 	Groups.join = async function (groupNames, uid) {
@@ -27,7 +27,7 @@ module.exports = function (Groups) {
 		const [isMembers, exists, isAdmin] = await Promise.all([
 			Groups.isMemberOfGroups(uid, groupNames),
 			Groups.exists(groupNames),
-			user.isAdministrator(uid),
+			utils.isNumber(uid) ? user.isAdministrator(uid) : false,
 		]);
 
 		const groupsToCreate = groupNames.filter((groupName, index) => groupName && !exists[index]);
@@ -75,8 +75,9 @@ module.exports = function (Groups) {
 			return;
 		}
 
-		await async.eachSeries(groupsToCreate, async (groupName) => {
+		for (const groupName of groupsToCreate) {
 			try {
+				// eslint-disable-next-line no-await-in-loop
 				await Groups.create({
 					name: groupName,
 					hidden: 1,
@@ -87,10 +88,13 @@ module.exports = function (Groups) {
 					throw err;
 				}
 			}
-		});
+		}
 	}
 
 	async function setGroupTitleIfNotSet(groupNames, uid) {
+		if (!utils.isNumber(uid)) {
+			return;
+		}
 		const ignore = ['registered-users', 'verified-users', 'unverified-users', Groups.BANNED_USERS];
 		groupNames = groupNames.filter(
 			groupName => !ignore.includes(groupName) && !Groups.isPrivilegeGroup(groupName)

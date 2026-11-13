@@ -1,18 +1,16 @@
 'use strict';
 
-const validator = require('validator');
-
 const db = require('../database');
 const categories = require('../categories');
 const utils = require('../utils');
-const translator = require('../translator');
 const plugins = require('../plugins');
 
 const intFields = [
 	'tid', 'cid', 'uid', 'mainPid', 'postcount',
-	'viewcount', 'postercount', 'deleted', 'locked', 'pinned',
-	'pinExpiry', 'timestamp', 'upvotes', 'downvotes', 'lastposttime',
-	'deleterUid',
+	'viewcount', 'postercount', 'followercount',
+	'deleted', 'locked', 'pinned', 'pinExpiry',
+	'timestamp', 'upvotes', 'downvotes',
+	'lastposttime', 'deleterUid', 'generatedTitle',
 ];
 
 module.exports = function (Topics) {
@@ -40,7 +38,7 @@ module.exports = function (Topics) {
 
 	Topics.getTopicField = async function (tid, field) {
 		const topic = await Topics.getTopicFields(tid, [field]);
-		return topic ? topic[field] : null;
+		return topic && topic.hasOwnProperty(field) ? topic[field] : null;
 	};
 
 	Topics.getTopicFields = async function (tid, fields) {
@@ -79,59 +77,65 @@ module.exports = function (Topics) {
 	};
 };
 
-function escapeTitle(topicData) {
-	if (topicData) {
-		if (topicData.title) {
-			topicData.title = translator.escape(validator.escape(topicData.title));
-		}
-		if (topicData.titleRaw) {
-			topicData.titleRaw = translator.escape(topicData.titleRaw);
-		}
-	}
-}
 
 function modifyTopic(topic, fields) {
 	if (!topic) {
 		return;
 	}
 
+	const hasField = utils.createFieldChecker(fields);
+
 	db.parseIntFields(topic, intFields, fields);
 
-	if (topic.hasOwnProperty('title')) {
-		topic.titleRaw = topic.title;
+	if (hasField('title')) {
 		topic.title = String(topic.title);
 	}
 
-	escapeTitle(topic);
+	if (hasField('titleEmoji')) {
+		topic.titleEmoji = topic.titleEmoji ? JSON.parse(String(topic.titleEmoji)) : [];
+	}
 
-	if (topic.hasOwnProperty('timestamp')) {
+	if (hasField('timestamp')) {
 		topic.timestampISO = utils.toISOString(topic.timestamp);
-		if (!fields.length || fields.includes('scheduled')) {
+		if (hasField('scheduled')) {
 			topic.scheduled = topic.timestamp > Date.now();
 		}
 	}
 
-	if (topic.hasOwnProperty('lastposttime')) {
+	if (hasField('lastposttime')) {
 		topic.lastposttimeISO = utils.toISOString(topic.lastposttime);
 	}
 
-	if (topic.hasOwnProperty('pinExpiry')) {
+	if (hasField('pinExpiry')) {
 		topic.pinExpiryISO = utils.toISOString(topic.pinExpiry);
 	}
 
-	if (topic.hasOwnProperty('upvotes') && topic.hasOwnProperty('downvotes')) {
+	if (hasField('upvotes') && hasField('downvotes')) {
 		topic.votes = topic.upvotes - topic.downvotes;
 	}
 
-	if (fields.includes('teaserPid') || !fields.length) {
+	if (hasField('teaserPid')) {
 		topic.teaserPid = topic.teaserPid || null;
 	}
 
-	if (fields.includes('tags') || !fields.length) {
+	if (hasField('tags')) {
 		const tags = String(topic.tags || '');
-		topic.tags = tags.split(',').filter(Boolean).map(tag => ({
-			value: tag,
-			valueEscaped: validator.escape(String(tag)),
-		}));
+		topic.tags = tags.split(',').filter(Boolean).map((tag) => {
+			return {
+				value: tag,
+				valueEncoded: encodeURIComponent(tag),
+				class: tag.replace(/\s/g, '-'),
+			};
+		});
+	}
+
+	if (hasField('thumbs')) {
+		try {
+			topic.numThumbs = topic.thumbs.length;
+			topic.thumbs = topic.thumbs ? JSON.parse(String(topic.thumbs || '[]')) : [];
+		} catch (e) {
+			topic.numThumbs = 0;
+			topic.thumbs = [];
+		}
 	}
 }

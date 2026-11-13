@@ -35,10 +35,13 @@ start.start = async function () {
 		await sockets.init(webserver.server);
 
 		if (nconf.get('runJobs')) {
-			require('./notifications').startJobs();
-			require('./user').startJobs();
-			require('./plugins').startJobs();
-			require('./topics').scheduled.startJobs();
+			await require('./cron').markJobsInactive();
+			await require('./notifications').startJobs();
+			await require('./user').startJobs();
+			await require('./plugins').startJobs();
+			await require('./topics').scheduled.startJobs();
+			await require('./posts').uploads.startJobs();
+			await require('./activitypub').jobs.start();
 			await db.delete('locks');
 		}
 
@@ -95,8 +98,9 @@ function printStartupInfo() {
 }
 
 function addProcessHandlers() {
-	process.on('SIGTERM', shutdown);
-	process.on('SIGINT', shutdown);
+	['SIGTERM', 'SIGINT', 'SIGQUIT'].forEach((signal) => {
+		process.on(signal, () => shutdown());
+	});
 	process.on('SIGHUP', restart);
 	process.on('uncaughtException', (err) => {
 		winston.error(err.stack);
@@ -105,12 +109,25 @@ function addProcessHandlers() {
 		shutdown(1);
 	});
 	process.on('message', (msg) => {
-		if (msg && msg.compiling === 'tpl') {
-			const benchpressjs = require('benchpressjs');
-			benchpressjs.flush();
-		} else if (msg && msg.compiling === 'lang') {
-			const translator = require('./translator');
-			translator.flush();
+		if (msg) {
+			if (Array.isArray(msg.compiling)) {
+				if (msg.compiling.includes('tpl')) {
+					const benchpressjs = require('benchpressjs');
+					benchpressjs.flush();
+				} else if (msg.compiling.includes('lang')) {
+					const translator = require('./translator');
+					translator.flush();
+				}
+			}
+
+			if (msg.livereload) {
+				// Send livereload event to all connected clients via Socket.IO
+				const websockets = require('./socket.io');
+				if (websockets.server) {
+					websockets.server.emit('event:livereload');
+					winston.info('[livereload] Sent reload event to all clients');
+				}
+			}
 		}
 	});
 }
@@ -128,18 +145,23 @@ function restart() {
 }
 
 async function shutdown(code) {
-	winston.info('[app] Shutdown (SIGTERM/SIGINT) Initialised.');
+	winston.info('[app] Shutdown (SIGTERM/SIGINT/SIGQUIT) Initialised.');
 	try {
 		await require('./webserver').destroy();
 		winston.info('[app] Web server closed to connections.');
-		await require('./analytics').writeData();
+		await require('./analytics').writeLocalData();
 		winston.info('[app] Live analytics saved.');
-		await require('./database').close();
+		require('./activitypub').shutdown();
+		winston.info('[app] ActivityPub send pool shut down.');
+		const db = require('./database');
+		await db.delete('locks');
+		await db.close();
 		winston.info('[app] Database connection closed.');
 		winston.info('[app] Shutdown complete.');
 		process.exit(code || 0);
 	} catch (err) {
 		winston.error(err.stack);
-		return process.exit(code || 0);
+
+		process.exit(code || 0);
 	}
 }

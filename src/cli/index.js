@@ -1,40 +1,35 @@
-/* eslint-disable import/order */
-
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
 
 require('../../require-main');
+require('../../nodebb-global');
+
+// https://github.com/NodeBB/NodeBB/issues/13734
+// check dev flag early so packageInstall.installAll() can use it
+const isDev = process.argv.some(arg =>
+	arg === '-d' ||
+	arg === '--dev' ||
+	(arg.startsWith('-') && !arg.startsWith('--') && arg.includes('d')));
+
+process.env.NODE_ENV = isDev ? 'development' : (process.env.NODE_ENV || 'production');
 
 const packageInstall = require('./package-install');
 const { paths } = require('../constants');
 
-// check to make sure dependencies are installed
 try {
-	fs.accessSync(paths.currentPackage, fs.constants.R_OK);
-} catch (e) {
-	if (e.code === 'ENOENT') {
-		console.warn('package.json not found.');
-		console.log('Populating package.json...');
-
-		packageInstall.updatePackageFile();
-		packageInstall.preserveExtraneousPlugins();
-
-		try {
-			fs.accessSync(path.join(paths.nodeModules, 'colors/package.json'), fs.constants.R_OK);
-
-			require('colors');
-			console.log('OK'.green);
-		} catch (e) {
-			console.log('OK');
+	fs.accessSync(paths.currentPackage, fs.constants.R_OK); // throw on missing package.json
+	try { // handle missing node_modules/ directory
+		fs.accessSync(paths.nodeModules, fs.constants.R_OK);
+	} catch (e) {
+		if (e.code === 'ENOENT') {
+			// run package installation just to sync up node_modules/ with existing package.json
+			packageInstall.installAll();
+		} else {
+			throw e;
 		}
-	} else {
-		throw e;
 	}
-}
-
-try {
 	fs.accessSync(path.join(paths.nodeModules, 'semver/package.json'), fs.constants.R_OK);
 
 	const semver = require('semver');
@@ -52,28 +47,42 @@ try {
 	checkVersion('nconf');
 	checkVersion('async');
 	checkVersion('commander');
-	checkVersion('colors');
+	checkVersion('chalk');
+	checkVersion('lodash');
+	checkVersion('lru-cache');
+	checkVersion('@xmldom/xmldom');
 } catch (e) {
 	if (['ENOENT', 'DEP_WRONG_VERSION', 'MODULE_NOT_FOUND'].includes(e.code)) {
-		console.warn('Dependencies outdated or not yet installed.');
+		console.warn(`Dependencies outdated or not yet installed. Error Code: ${e.code}\n${e.stack}`);
 		console.log('Installing them now...\n');
 
 		packageInstall.updatePackageFile();
+		packageInstall.preserveExtraneousPlugins();
 		packageInstall.installAll();
 
-		require('colors');
-		console.log('OK'.green + '\n'.reset);
+		// delete the module from require cache so it doesn't break rest of the upgrade
+		// https://github.com/NodeBB/NodeBB/issues/11173
+		const packages = ['nconf', 'async', 'commander', 'chalk', 'lodash', 'lru-cache'];
+		packages.forEach((packageName) => {
+			const resolvedModule = require.resolve(packageName);
+			if (require.cache[resolvedModule]) {
+				delete require.cache[resolvedModule];
+			}
+		});
+
+		const chalk = require('chalk').default;
+		console.log(`${chalk.green('OK')}\n`);
 	} else {
 		throw e;
 	}
 }
 
-require('colors');
+const chalk = require('chalk').default;
 const nconf = require('nconf');
 const { program } = require('commander');
 const yargs = require('yargs');
 
-const pkg = require('../../package.json');
+const pkg = require('../../install/package.json');
 const file = require('../file');
 const prestart = require('../prestart');
 
@@ -87,7 +96,8 @@ program
 	.option('--log-level <level>', 'Default logging level to use', 'info')
 	.option('--config <value>', 'Specify a config file', 'config.json')
 	.option('-d, --dev', 'Development mode, including verbose logging', false)
-	.option('-l, --log', 'Log subprocess output to console', false);
+	.option('-l, --log', 'Log subprocess output to console', false)
+	.option('-y, --unattended', 'Answer yes to any prompts, like plugin upgrades', false);
 
 // provide a yargs object ourselves
 // otherwise yargs will consume `--help` or `help`
@@ -97,10 +107,12 @@ nconf.argv(opts).env({
 	separator: '__',
 });
 
+
+
 prestart.setupWinston();
 
 // Alternate configuration file support
-const	configFile = path.resolve(paths.baseDir, nconf.get('config') || 'config.json');
+const configFile = path.resolve(paths.baseDir, nconf.get('config') || 'config.json');
 const configExists = file.existsSync(configFile) || (nconf.get('url') && nconf.get('secret') && nconf.get('database'));
 
 prestart.loadConfig(configFile);
@@ -111,7 +123,9 @@ if (!configExists && process.argv[2] !== 'setup') {
 	return;
 }
 
-process.env.CONFIG = configFile;
+if (configExists) {
+	process.env.CONFIG = configFile;
+}
 
 // running commands
 program
@@ -135,7 +149,6 @@ program
 	.description('Start NodeBB in verbose development mode')
 	.action(() => {
 		process.env.NODE_ENV = 'development';
-		global.env = 'development';
 		require('./running').start({ ...program.opts(), dev: true });
 	});
 program
@@ -173,7 +186,7 @@ program
 			try {
 				initConfig = JSON.parse(initConfig);
 			} catch (e) {
-				console.warn('Invalid JSON passed as initial config value.'.red);
+				console.warn(chalk.red('Invalid JSON passed as initial config value.'));
 				console.log('If you meant to pass in an initial config value, please try again.\n');
 
 				throw e;
@@ -183,19 +196,25 @@ program
 	});
 
 program
-	.command('install')
-	.description('Launch the NodeBB web installer for configuration setup')
-	.action(() => {
-		require('./setup').webInstall();
+	.command('install [plugin]')
+	.description('Launch the NodeBB web installer for configuration setup or install a plugin')
+	.option('-f, --force', 'Force plugin installation even if it may be incompatible with currently installed NodeBB version')
+	.action((plugin, options) => {
+		if (plugin) {
+			require('./manage').install(plugin, options);
+		} else {
+			require('./setup').webInstall();
+		}
 	});
+
 program
 	.command('build [targets...]')
-	.description(`Compile static assets ${'(JS, CSS, templates, languages)'.red}`)
+	.description(`Compile static assets ${chalk.red('(JS, CSS, templates, languages)')}`)
 	.option('-s, --series', 'Run builds in series without extra processes')
+	.option('-w, --webpack', 'Bundle assets with webpack', true)
 	.action((targets, options) => {
 		if (program.opts().dev) {
 			process.env.NODE_ENV = 'development';
-			global.env = 'development';
 		}
 		require('./manage').build(targets.length ? targets : true, options);
 	})
@@ -226,6 +245,12 @@ program
 	.action(() => {
 		require('./manage').info();
 	});
+program
+	.command('maintenance <toggle>')
+	.description('Toggle maintenance mode true/false')
+	.action((toggle) => {
+		require('./manage').maintenance(toggle);
+	});
 
 // reset
 const resetCommand = program.command('reset');
@@ -240,7 +265,7 @@ resetCommand
 	.action((options) => {
 		const valid = ['theme', 'plugin', 'widgets', 'settings', 'all'].some(x => options[x]);
 		if (!valid) {
-			console.warn('\n  No valid options passed in, so nothing was reset.'.red);
+			console.warn(`\n${chalk.red('No valid options passed in, so nothing was reset.')}`);
 			resetCommand.help();
 		}
 
@@ -252,6 +277,10 @@ resetCommand
 			process.exit(0);
 		});
 	});
+
+// user
+program
+	.addCommand(require('./user')());
 
 // upgrades
 program
@@ -266,11 +295,16 @@ program
 		console.log(`\n${[
 			'When running particular upgrade scripts, options are ignored.',
 			'By default all options are enabled. Passing any options disables that default.',
-			`Only package and dependency updates: ${'./nodebb upgrade -mi'.yellow}`,
-			`Only database update: ${'./nodebb upgrade -s'.yellow}`,
+			'\nExamples:',
+			`  Only package and dependency updates: ${chalk.yellow('./nodebb upgrade -mi')}`,
+			`  Only database update: ${chalk.yellow('./nodebb upgrade -s')}`,
 		].join('\n')}`);
 	})
 	.action((scripts, options) => {
+		options.unattended = program.opts().unattended;
+		if (program.opts().dev) {
+			process.env.NODE_ENV = 'development';
+		}
 		require('./upgrade').upgrade(scripts.length ? scripts : true, options);
 	});
 
@@ -281,11 +315,12 @@ program
 	.alias('upgradePlugins')
 	.description('Upgrade plugins')
 	.action(() => {
-		require('./upgrade-plugins').upgradePlugins((err) => {
+		const { unattended } = program.opts();
+		require('./upgrade-plugins').upgradePlugins(unattended, (err) => {
 			if (err) {
 				throw err;
 			}
-			console.log('OK'.green);
+			console.log(chalk.green('OK'));
 			process.exit();
 		});
 	});

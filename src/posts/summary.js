@@ -3,6 +3,7 @@
 
 const validator = require('validator');
 const _ = require('lodash');
+const nconf = require('nconf');
 
 const topics = require('../topics');
 const user = require('../user');
@@ -18,9 +19,12 @@ module.exports = function (Posts) {
 
 		options.stripTags = options.hasOwnProperty('stripTags') ? options.stripTags : false;
 		options.parse = options.hasOwnProperty('parse') ? options.parse : true;
+		options.escape = options.hasOwnProperty('escape') ? options.escape : false;
 		options.extraFields = options.hasOwnProperty('extraFields') ? options.extraFields : [];
 
-		const fields = ['pid', 'tid', 'content', 'uid', 'timestamp', 'deleted', 'upvotes', 'downvotes', 'replies', 'handle'].concat(options.extraFields);
+		// `uploads` is selected so parsing can size images without a second lookup,
+		// and is dropped again below to keep the summary payload unchanged
+		const fields = ['pid', 'tid', 'toPid', 'url', 'content', 'sourceContent', 'uid', 'timestamp', 'deleted', 'upvotes', 'downvotes', 'replies', 'handle', 'uploads'].concat(options.extraFields);
 
 		let posts = await Posts.getPostsFields(pids, fields);
 		posts = posts.filter(Boolean);
@@ -30,7 +34,7 @@ module.exports = function (Posts) {
 		const tids = _.uniq(posts.map(p => p && p.tid));
 
 		const [users, topicsAndCategories] = await Promise.all([
-			user.getUsersFields(uids, ['uid', 'username', 'userslug', 'picture', 'status']),
+			user.getUsersFields(uids, ['uid', 'username', 'userslug', 'picture', 'status', 'fullnameEmoji']),
 			getTopicAndCategories(tids),
 		]);
 
@@ -44,6 +48,10 @@ module.exports = function (Posts) {
 			if (!uidToUser.hasOwnProperty(post.uid)) {
 				post.uid = 0;
 			}
+
+			// toPid is nullable so it is casted separately
+			post.toPid = utils.isNumber(post.toPid) ? parseInt(post.toPid, 10) : post.toPid;
+
 			post.user = uidToUser[post.uid];
 			Posts.overrideGuestHandle(post, post.handle);
 			post.handle = undefined;
@@ -52,33 +60,53 @@ module.exports = function (Posts) {
 			post.isMainPost = post.topic && post.pid === post.topic.mainPid;
 			post.deleted = post.deleted === 1;
 			post.timestampISO = utils.toISOString(post.timestamp);
+
+			// url only applies to remote posts; assume permalink otherwise
+			if (utils.isNumber(post.pid)) {
+				post.url = `${nconf.get('url')}/post/${post.pid}`;
+			}
 		});
 
 		posts = posts.filter(post => tidToTopic[post.tid]);
 
 		posts = await parsePosts(posts, options);
+		if (!options.extraFields.includes('uploads')) {
+			posts.forEach((post) => { post.uploads = undefined; });
+		}
 		const result = await plugins.hooks.fire('filter:post.getPostSummaryByPids', { posts: posts, uid: uid });
 		return result.posts;
 	};
 
 	async function parsePosts(posts, options) {
 		return await Promise.all(posts.map(async (post) => {
-			if (!post.content || !options.parse) {
-				post.content = post.content ? validator.escape(String(post.content)) : post.content;
+			if (!post.content && !post.sourceContent) {
 				return post;
 			}
-			post = await Posts.parsePost(post);
+			if (options.parse) {
+				post = await Posts.parsePost(post);
+			}
 			if (options.stripTags) {
 				post.content = stripTags(post.content);
+			}
+			if (options.escape) {
+				post.content = post.content ? validator.escape(String(post.content)) : post.content;
 			}
 			return post;
 		}));
 	}
 
 	async function getTopicAndCategories(tids) {
-		const topicsData = await topics.getTopicsFields(tids, ['uid', 'tid', 'title', 'cid', 'slug', 'deleted', 'scheduled', 'postcount', 'mainPid', 'teaserPid']);
+		const topicsData = await topics.getTopicsFields(tids, [
+			'uid', 'tid', 'title', 'generatedTitle', 'cid', 'tags', 'slug',
+			'deleted', 'scheduled', 'postcount', 'mainPid', 'teaserPid',
+		]);
+
 		const cids = _.uniq(topicsData.map(topic => topic && topic.cid));
-		const categoriesData = await categories.getCategoriesFields(cids, ['cid', 'name', 'icon', 'slug', 'parentCid', 'bgColor', 'color', 'backgroundImage', 'imageClass']);
+		const categoriesData = await categories.getCategoriesFields(cids, [
+			'cid', 'name', 'icon', 'slug', 'parentCid',
+			'bgColor', 'color', 'backgroundImage', 'imageClass',
+		]);
+
 		return { topics: topicsData, categories: categoriesData };
 	}
 

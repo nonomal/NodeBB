@@ -1,7 +1,7 @@
 'use strict';
 
 define('components', function () {
-	var components = {};
+	const components = {};
 
 	components.core = {
 		'topic/teaser': function (tid) {
@@ -58,10 +58,14 @@ define('components', function () {
 		'chat/recent/room': function (roomid) {
 			return $('[component="chat/recent/room"][data-roomid="' + roomid + '"]');
 		},
+
+		'chat/public/room': function (roomid) {
+			return $('[component="chat/public/room"][data-roomid="' + roomid + '"]');
+		},
 	};
 
 	components.get = function () {
-		var args = Array.prototype.slice.call(arguments, 1);
+		const args = Array.prototype.slice.call(arguments, 1);
 
 		if (components.core[arguments[0]] && args.length) {
 			return components.core[arguments[0]].apply(this, args);

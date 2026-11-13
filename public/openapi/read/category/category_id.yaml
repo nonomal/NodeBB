@@ -38,6 +38,9 @@ get:
                     type: array
                     items:
                       type: string
+                  unread:
+                    type: boolean
+                    description: True if category or it's children have unread topics
                   unread-class:
                     type: string
                   children:
@@ -52,10 +55,15 @@ get:
                     type: number
                   isWatched:
                     type: boolean
+                  isTracked:
+                    type: boolean
                   isNotWatched:
                     type: boolean
                   isIgnored:
                     type: boolean
+                  hasFollowers:
+                    type: boolean
+                    nullable: true
                   title:
                     type: string
                   selectCategoryLabel:
@@ -99,6 +107,23 @@ get:
                     type: number
                   reputation:disabled:
                     type: number
+                  selectedTag:
+                    type: object
+                    properties:
+                      label:
+                        type: string
+                    nullable: true
+                  selectedTags:
+                    type: array
+                    items:
+                      type: string
+                  sortOptionLabel:
+                    type: string
+                  handleFull:
+                    type: string
+                    description: |
+                      The full webfinger addressable handle for the category.
+                      This property is only present if the category privileges allow it to be accessed by the "fediverse" pseudo-user.
               - $ref: ../../components/schemas/Pagination.yaml#/Pagination
               - $ref: ../../components/schemas/Breadcrumbs.yaml#/Breadcrumbs
               - $ref: ../../components/schemas/CommonProps.yaml#/CommonProps

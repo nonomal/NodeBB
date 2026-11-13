@@ -2,62 +2,18 @@
 
 const async = require('async');
 const winston = require('winston');
+const nconf = require('nconf');
+const pubsub = require('../../pubsub');
 
 const db = require('../../database');
-const api = require('../../api');
 const groups = require('../../groups');
 const user = require('../../user');
 const events = require('../../events');
-const meta = require('../../meta');
-const translator = require('../../translator');
+const utils = require('../../utils');
 const sockets = require('..');
+const api = require('../../api');
 
 const User = module.exports;
-
-User.makeAdmins = async function (socket, uids) {
-	if (!Array.isArray(uids)) {
-		throw new Error('[[error:invalid-data]]');
-	}
-	const isMembersOfBanned = await groups.isMembers(uids, groups.BANNED_USERS);
-	if (isMembersOfBanned.includes(true)) {
-		throw new Error('[[error:cant-make-banned-users-admin]]');
-	}
-	for (const uid of uids) {
-		/* eslint-disable no-await-in-loop */
-		await groups.join('administrators', uid);
-		await events.log({
-			type: 'user-makeAdmin',
-			uid: socket.uid,
-			targetUid: uid,
-			ip: socket.ip,
-		});
-	}
-};
-
-User.removeAdmins = async function (socket, uids) {
-	if (!Array.isArray(uids)) {
-		throw new Error('[[error:invalid-data]]');
-	}
-	for (const uid of uids) {
-		/* eslint-disable no-await-in-loop */
-		const count = await groups.getMemberCount('administrators');
-		if (count === 1) {
-			throw new Error('[[error:cant-remove-last-admin]]');
-		}
-		await groups.leave('administrators', uid);
-		await events.log({
-			type: 'user-removeAdmin',
-			uid: socket.uid,
-			targetUid: uid,
-			ip: socket.ip,
-		});
-	}
-};
-
-User.createUser = async function (socket, userData) {
-	sockets.warnDeprecated(socket, 'POST /api/v3/users');
-	return await api.users.create(socket, userData);
-};
 
 User.resetLockouts = async function (socket, uids) {
 	if (!Array.isArray(uids)) {
@@ -72,7 +28,14 @@ User.validateEmail = async function (socket, uids) {
 	}
 
 	for (const uid of uids) {
-		await user.email.confirmByUid(uid);
+		// eslint-disable-next-line no-await-in-loop
+		const email = await user.email.getEmailForValidation(uid);
+		if (email) {
+			// eslint-disable-next-line no-await-in-loop
+			await user.setUserField(uid, 'email', email);
+		}
+		// eslint-disable-next-line no-await-in-loop
+		await user.email.confirmByUid(uid, socket.uid);
 	}
 };
 
@@ -81,14 +44,14 @@ User.sendValidationEmail = async function (socket, uids) {
 		throw new Error('[[error:invalid-data]]');
 	}
 
-	if (!meta.config.requireEmailConfirmation) {
-		throw new Error('[[error:email-confirmations-are-disabled]]');
-	}
-
 	const failed = [];
 	let errorLogged = false;
 	await async.eachLimit(uids, 50, async (uid) => {
-		await user.email.sendValidationEmail(uid, { force: true }).catch((err) => {
+		const email = await user.email.getEmailForValidation(uid);
+		await user.email.sendValidationEmail(uid, {
+			force: true,
+			email: email,
+		}).catch((err) => {
 			if (!errorLogged) {
 				winston.error(`[user.create] Validation email failed to send\n[emailer.send] ${err.stack}`);
 				errorLogged = true;
@@ -131,27 +94,15 @@ User.forcePasswordReset = async function (socket, uids) {
 	uids.forEach(uid => sockets.in(`uid_${uid}`).emit('event:logout'));
 };
 
-User.deleteUsers = async function (socket, uids) {
-	sockets.warnDeprecated(socket, 'DELETE /api/v3/users/:uid/account');
-	await Promise.all(uids.map(async (uid) => {
-		await api.users.deleteAccount(socket, { uid });
-	}));
-};
-
-User.deleteUsersContent = async function (socket, uids) {
-	sockets.warnDeprecated(socket, 'DELETE /api/v3/users/:uid/content');
-	await Promise.all(uids.map(async (uid) => {
-		await api.users.deleteContent(socket, { uid });
-	}));
-};
-
-User.deleteUsersAndContent = async function (socket, uids) {
-	sockets.warnDeprecated(socket, 'DELETE /api/v3/users or DELETE /api/v3/users/:uid');
-	await api.users.deleteMany(socket, { uids });
-};
+pubsub.on('admin.user.restartJobs', () => {
+	if (nconf.get('runJobs')) {
+		winston.verbose('[user/jobs] Restarting jobs...');
+		user.startJobs();
+	}
+});
 
 User.restartJobs = async function () {
-	user.startJobs();
+	pubsub.publish('admin.user.restartJobs', {});
 };
 
 User.loadGroups = async function (socket, uids) {
@@ -161,14 +112,26 @@ User.loadGroups = async function (socket, uids) {
 	]);
 	userData.forEach((data, index) => {
 		data.groups = groupData[index].filter(group => !groups.isPrivilegeGroup(group.name));
-		data.groups.forEach((group) => {
-			group.nameEscaped = translator.escape(group.displayName);
-		});
 	});
 	return { users: userData };
 };
 
-User.exportUsersCSV = async function (socket) {
+User.setReputation = async function (socket, data) {
+	if (!data || !Array.isArray(data.uids) || !utils.isNumber(data.value)) {
+		throw new Error('[[error:invalid-data]]');
+	}
+
+	await Promise.all([
+		db.setObjectBulk(
+			data.uids.map(uid => ([`user:${uid}`, { reputation: parseInt(data.value, 10) }]))
+		),
+		db.sortedSetAddBulk(
+			data.uids.map(uid => (['users:reputation', data.value, uid]))
+		),
+	]);
+};
+
+User.exportUsersCSV = async function (socket, data) {
 	await events.log({
 		type: 'exportUsersCSV',
 		uid: socket.uid,
@@ -176,8 +139,10 @@ User.exportUsersCSV = async function (socket) {
 	});
 	setTimeout(async () => {
 		try {
-			await user.exportUsersCSV();
-			socket.emit('event:export-users-csv');
+			await user.exportUsersCSV(data.fields);
+			if (socket.emit) {
+				socket.emit('event:export-users-csv');
+			}
 			const notifications = require('../../notifications');
 			const n = await notifications.create({
 				bodyShort: '[[notifications:users-csv-exported]]',
@@ -187,7 +152,20 @@ User.exportUsersCSV = async function (socket) {
 			});
 			await notifications.push(n, [socket.uid]);
 		} catch (err) {
-			winston.error(err);
+			winston.error(err.stack);
 		}
 	}, 0);
+};
+
+User.saveCustomFields = async function (socket, fields) {
+	await api.admin.users.saveCustomFields(socket, { fields });
+};
+
+User.saveCustomReasons = async function (socket, reasons) {
+	const keys = await db.getSortedSetRange('custom-reasons', 0, -1);
+	await db.delete('custom-reasons');
+	await db.deleteAll(keys.map(k => `custom-reason:${k}`));
+	const ids = reasons.map((f, i) => i);
+	await db.sortedSetAdd(`custom-reasons`, ids, ids);
+	await db.setObjectBulk(reasons.map((reason, i) => [`custom-reason:${i}`, reason]));
 };

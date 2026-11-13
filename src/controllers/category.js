@@ -2,7 +2,6 @@
 
 
 const nconf = require('nconf');
-const validator = require('validator');
 const qs = require('querystring');
 
 const db = require('../database');
@@ -10,29 +9,47 @@ const privileges = require('../privileges');
 const user = require('../user');
 const categories = require('../categories');
 const meta = require('../meta');
+const activitypub = require('../activitypub');
 const pagination = require('../pagination');
 const helpers = require('./helpers');
 const utils = require('../utils');
-const translator = require('../translator');
 const analytics = require('../analytics');
 
 const categoryController = module.exports;
 
 const url = nconf.get('url');
 const relative_path = nconf.get('relative_path');
+const validSorts = [
+	'recently_replied', 'recently_created', 'most_posts', 'most_votes', 'most_views',
+];
 
 categoryController.get = async function (req, res, next) {
-	const cid = req.params.category_id;
+	let cid = req.params.category_id;
+	if (cid === '-1') {
+		return helpers.redirect(res, `${res.locals.isAPI ? '/api' : ''}/world?${qs.stringify(req.query)}`);
+	}
+
+	if (!utils.isNumber(cid)) {
+		const assertion = await activitypub.actors.assertGroup([cid]);
+		if (!activitypub.helpers.isUri(cid)) {
+			cid = await db.getObjectField('handle:cid', cid);
+		}
+
+		if (!assertion || !cid) {
+			return next();
+		}
+	}
 
 	let currentPage = parseInt(req.query.page, 10) || 1;
 	let topicIndex = utils.isNumber(req.params.topic_index) ? parseInt(req.params.topic_index, 10) - 1 : 0;
-	if ((req.params.topic_index && !utils.isNumber(req.params.topic_index)) || !utils.isNumber(cid)) {
+	if ((req.params.topic_index && !utils.isNumber(req.params.topic_index))) {
 		return next();
 	}
 
-	const [categoryFields, userPrivileges, userSettings, rssToken] = await Promise.all([
+	const [categoryFields, userPrivileges, tagData, userSettings, rssToken] = await Promise.all([
 		categories.getCategoryFields(cid, ['slug', 'disabled', 'link']),
 		privileges.categories.get(cid, req.uid),
+		helpers.getSelectedTag(req.query.tag),
 		user.getSettings(req.uid),
 		user.auth.getFeedToken(req.uid),
 	]);
@@ -50,13 +67,13 @@ categoryController.get = async function (req, res, next) {
 		return helpers.notAllowed(req, res);
 	}
 
-	if (!res.locals.isAPI && !req.params.slug && (categoryFields.slug && categoryFields.slug !== `${cid}/`)) {
+	if (utils.isNumber(cid) && !res.locals.isAPI && !req.params.slug && (categoryFields.slug && categoryFields.slug !== `${cid}/`)) {
 		return helpers.redirect(res, `/category/${categoryFields.slug}?${qs.stringify(req.query)}`, true);
 	}
 
 	if (categoryFields.link) {
 		await db.incrObjectField(`category:${cid}`, 'timesClicked');
-		return helpers.redirect(res, validator.unescape(categoryFields.link));
+		return helpers.redirect(res, categoryFields.link);
 	}
 
 	if (!userSettings.usePagination) {
@@ -71,12 +88,15 @@ categoryController.get = async function (req, res, next) {
 	const start = ((currentPage - 1) * userSettings.topicsPerPage) + topicIndex;
 	const stop = start + userSettings.topicsPerPage - 1;
 
+	const selectedSort = String(req.query.sort || userSettings.categoryTopicSort);
+	const sort = validSorts.includes(selectedSort) ? selectedSort : meta.config.categoryTopicSort;
+
 	const categoryData = await categories.getCategoryById({
 		uid: req.uid,
 		cid: cid,
 		start: start,
 		stop: stop,
-		sort: req.query.sort || userSettings.categoryTopicSort,
+		sort: sort,
 		settings: userSettings,
 		query: req.query,
 		tag: req.query.tag,
@@ -94,13 +114,18 @@ categoryController.get = async function (req, res, next) {
 		return next();
 	}
 
-	categories.modifyTopicsByPrivilege(categoryData.topics, userPrivileges);
+	await categories.modifyTopicsByPrivilege(categoryData.topics, userPrivileges);
 	categoryData.tagWhitelist = categories.filterTagWhitelist(categoryData.tagWhitelist, userPrivileges.isAdminOrMod);
 
-	await buildBreadcrumbs(req, categoryData);
+	const allCategories = [];
+	categories.flattenCategories(allCategories, categoryData.children);
+
+	await Promise.all([
+		buildBreadcrumbs(req, categoryData),
+		categories.setUnread([categoryData], allCategories.map(c => c.cid).concat(cid), req.uid),
+	]);
+
 	if (categoryData.children.length) {
-		const allCategories = [];
-		categories.flattenCategories(allCategories, categoryData.children);
 		await categories.getRecentTopicReplies(allCategories, req.uid, req.query);
 		categoryData.subCategoriesLeft = Math.max(0, categoryData.children.length - categoryData.subCategoriesPerPage);
 		categoryData.hasMoreSubCategories = categoryData.children.length > categoryData.subCategoriesPerPage;
@@ -114,20 +139,25 @@ categoryController.get = async function (req, res, next) {
 		});
 	}
 
-	categoryData.title = translator.escape(categoryData.name);
+	categoryData.title = categoryData.name;
 	categoryData.selectCategoryLabel = '[[category:subcategories]]';
-	categoryData.description = translator.escape(categoryData.description);
 	categoryData.privileges = userPrivileges;
 	categoryData.showSelect = userPrivileges.editable;
 	categoryData.showTopicTools = userPrivileges.editable;
 	categoryData.topicIndex = topicIndex;
-	categoryData.rssFeedUrl = `${url}/category/${categoryData.cid}.rss`;
-	if (parseInt(req.uid, 10)) {
-		categories.markAsRead([cid], req.uid);
-		categoryData.rssFeedUrl += `?uid=${req.uid}&token=${rssToken}`;
+	categoryData.selectedTag = tagData.selectedTag;
+	categoryData.selectedTags = tagData.selectedTags;
+	categoryData.sortOption = sort;
+	categoryData.sortOptionLabel = `[[topic:${sort.replace(/_/g, '-')}]]`;
+
+	if (utils.isNumber(categoryData.cid) && !meta.config['feeds:disableRSS']) {
+		categoryData.rssFeedUrl = `${url}/category/${categoryData.cid}.rss`;
+		if (req.loggedIn) {
+			categoryData.rssFeedUrl += `?uid=${req.uid}&token=${rssToken}`;
+		}
 	}
 
-	addTags(categoryData, res);
+	addTags(categoryData, res, currentPage);
 
 	categoryData['feeds:disableRSS'] = meta.config['feeds:disableRSS'] || 0;
 	categoryData['reputation:disabled'] = meta.config['reputation:disabled'];
@@ -139,6 +169,22 @@ categoryController.get = async function (req, res, next) {
 
 	analytics.increment([`pageviews:byCid:${categoryData.cid}`]);
 
+	if (meta.config.activitypubEnabled) {
+		// Include link header for richer parsing
+		res.set('Link', `<${nconf.get('url')}/category/${cid}>; rel="alternate"; type="application/activity+json"`);
+
+		// Category accessible
+		const federating = await privileges.categories.can('read', cid, activitypub._constants.uid);
+		if (federating) {
+			categoryData.handleFull = `${categoryData.handle}@${nconf.get('url_parsed').host}`;
+		}
+
+		// Some remote categories don't have `url`, assume same as id
+		if (!utils.isNumber(categoryData.cid) && !categoryData.hasOwnProperty('url')) {
+			categoryData.url = categoryData.cid;
+		}
+	}
+
 	res.render('category', categoryData);
 };
 
@@ -146,7 +192,7 @@ async function buildBreadcrumbs(req, categoryData) {
 	const breadcrumbs = [
 		{
 			text: categoryData.name,
-			url: `${relative_path}/category/${categoryData.slug}`,
+			url: `${url}/category/${categoryData.slug}`,
 			cid: categoryData.cid,
 		},
 	];
@@ -156,22 +202,22 @@ async function buildBreadcrumbs(req, categoryData) {
 	}
 }
 
-function addTags(categoryData, res) {
+function addTags(categoryData, res, currentPage) {
 	res.locals.metaTags = [
 		{
 			name: 'title',
 			content: categoryData.name,
-			noEscape: true,
+			translate: true,
 		},
 		{
 			property: 'og:title',
 			content: categoryData.name,
-			noEscape: true,
+			translate: true,
 		},
 		{
 			name: 'description',
 			content: categoryData.description,
-			noEscape: true,
+			translate: true,
 		},
 		{
 			property: 'og:type',
@@ -180,27 +226,41 @@ function addTags(categoryData, res) {
 	];
 
 	if (categoryData.backgroundImage) {
-		if (!categoryData.backgroundImage.startsWith('http')) {
-			categoryData.backgroundImage = url + categoryData.backgroundImage;
+		let { backgroundImage } = categoryData;
+		if (!backgroundImage.startsWith('http')) {
+			backgroundImage = url + backgroundImage.replace(new RegExp(`^${nconf.get('relative_path')}`), '');
 		}
 		res.locals.metaTags.push({
 			property: 'og:image',
-			content: categoryData.backgroundImage,
+			content: backgroundImage,
 		});
 	}
 
+	const page = currentPage > 1 ? `?page=${currentPage}` : '';
 	res.locals.linkTags = [
 		{
 			rel: 'up',
-			href: url,
+			href: categoryData.parent ? `${url}/category/${categoryData.parent.slug}` : url,
+		},
+		{
+			rel: 'canonical',
+			href: `${url}/category/${categoryData.slug}${page}`,
 		},
 	];
 
-	if (!categoryData['feeds:disableRSS']) {
+	if (categoryData.rssFeedUrl && !categoryData['feeds:disableRSS']) {
 		res.locals.linkTags.push({
 			rel: 'alternate',
 			type: 'application/rss+xml',
 			href: categoryData.rssFeedUrl,
+		});
+	}
+
+	if (meta.config.activitypubEnabled) {
+		res.locals.linkTags.push({
+			rel: 'alternate',
+			type: 'application/activity+json',
+			href: `${nconf.get('url')}/category/${categoryData.cid}`,
 		});
 	}
 }

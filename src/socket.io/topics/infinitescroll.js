@@ -12,14 +12,14 @@ module.exports = function (SocketTopics) {
 			throw new Error('[[error:invalid-data]]');
 		}
 
-		const [userPrivileges, topicData] = await Promise.all([
-			privileges.topics.get(data.tid, socket.uid),
-			topics.getTopicFields(data.tid, ['postcount', 'deleted', 'scheduled', 'uid']),
-		]);
-
-		if (!userPrivileges['topics:read'] || !privileges.topics.canViewDeletedScheduled(topicData, userPrivileges)) {
+		if (!await privileges.topics.canRead(data.tid, socket.uid)) {
 			throw new Error('[[error:no-privileges]]');
 		}
+
+		const [userPrivileges, topicData] = await Promise.all([
+			privileges.topics.get(data.tid, socket.uid),
+			topics.getTopicData(data.tid),
+		]);
 
 		const set = data.topicPostSort === 'most_votes' ? `tid:${data.tid}:posts:votes` : `tid:${data.tid}:posts`;
 		const reverse = data.topicPostSort === 'newest_to_oldest' || data.topicPostSort === 'most_votes';
@@ -30,28 +30,20 @@ module.exports = function (SocketTopics) {
 			parseInt(data.count, 10) || meta.config.postsPerPage || 20
 		));
 
-		if (data.direction === -1) {
-			start -= (infScrollPostsPerPage + 1);
+		if (parseInt(data.direction, 10) === -1) {
+			start -= infScrollPostsPerPage;
 		}
 
 		let stop = start + infScrollPostsPerPage - 1;
 
 		start = Math.max(0, start);
 		stop = Math.max(0, stop);
-
-		const [mainPost, posts, postSharing] = await Promise.all([
-			start > 0 ? null : topics.getMainPost(data.tid, socket.uid),
-			topics.getTopicPosts(data.tid, set, start, stop, socket.uid, reverse),
+		const [posts, postSharing] = await Promise.all([
+			topics.getTopicPosts(topicData, set, start, stop, socket.uid, reverse),
 			social.getActivePostSharing(),
 		]);
 
-		if (mainPost) {
-			topicData.mainPost = mainPost;
-			topicData.posts = [mainPost].concat(posts);
-		} else {
-			topicData.posts = posts;
-		}
-
+		topicData.posts = posts;
 		topicData.privileges = userPrivileges;
 		topicData.postSharing = postSharing;
 		topicData['reputation:disabled'] = meta.config['reputation:disabled'] === 1;
@@ -60,48 +52,4 @@ module.exports = function (SocketTopics) {
 		topics.modifyPostsByPrivilege(topicData, userPrivileges);
 		return topicData;
 	};
-
-	SocketTopics.loadMoreSortedTopics = async function (socket, data) {
-		if (!data || !utils.isNumber(data.after) || parseInt(data.after, 10) < 0) {
-			throw new Error('[[error:invalid-data]]');
-		}
-		const { start, stop } = calculateStartStop(data);
-		const params = {
-			uid: socket.uid,
-			start: start,
-			stop: stop,
-			filter: data.filter,
-			query: data.query,
-		};
-		if (data.sort === 'unread') {
-			params.cid = data.cid;
-			return await topics.getUnreadTopics(params);
-		}
-		params.cids = data.cid;
-		params.tags = data.tags;
-		params.sort = data.sort;
-		params.term = data.term;
-		return await topics.getSortedTopics(params);
-	};
-
-	SocketTopics.loadMoreFromSet = async function (socket, data) {
-		if (!data || !utils.isNumber(data.after) || parseInt(data.after, 10) < 0 || !data.set) {
-			throw new Error('[[error:invalid-data]]');
-		}
-		const { start, stop } = calculateStartStop(data);
-		return await topics.getTopicsFromSet(data.set, socket.uid, start, stop);
-	};
-
-	function calculateStartStop(data) {
-		const itemsPerPage = Math.min(
-			meta.config.topicsPerPage || 20,
-			parseInt(data.count, 10) || meta.config.topicsPerPage || 20
-		);
-		let start = Math.max(0, parseInt(data.after, 10));
-		if (data.direction === -1) {
-			start -= itemsPerPage;
-		}
-		const stop = start + Math.max(0, itemsPerPage - 1);
-		return { start: Math.max(0, start), stop: Math.max(0, stop) };
-	}
 };

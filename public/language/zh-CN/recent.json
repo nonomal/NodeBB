@@ -5,15 +5,9 @@
     "month": "月",
     "year": "年",
     "alltime": "总计",
-    "no_recent_topics": "暂无主题。",
-    "no_popular_topics": "暂无热门主题。",
-    "there-is-a-new-topic": "共计 1 个新主题。",
-    "there-is-a-new-topic-and-a-new-post": "共计 1 个新主题和 1 个新回复。",
-    "there-is-a-new-topic-and-new-posts": "共计 1 个新主题和 %1 个新回复。",
-    "there-are-new-topics": "共计 %1 个新主题。",
-    "there-are-new-topics-and-a-new-post": "共计 %1 个新主题和 1 个新回复。",
-    "there-are-new-topics-and-new-posts": "共计 %1 个新主题和 %2 个新回复。",
-    "there-is-a-new-post": "共计 1 个新回复。",
-    "there-are-new-posts": "共计 %1 个新回复。",
-    "click-here-to-reload": "点击这里重新加载。"
+    "no-recent-topics": "暂无主题。",
+    "no-popular-topics": "暂无热门主题。",
+    "load-new-posts": "加载新的帖子",
+    "uncategorized.title": "所有已知主题",
+    "uncategorized.intro": "本页按时间顺序列出了本论坛收到的每个主题。<br />以下主题中表达的观点和意见未经审核，可能不代表本网站的观点和意见。"
 }

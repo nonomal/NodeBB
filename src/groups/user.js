@@ -4,13 +4,10 @@ const db = require('../database');
 const user = require('../user');
 
 module.exports = function (Groups) {
-	Groups.getUsersFromSet = async function (set, fields) {
+	Groups.getUsersFromSet = async function (set, fields = []) {
 		const uids = await db.getSetMembers(set);
-
-		if (fields) {
-			return await user.getUsersFields(uids, fields);
-		}
-		return await user.getUsersData(uids);
+		const userData = await user.getUsersFields(uids, fields);
+		return userData.filter(u => u && u.uid);
 	};
 
 	Groups.getUserGroups = async function (uids) {
@@ -37,7 +34,10 @@ module.exports = function (Groups) {
 		allGroups = allGroups.filter(group => !Groups.ephemeralGroups.includes(group.name));
 
 		const publicGroups = allGroups.filter(group => group.hidden === 0 && group.system === 0 && group.private === 0);
-		const adminModGroups = [{ name: 'administrators' }, { name: 'Global Moderators' }];
+		const adminModGroups = [
+			{ name: 'administrators', displayName: 'administrators' },
+			{ name: 'Global Moderators', displayName: 'Global Moderators' },
+		];
 		// Private (but not hidden)
 		const privateGroups = allGroups.filter(group => group.hidden === 0 && group.system === 0 && group.private === 1);
 
@@ -58,7 +58,6 @@ module.exports = function (Groups) {
 		}
 
 		return inviteGroups
-			.concat(publicGroups)
-			.map(group => group.name);
+			.concat(publicGroups);
 	};
 };

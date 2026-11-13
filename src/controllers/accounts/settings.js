@@ -13,12 +13,12 @@ const plugins = require('../../plugins');
 const notifications = require('../../notifications');
 const db = require('../../database');
 const helpers = require('../helpers');
-const accountHelpers = require('./helpers');
+const slugify = require('../../slugify');
 
 const settingsController = module.exports;
 
 settingsController.get = async function (req, res, next) {
-	const userData = await accountHelpers.getUserDataByUserSlug(req.params.userslug, req.uid, req.query);
+	const { userData } = res.locals;
 	if (!userData) {
 		return next();
 	}
@@ -39,46 +39,27 @@ settingsController.get = async function (req, res, next) {
 		uid: req.uid,
 	});
 
-	const [notificationSettings, routes] = await Promise.all([
+	const [notificationSettings, routes, bsSkinOptions] = await Promise.all([
 		getNotificationSettings(userData),
 		getHomePageRoutes(userData),
+		getSkinOptions(userData),
+		getChatAllowDenyList(userData),
 	]);
 
 	userData.customSettings = data.customSettings;
 	userData.homePageRoutes = routes;
+	userData.bootswatchSkinOptions = bsSkinOptions;
 	userData.notificationSettings = notificationSettings;
 	userData.disableEmailSubscriptions = meta.config.disableEmailSubscriptions;
+	userData.disableNotificationEmails = meta.config.disableNotificationEmails;
 
 	userData.dailyDigestFreqOptions = [
-		{ value: 'off', name: '[[user:digest_off]]', selected: userData.settings.dailyDigestFreq === 'off' },
-		{ value: 'day', name: '[[user:digest_daily]]', selected: userData.settings.dailyDigestFreq === 'day' },
-		{ value: 'week', name: '[[user:digest_weekly]]', selected: userData.settings.dailyDigestFreq === 'week' },
-		{ value: 'month', name: '[[user:digest_monthly]]', selected: userData.settings.dailyDigestFreq === 'month' },
+		{ value: 'off', name: '[[user:digest-off]]', selected: userData.settings.dailyDigestFreq === 'off' },
+		{ value: 'day', name: '[[user:digest-daily]]', selected: userData.settings.dailyDigestFreq === 'day' },
+		{ value: 'week', name: '[[user:digest-weekly]]', selected: userData.settings.dailyDigestFreq === 'week' },
+		{ value: 'biweek', name: '[[user:digest-biweekly]]', selected: userData.settings.dailyDigestFreq === 'biweek' },
+		{ value: 'month', name: '[[user:digest-monthly]]', selected: userData.settings.dailyDigestFreq === 'month' },
 	];
-
-	userData.bootswatchSkinOptions = [
-		{ name: 'Default', value: '' },
-		{ name: 'Cerulean', value: 'cerulean' },
-		{ name: 'Cosmo', value: 'cosmo'	},
-		{ name: 'Cyborg', value: 'cyborg' },
-		{ name: 'Darkly', value: 'darkly' },
-		{ name: 'Flatly', value: 'flatly' },
-		{ name: 'Journal', value: 'journal'	},
-		{ name: 'Lumen', value: 'lumen' },
-		{ name: 'Paper', value: 'paper' },
-		{ name: 'Readable', value: 'readable' },
-		{ name: 'Sandstone', value: 'sandstone' },
-		{ name: 'Simplex', value: 'simplex' },
-		{ name: 'Slate', value: 'slate'	},
-		{ name: 'Spacelab', value: 'spacelab' },
-		{ name: 'Superhero', value: 'superhero' },
-		{ name: 'United', value: 'united' },
-		{ name: 'Yeti', value: 'yeti' },
-	];
-
-	userData.bootswatchSkinOptions.forEach((skin) => {
-		skin.selected = skin.value === userData.settings.bootswatchSkin;
-	});
 
 	userData.languages.forEach((language) => {
 		language.selected = language.code === userData.settings.userLang;
@@ -100,7 +81,7 @@ settingsController.get = async function (req, res, next) {
 	];
 
 	userData.upvoteNotifFreq = notifFreqOptions.map(
-		name => ({ name: name, selected: name === userData.settings.upvoteNotifFreq })
+		name => ({ name: name, label: `user:upvote-notif-freq.${name}`, selected: name === userData.settings.upvoteNotifFreq })
 	);
 
 	userData.categoryWatchState = { [userData.settings.categoryWatchState]: true };
@@ -116,6 +97,7 @@ settingsController.get = async function (req, res, next) {
 
 	userData.maxTopicsPerPage = meta.config.maxTopicsPerPage;
 	userData.maxPostsPerPage = meta.config.maxPostsPerPage;
+	userData.maxUnreadCutoff = Math.max(meta.config.unreadCutoff, 14);
 
 	userData.title = '[[pages:account/settings]]';
 	userData.breadcrumbs = helpers.buildBreadcrumbs([{ text: userData.username, url: `/user/${userData.userslug}` }, { text: '[[user:settings]]' }]);
@@ -134,30 +116,35 @@ const doUnsubscribe = async (payload) => {
 			user.updateDigestSetting(payload.uid, 'off'),
 		]);
 	} else if (payload.template === 'notification') {
+		const currentToNewSetting = {
+			notificationemail: 'notification',
+			email: 'none',
+		};
 		const current = await db.getObjectField(`user:${payload.uid}:settings`, `notificationType_${payload.type}`);
-		await user.setSetting(payload.uid, `notificationType_${payload.type}`, (current === 'notificationemail' ? 'notification' : 'none'));
+		if (currentToNewSetting.hasOwnProperty(current)) {
+			await user.setSetting(payload.uid, `notificationType_${payload.type}`, currentToNewSetting[current]);
+		}
 	}
 	return true;
 };
 
-settingsController.unsubscribe = async (req, res) => {
-	let payload;
-	try {
-		payload = await jwtVerifyAsync(req.params.token);
-		if (!payload || !unsubscribable.includes(payload.template)) {
-			return;
-		}
-	} catch (err) {
-		throw new Error(err);
+settingsController.unsubscribe = async (req, res, next) => {
+	if (req.method === 'HEAD') {
+		return res.sendStatus(204);
 	}
-
 	try {
+		const payload = await jwtVerifyAsync(req.params.token);
+		if (!payload || !unsubscribable.includes(payload.template)) {
+			return next();
+		}
 		await doUnsubscribe(payload);
 		res.render('unsubscribe', {
-			payload: payload,
+			payload,
 		});
 	} catch (err) {
-		throw new Error(err);
+		res.render('unsubscribe', {
+			error: err.message,
+		});
 	}
 };
 
@@ -193,6 +180,9 @@ async function getNotificationSettings(userData) {
 	if (privileges.isAdmin || privileges.isGlobalMod) {
 		privilegedTypes.push('notificationType_new-user-flag');
 	}
+	if (privileges.isAdmin) {
+		privilegedTypes.push('notificationType_new-message-flag');
+	}
 	const results = await plugins.hooks.fire('filter:user.notificationTypes', {
 		types: notifications.baseTypes.slice(),
 		privilegedTypes: privilegedTypes,
@@ -202,7 +192,8 @@ async function getNotificationSettings(userData) {
 		const setting = userData.settings[type];
 		return {
 			name: type,
-			label: `[[notifications:${type}]]`,
+			label: `[[notifications:${type.replace(/_/g, '-')}]]`,
+			value: setting,
 			none: setting === 'none',
 			notification: setting === 'notification',
 			email: setting === 'email',
@@ -244,3 +235,39 @@ async function getHomePageRoutes(userData) {
 
 	return routes;
 }
+
+async function getSkinOptions(userData) {
+	const defaultSkin = _.capitalize(meta.config.bootswatchSkin) || '[[user:no-skin]]';
+	const bootswatchSkinOptions = [
+		{ name: '[[user:no-skin]]', value: 'noskin' },
+		{ name: `[[user:default, ${defaultSkin}]]`, value: '' },
+	];
+	const customSkins = await meta.settings.get('custom-skins');
+	if (customSkins && Array.isArray(customSkins['custom-skin-list'])) {
+		customSkins['custom-skin-list'].forEach((customSkin) => {
+			bootswatchSkinOptions.push({
+				name: customSkin['custom-skin-name'],
+				value: slugify(customSkin['custom-skin-name']),
+			});
+		});
+	}
+
+	bootswatchSkinOptions.push(
+		...meta.css.supportedSkins.map(skin => ({ name: _.capitalize(skin), value: skin }))
+	);
+
+	bootswatchSkinOptions.forEach((skin) => {
+		skin.selected = skin.value === userData.settings.bootswatchSkin;
+	});
+	return bootswatchSkinOptions;
+}
+
+async function getChatAllowDenyList(userData) {
+	const [chatAllowListUsers, chatDenyListUsers] = await Promise.all([
+		user.getUsersFields(userData.settings.chatAllowList, ['uid', 'username', 'picture']),
+		user.getUsersFields(userData.settings.chatDenyList, ['uid', 'username', 'picture']),
+	]);
+
+	userData.settings.chatAllowListUsers = chatAllowListUsers;
+	userData.settings.chatDenyListUsers = chatDenyListUsers;
+};

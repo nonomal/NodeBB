@@ -4,9 +4,11 @@ const fs = require('fs');
 const nconf = require('nconf');
 const path = require('path');
 const winston = require('winston');
-const mkdirp = require('mkdirp');
-const mime = require('mime');
+const { mkdirp } = require('mkdirp');
+const mime = require('mime').default;
 const graceful = require('graceful-fs');
+const sanitizeHtml = require('sanitize-html');
+const { DOMParser, XMLSerializer } = require('@xmldom/xmldom');
 
 const slugify = require('./slugify');
 
@@ -14,24 +16,72 @@ graceful.gracefulify(fs);
 
 const file = module.exports;
 
-file.saveFileToLocal = async function (filename, folder, tempPath) {
+file.saveFileToLocal = async function (filename, folder, tempPath, { unique = false } = {}) {
 	/*
 	 * remarkable doesn't allow spaces in hyperlinks, once that's fixed, remove this.
 	 */
-	filename = filename.split('.').map(name => slugify(name)).join('.');
-
-	const uploadPath = path.join(nconf.get('upload_path'), folder, filename);
-	if (!uploadPath.startsWith(nconf.get('upload_path'))) {
+	const slugified = filename.split('.').map(name => slugify(name)).join('.');
+	filename = file.stripResized(slugified);
+	let uploadPath = path.join(nconf.get('upload_path'), folder, filename);
+	if (!file.isPathInside(nconf.get('upload_path'), uploadPath)) {
 		throw new Error('[[error:invalid-path]]');
 	}
 
-	winston.verbose(`Saving file ${filename} to : ${uploadPath}`);
 	await mkdirp(path.dirname(uploadPath));
-	await fs.promises.copyFile(tempPath, uploadPath);
+	const extension = path.extname(filename).toLowerCase();
+	if (extension === '.svg') {
+		await sanitizeSvg(tempPath);
+	} else if (extension === '.xml') {
+		await sanitizeXml(tempPath);
+	}
+	// avoid overwriting the original file when stripResized() changes the filename.
+	const preventOverwrite = unique || filename !== slugified;
+	if (preventOverwrite) {
+		uploadPath = await copyFileWithUniqueName(tempPath, uploadPath);
+		filename = path.basename(uploadPath);
+	} else {
+		await fs.promises.copyFile(tempPath, uploadPath);
+	}
+
+	winston.verbose(`Saved file ${filename} to : ${uploadPath}`);
 	return {
 		url: `/assets/uploads/${folder ? `${folder}/` : ''}${filename}`,
 		path: uploadPath,
 	};
+};
+
+async function copyFileWithUniqueName(sourcePath, destinationPath) {
+	const ext = path.extname(destinationPath);
+	const base = path.basename(destinationPath, ext);
+	const dir = path.dirname(destinationPath);
+
+	let counter = 0;
+
+	/* eslint-disable no-await-in-loop */
+	for (;;) {
+		try {
+			await fs.promises.copyFile(sourcePath, destinationPath, fs.constants.COPYFILE_EXCL);
+			return destinationPath;
+		} catch (err) {
+			// Windows reports EPERM instead of EEXIST for exclusive creates
+			const collision = err.code === 'EEXIST' ||
+				(err.code === 'EPERM' && await file.exists(destinationPath).catch(() => false));
+
+			if (!collision || counter >= 100) {
+				throw err;
+			}
+
+			counter += 1;
+			destinationPath = path.join(dir, `${base}-${counter}${ext}`);
+		}
+	}
+	/* eslint-enable no-await-in-loop */
+}
+
+file.isPathInside = function (base, targetPath) {
+	const resolvedBase = path.resolve(base);
+	const resolvedTarget = path.resolve(base, targetPath);
+	return resolvedTarget === resolvedBase || resolvedTarget.startsWith(resolvedBase + path.sep);
 };
 
 file.base64ToLocal = async function (imageData, uploadPath) {
@@ -53,14 +103,29 @@ file.appendToFileName = function (filename, string) {
 	return filename.substring(0, dotIndex) + string + filename.substring(dotIndex);
 };
 
+file.stripResized = function (filename) {
+	const raw = String(filename || 'upload');
+	const extension = path.extname(raw) || '';
+	const basename = raw.slice(0, raw.length - extension.length);
+	const stripped = basename.split('-resized').join('') || 'upload';
+	return `${stripped}${extension}`;
+};
+
 file.allowedExtensions = function () {
-	const meta = require('./meta');
-	let allowedExtensions = (meta.config.allowedFileExtensions || '').trim();
-	if (!allowedExtensions) {
+	return parseExtensions(require('./meta').config.allowedFileExtensions);
+};
+
+file.blockedExtensions = function () {
+	return parseExtensions(require('./meta').config.blockedFileExtensions);
+};
+
+function parseExtensions(input) {
+	let extensions = (input || '').trim();
+	if (!extensions) {
 		return [];
 	}
-	allowedExtensions = allowedExtensions.split(',');
-	allowedExtensions = allowedExtensions.filter(Boolean).map((extension) => {
+	extensions = extensions.split(',');
+	extensions = extensions.filter(Boolean).map((extension) => {
 		extension = extension.trim();
 		if (!extension.startsWith('.')) {
 			extension = `.${extension}`;
@@ -68,12 +133,12 @@ file.allowedExtensions = function () {
 		return extension.toLowerCase();
 	});
 
-	if (allowedExtensions.includes('.jpg') && !allowedExtensions.includes('.jpeg')) {
-		allowedExtensions.push('.jpeg');
+	if (extensions.includes('.jpg') && !extensions.includes('.jpeg')) {
+		extensions.push('.jpeg');
 	}
 
-	return allowedExtensions;
-};
+	return extensions;
+}
 
 file.exists = async function (path) {
 	try {
@@ -107,6 +172,11 @@ file.delete = async function (path) {
 	try {
 		await fs.promises.unlink(path);
 	} catch (err) {
+		if (err.code === 'ENOENT') {
+			winston.verbose(`[file] Attempted to delete non-existent file: ${path}`);
+			return;
+		}
+
 		winston.warn(err);
 	}
 };
@@ -149,5 +219,98 @@ file.walk = async function (dir) {
 	}));
 	return files.reduce((a, f) => a.concat(f), []);
 };
+
+async function sanitizeSvg(filePath) {
+	const dirty = await fs.promises.readFile(filePath, 'utf8');
+	const clean = sanitizeHtml(dirty, {
+		allowedTags: [
+			'svg', 'g', 'defs', 'linearGradient', 'radialGradient', 'stop',
+			'circle', 'ellipse', 'polygon', 'polyline', 'path', 'rect',
+			'line', 'text', 'tspan', 'use', 'symbol', 'clipPath', 'mask', 'pattern',
+			'filter', 'feGaussianBlur', 'feOffset', 'feBlend', 'feColorMatrix', 'feMerge', 'feMergeNode',
+		],
+		allowedAttributes: {
+			'*': [
+				// Geometry
+				'x', 'y', 'x1', 'x2', 'y1', 'y2', 'cx', 'cy', 'r', 'rx', 'ry',
+				'width', 'height', 'd', 'points', 'viewBox', 'transform',
+
+				// Presentation
+				'fill', 'stroke', 'stroke-width', 'opacity',
+				'stop-color', 'stop-opacity', 'offset', 'style', 'class',
+
+				// Text
+				'text-anchor', 'font-size', 'font-family',
+
+				// Misc
+				'id', 'clip-path', 'mask', 'filter', 'gradientUnits', 'gradientTransform',
+				'xmlns', 'preserveAspectRatio',
+			],
+		},
+		parser: {
+			lowerCaseTags: false,
+			lowerCaseAttributeNames: false,
+		},
+	});
+	await fs.promises.writeFile(filePath, clean);
+}
+
+const FORBIDDEN = new Set([
+	'script', 'iframe', 'object', 'embed',
+	'svg', 'animate', 'foreignObject',
+	'set', 'use', 'feImage',
+]);
+
+async function sanitizeXml(filePath) {
+	const dirty = await fs.promises.readFile(filePath, 'utf8');
+	if (dirty.includes('<!DOCTYPE') || dirty.includes('<!ENTITY')) {
+		throw new Error('DTD not allowed');
+	}
+	const doc = new DOMParser().parseFromString(dirty, 'text/xml');
+
+	function walk(node) {
+		if (node.nodeType === 1) {
+			const tag = (node.localName || node.tagName).toLowerCase();
+
+			if (FORBIDDEN.has(tag)) {
+				node.parentNode.removeChild(node);
+				return;
+			}
+
+			for (const attr of [...node.attributes]) {
+				const name = (attr.localName || attr.name).toLowerCase();
+				const value = attr.value
+					.trim()
+					// eslint-disable-next-line no-control-regex
+					.replace(/[\u0000-\u001F\u007F\s]+/g, '')
+					.toLowerCase();
+				const fullName = attr.name.toLowerCase();
+
+				if (name.startsWith('on')) {
+					node.removeAttribute(fullName);
+					continue;
+				}
+
+				if (name === 'href' || name === 'src' || name === 'data' || name.endsWith(':href')) {
+					if (
+						value.startsWith('javascript:') ||
+						value.startsWith('data:text/html')
+					) {
+						node.removeAttribute(fullName);
+					}
+				}
+			}
+		}
+
+		for (const child of [...node.childNodes]) {
+			walk(child);
+		}
+	}
+
+	walk(doc.documentElement);
+
+	const clean = new XMLSerializer().serializeToString(doc);
+	await fs.promises.writeFile(filePath, clean);
+}
 
 require('./promisify')(file);

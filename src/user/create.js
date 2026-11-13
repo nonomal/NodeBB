@@ -12,7 +12,8 @@ const meta = require('../meta');
 const analytics = require('../analytics');
 
 module.exports = function (User) {
-	User.create = async function (data) {
+	User.create = async function (data, opts = {}) {
+		opts = { emailVerification: 'send', ...opts };
 		data.username = data.username.trim();
 		data.userslug = slugify(data.username);
 		if (data.email !== undefined) {
@@ -27,7 +28,7 @@ module.exports = function (User) {
 		}
 
 		try {
-			return await create(data);
+			return await create(data, opts);
 		} finally {
 			await db.deleteObjectFields('locks', [data.username, data.email]);
 		}
@@ -40,18 +41,17 @@ module.exports = function (User) {
 		}
 	}
 
-	async function create(data) {
+	async function create(data, opts) {
 		const timestamp = data.timestamp || Date.now();
 
 		let userData = {
 			username: data.username,
 			userslug: data.userslug,
-			email: data.email || '',
 			joindate: timestamp,
 			lastonline: timestamp,
 			status: 'online',
 		};
-		['picture', 'fullname', 'location', 'birthday'].forEach((field) => {
+		['picture', 'fullname', 'birthday'].forEach((field) => {
 			if (data[field]) {
 				userData[field] = data[field];
 			}
@@ -70,16 +70,12 @@ module.exports = function (User) {
 			userData.userslug = slugify(renamedUsername);
 		}
 
-		const results = await plugins.hooks.fire('filter:user.create', { user: userData, data: data });
+		const results = await plugins.hooks.fire('filter:user.create', { user: userData, data, opts });
 		userData = results.user;
 
 		const uid = await db.incrObjectField('global', 'nextUid');
-		const isFirstUser = uid === 1;
 		userData.uid = uid;
 
-		if (isFirstUser) {
-			userData['email:confirmed'] = 1;
-		}
 		await db.setObject(`user:${uid}`, userData);
 
 		const bulkAdd = [
@@ -93,39 +89,26 @@ module.exports = function (User) {
 			['users:reputation', 0, userData.uid],
 		];
 
-		if (userData.email) {
-			bulkAdd.push(['email:uid', userData.uid, userData.email.toLowerCase()]);
-			bulkAdd.push(['email:sorted', 0, `${userData.email.toLowerCase()}:${userData.uid}`]);
-			bulkAdd.push([`user:${userData.uid}:emails`, timestamp, `${userData.email}:${timestamp}`]);
-		}
-
 		if (userData.fullname) {
 			bulkAdd.push(['fullname:sorted', 0, `${userData.fullname.toLowerCase()}:${userData.uid}`]);
 		}
-
-		const groupsToJoin = ['registered-users'].concat(
-			isFirstUser ? 'verified-users' : 'unverified-users'
-		);
 
 		await Promise.all([
 			db.incrObjectField('global', 'userCount'),
 			analytics.increment('registrations'),
 			db.sortedSetAddBulk(bulkAdd),
-			groups.join(groupsToJoin, userData.uid),
+			groups.join(['registered-users', 'unverified-users'], userData.uid),
 			User.notifications.sendWelcomeNotification(userData.uid),
 			storePassword(userData.uid, data.password),
 			User.updateDigestSetting(userData.uid, meta.config.dailyDigestFreq),
 		]);
 
-		if (userData.email && userData.uid > 1 && meta.config.requireEmailConfirmation) {
-			User.email.sendValidationEmail(userData.uid, {
-				email: userData.email,
-			}).catch(err => winston.error(`[user.create] Validation email failed to send\n[emailer.send] ${err.stack}`));
-		}
+		await handleEmailVerification(uid, data.email, data.token, opts.emailVerification);
+
 		if (userNameChanged) {
 			await User.notifications.sendNameChangeNotification(userData.uid, userData.username);
 		}
-		plugins.hooks.fire('action:user.create', { user: userData, data: data });
+		plugins.hooks.fire('action:user.create', { user: userData, data, opts });
 		return userData.uid;
 	}
 
@@ -143,13 +126,38 @@ module.exports = function (User) {
 		]);
 	}
 
+	async function handleEmailVerification(uid, email, token, method) {
+		if (email) {
+			switch (method) {
+				case 'verify':
+					await User.setUserField(uid, 'email', email);
+					await User.email.confirmByUid(uid);
+					break;
+				case 'send':
+					if (!token || !await User.isInviteTokenValid(token, email)) {
+						await User.email.sendValidationEmail(uid, {
+							email: email,
+							template: 'welcome',
+							subject: `[[email:welcome-to, ${meta.config.title || meta.config.browserTitle || 'NodeBB'}]]`,
+						}).catch(err => winston.error(`[user.create] Validation email failed to send\n[emailer.send] ${err.stack}`));
+					}
+					break;
+				case 'skip':
+					// explicitly do nothing
+					break;
+				default:
+					throw new Error(`Invalid email verification mode: ${method}`);
+			}
+		}
+	}
+
 	User.isDataValid = async function (userData) {
 		if (userData.email && !utils.isEmailValid(userData.email)) {
 			throw new Error('[[error:invalid-email]]');
 		}
 
-		if (!utils.isUserNameValid(userData.username) || !userData.userslug) {
-			throw new Error(`[[error:invalid-username, ${userData.username}]]`);
+		if (!utils.isUserNameValid(userData.username) || !utils.isSlugValid(userData.userslug)) {
+			throw new Error(`[[error:invalid-username]]`);
 		}
 
 		if (userData.password) {
@@ -173,7 +181,7 @@ module.exports = function (User) {
 		}
 
 		if (password.length < meta.config.minimumPasswordLength) {
-			throw new Error('[[reset_password:password_too_short]]');
+			throw new Error('[[reset_password:password-too-short]]');
 		}
 
 		if (password.length > 512) {
@@ -182,7 +190,7 @@ module.exports = function (User) {
 
 		const strength = zxcvbn(password);
 		if (strength.score < minStrength) {
-			throw new Error('[[user:weak_password]]');
+			throw new Error('[[user:weak-password]]');
 		}
 	};
 
@@ -191,7 +199,7 @@ module.exports = function (User) {
 		let { username } = userData;
 		while (true) {
 			/* eslint-disable no-await-in-loop */
-			const exists = await meta.userOrGroupExists(username);
+			const exists = await meta.slugTaken(username);
 			if (!exists) {
 				return numTries ? username : null;
 			}

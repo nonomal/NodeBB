@@ -1,32 +1,54 @@
 'use strict';
 
+const db = require('../database');
 const sockets = require('../socket.io');
+const plugins = require('../plugins');
+const activitypub = require('../activitypub');
 
 module.exports = function (Messaging) {
 	Messaging.deleteMessage = async (mid, uid) => await doDeleteRestore(mid, 1, uid);
 	Messaging.restoreMessage = async (mid, uid) => await doDeleteRestore(mid, 0, uid);
+	Messaging.purgeMessage = async (mid) => {
+		const msgData = await Messaging.getMessageFields(mid, [
+			'mid', 'fromuid', 'roomId', 'deleted', 'system',
+		]);
+		if (!msgData) {
+			return;
+		}
+		await db.delete(`message:${mid}`);
+		await db.sortedSetRemove(`chat:room:${msgData.roomId}:mids`, mid);
+		await db.decrObjectField(`chat:room:${msgData.roomId}`, 'messageCount');
+
+		plugins.hooks.fire('action:messaging.delete', { message: msgData });
+	};
 
 	async function doDeleteRestore(mid, state, uid) {
 		const field = state ? 'deleted' : 'restored';
-		const { deleted, roomId } = await Messaging.getMessageFields(mid, ['deleted', 'roomId']);
-		if (deleted === state) {
+		const msgData = await Messaging.getMessageFields(mid, [
+			'mid', 'fromuid', 'deleted', 'roomId', 'content', 'system',
+		]);
+		if (msgData.deleted === state) {
 			throw new Error(`[[error:chat-${field}-already]]`);
 		}
 
 		await Messaging.setMessageField(mid, 'deleted', state);
+		msgData.deleted = state;
 
-		const [uids, messages] = await Promise.all([
-			Messaging.getUidsInRoom(roomId, 0, -1),
-			Messaging.getMessagesData([mid], uid, roomId, true),
-		]);
+		const ioRoom = sockets.in(`chat_room_${msgData.roomId}`);
+		if (state === 1 && ioRoom) {
+			ioRoom.emit('event:chats.delete', mid);
+			plugins.hooks.fire('action:messaging.delete', { message: msgData });
+		} else if (state === 0 && ioRoom) {
+			const messages = await Messaging.getMessagesData([mid], uid, msgData.roomId, true);
+			ioRoom.emit('event:chats.restore', messages[0]);
+			plugins.hooks.fire('action:messaging.restore', { message: msgData });
+		}
 
-		uids.forEach((_uid) => {
-			if (parseInt(_uid, 10) !== parseInt(uid, 10)) {
-				if (state === 1) {
-					sockets.in(`uid_${_uid}`).emit('event:chats.delete', mid);
-				} else if (state === 0) {
-					sockets.in(`uid_${_uid}`).emit('event:chats.restore', messages[0]);
-				}
+		setImmediate(() => {
+			if (state === 1) {
+				activitypub.out.delete.privateNote(uid, msgData);
+			} else {
+				activitypub.out.update.privateNote(uid, msgData);
 			}
 		});
 	}

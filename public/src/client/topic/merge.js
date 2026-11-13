@@ -1,26 +1,26 @@
 'use strict';
 
 
-define('forum/topic/merge', function () {
-	var Merge = {};
-	var modal;
-	var mergeBtn;
+define('forum/topic/merge', ['search', 'alerts', 'api'], function (search, alerts, api) {
+	const Merge = {};
+	let modal;
+	let mergeBtn;
 
-	var selectedTids = {};
+	let selectedTids = {};
 
 	Merge.init = function (callback) {
 		callback = callback || function () {};
 		if (modal) {
 			return;
 		}
-		app.parseAndTranslate('partials/merge_topics_modal', {}, function (html) {
+		app.parseAndTranslate('modals/merge-topic', {}, function (html) {
 			modal = html;
 
 			$('body').append(modal);
 
 			mergeBtn = modal.find('#merge_topics_confirm');
 
-			modal.find('.close,#merge_topics_cancel').on('click', closeModal);
+			modal.find('#merge_topics_cancel').on('click', closeModal);
 
 			$('#content').on('click', '[component="topic/select"]', onTopicClicked);
 
@@ -30,7 +30,7 @@ define('forum/topic/merge', function () {
 				mergeTopics(mergeBtn);
 			});
 
-			app.enableTopicSearch({
+			search.enableQuickSearch({
 				searchElements: {
 					inputEl: modal.find('.topic-search-input'),
 					resultEl: modal.find('.quick-search-container'),
@@ -38,10 +38,22 @@ define('forum/topic/merge', function () {
 				searchOptions: {
 					in: 'titles',
 				},
+				dropdown: {
+					maxWidth: '400px',
+					maxHeight: '350px',
+				},
 			});
 			modal.on('click', '[data-tid]', function () {
-				if ($(this).attr('data-tid')) {
-					Merge.addTopic($(this).attr('data-tid'));
+				const addTid = $(this).attr('data-tid');
+				if (addTid) {
+					Merge.addTopic(addTid);
+				}
+				return false;
+			});
+			modal.on('click', '[data-remove-tid]', function () {
+				const removeTid = $(this).attr('data-remove-tid');
+				if (removeTid) {
+					Merge.removeTopic(removeTid);
 				}
 				return false;
 			});
@@ -52,28 +64,35 @@ define('forum/topic/merge', function () {
 
 	Merge.addTopic = function (tid, callback) {
 		callback = callback || function () {};
-		socket.emit('topics.getTopic', tid, function (err, topicData) {
-			if (err) {
-				return app.alertError(err);
-			}
-			var title = topicData ? topicData.title : 'No title';
-			if (selectedTids[tid]) {
-				delete selectedTids[tid];
-			} else {
-				selectedTids[tid] = title;
-			}
+		api.get(`/topics/${tid}`, {}).then(function (topicData) {
+			const title = topicData ? topicData.title : 'No title';
+			selectedTids[tid] = title;
 			checkButtonEnable();
 			showTopicsSelected();
 			callback();
-		});
+		}).catch(alerts.error);
+	};
+
+	Merge.removeTopic = function (tid) {
+		if (selectedTids[tid]) {
+			delete selectedTids[tid];
+		}
+		checkButtonEnable();
+		showTopicsSelected();
 	};
 
 	function onTopicClicked(ev) {
 		if (!modal) {
 			return;
 		}
-		var tid = $(this).parents('[component="category/topic"]').attr('data-tid');
-		Merge.addTopic(tid);
+		const topicEl = $(this).parents('[component="category/topic"]');
+		const isSelected = topicEl.hasClass('selected');
+		const tid = topicEl.attr('data-tid');
+		if (isSelected) {
+			Merge.addTopic(tid);
+		} else {
+			Merge.removeTopic(tid);
+		}
 
 		ev.preventDefault();
 		ev.stopPropagation();
@@ -82,8 +101,8 @@ define('forum/topic/merge', function () {
 
 	function mergeTopics(btn) {
 		btn.attr('disabled', true);
-		var tids = Object.keys(selectedTids);
-		var options = {};
+		const tids = Object.keys(selectedTids);
+		const options = {};
 		if (modal.find('.merge-main-topic-radio').is(':checked')) {
 			options.mainTid = modal.find('.merge-main-topic-select').val();
 		} else if (modal.find('.merge-new-title-radio').is(':checked')) {
@@ -93,7 +112,7 @@ define('forum/topic/merge', function () {
 		socket.emit('topics.merge', { tids: tids, options: options }, function (err, tid) {
 			btn.removeAttr('disabled');
 			if (err) {
-				return app.alertError(err.message);
+				return alerts.error(err);
 			}
 			ajaxify.go('/topic/' + tid);
 			closeModal();
@@ -104,25 +123,28 @@ define('forum/topic/merge', function () {
 		if (!modal) {
 			return;
 		}
-		var tids = Object.keys(selectedTids);
+		const tids = Object.keys(selectedTids);
 		tids.sort(function (a, b) {
 			return a - b;
 		});
 
-		var topics = tids.map(function (tid) {
+		const topics = tids.map(function (tid) {
 			return { tid: tid, title: selectedTids[tid] };
 		});
 
 		if (tids.length) {
-			app.parseAndTranslate('partials/merge_topics_modal', {
+			app.parseAndTranslate('modals/merge-topic', {
 				config: config,
 				topics: topics,
 			}, function (html) {
 				modal.find('.topics-section').html(html.find('.topics-section').html());
-				modal.find('.merge-main-topic-select').html(html.find('.merge-main-topic-select').html());
+				modal.find('.merge-main-topic-select').html(
+					html.find('.merge-main-topic-select').html()
+				);
 			});
 		} else {
-			modal.find('.topics-section').translateHtml('[[error:no-topics-selected]]');
+			modal.find('.topics-section').translateText('[[error:no-topics-selected]]');
+			modal.find('.merge-main-topic-select').html('');
 		}
 	}
 

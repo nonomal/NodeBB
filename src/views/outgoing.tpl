@@ -1,12 +1,18 @@
-<div class="outgoing">
-	<!-- IMPORT partials/breadcrumbs.tpl -->
-	<div class="well">
-		<h3>
-			[[notifications:outgoing_link_message, {title}]]
-		</h3>
-		<p>
-			<a href="{outgoing}" rel="nofollow noopener noreferrer" class="btn btn-primary btn-lg">[[notifications:continue_to, {outgoing}]]</a>
-			<a id="return-btn" href="#" class="btn btn-lg btn-warning" onclick="history.back(); return false;">[[notifications:return_to, {title}]]</a>
-		</p>
+<div class="flex-fill">
+	<h2 class="fw-semibold tracking-tight text-center">{{tx("notifications:outgoing-link-message", title)}}</h2>
+
+	<div class="mx-auto">
+		<div class="d-flex flex-column gap-3 justify-content-center text-center">
+			<div class="mx-auto p-4 bg-light border rounded">
+				<i class="text-secondary fa fa-fw fa-4x fa-external-link"></i>
+			</div>
+
+			<div class="col-10 offset-1 col-md-4 offset-4 d-flex flex-column gap-3">
+				<a href="{outgoing}" rel="nofollow noopener noreferrer" class="btn btn-primary text-break">
+					{{tx("notifications:continue-to", txEscape(outgoing))}}
+				</a>
+				<a href="#" class="btn btn-link" onclick="history.back(); return false;">{{tx("notifications:return-to", title)}}</a>
+			</div>
+		</div>
 	</div>
 </div>

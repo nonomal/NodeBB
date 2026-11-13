@@ -27,6 +27,8 @@ require('./queue')(Posts);
 require('./diffs')(Posts);
 require('./uploads')(Posts);
 
+Posts.attachments = require('./attachments');
+
 Posts.exists = async function (pids) {
 	return await db.exists(
 		Array.isArray(pids) ? pids.map(pid => `post:${pid}`) : `post:${pids}`
@@ -44,9 +46,9 @@ Posts.getPostsByPids = async function (pids, uid) {
 	if (!Array.isArray(pids) || !pids.length) {
 		return [];
 	}
+
 	let posts = await Posts.getPostsData(pids);
-	posts = await Promise.all(posts.map(p => Posts.parsePost(p)));
-	posts = await user.blocks.filter(uid, posts);
+	posts = await Promise.all(posts.map(Posts.parsePost));
 	const data = await plugins.hooks.fire('filter:post.getPosts', { posts: posts, uid: uid });
 	if (!data || !Array.isArray(data.posts)) {
 		return [];
@@ -57,7 +59,7 @@ Posts.getPostsByPids = async function (pids, uid) {
 Posts.getPostSummariesFromSet = async function (set, uid, start, stop) {
 	let pids = await db.getSortedSetRevRange(set, start, stop);
 	pids = await privileges.posts.filter('topics:read', pids, uid);
-	const posts = await Posts.getPostSummaryByPids(pids, uid, { stripTags: false });
+	const posts = await Posts.getPostSummaryByPids(pids, uid, { stripTags: false, extraFields: ['contentWarning'] });
 	return { posts: posts, nextStart: stop + 1 };
 };
 
@@ -94,11 +96,24 @@ Posts.getPostIndices = async function (posts, uid) {
 };
 
 Posts.modifyPostByPrivilege = function (post, privileges) {
-	if (post.deleted && !(post.selfPost || privileges['posts:view_deleted'])) {
-		post.content = '[[topic:post_is_deleted]]';
-		if (post.user) {
-			post.user.signature = '';
+	if (post && privileges) {
+		if (post.deleted && !(post.selfPost || privileges['posts:view_deleted'])) {
+			Posts.clearDeletedPostContent(post);
+			if (post.user) {
+				post.user.signature = '';
+			}
 		}
+		post.ip = privileges.isAdminOrMod ? post.ip : undefined;
+	}
+};
+
+Posts.clearDeletedPostContent = function (post) {
+	if (post) {
+		post.content = '[[topic:post-is-deleted]]';
+		if (Object.hasOwn(post, 'sourceContent')) {
+			post.sourceContent = '[[topic:post-is-deleted]]';
+		}
+		post.txContent = true;
 	}
 };
 

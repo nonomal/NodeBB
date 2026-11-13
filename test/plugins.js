@@ -1,14 +1,14 @@
 'use strict';
 
-
-const	assert = require('assert');
+const assert = require('assert');
 const path = require('path');
 const nconf = require('nconf');
-const request = require('request');
+
 const fs = require('fs');
 
 const db = require('./mocks/databasemock');
 const plugins = require('../src/plugins');
+const request = require('../src/request');
 
 describe('Plugins', () => {
 	it('should load plugin data', (done) => {
@@ -47,7 +47,7 @@ describe('Plugins', () => {
 		});
 	});
 
-	it('should register and fire a filter hook having 3 methods, one returning a promise, one calling the callback and one just returning', async () => {
+	it('should register and fire a filter hook having 3 methods', async () => {
 		function method1(data, callback) {
 			data.foo += 1;
 			callback(null, data);
@@ -211,9 +211,26 @@ describe('Plugins', () => {
 		});
 	});
 
+	it('should submit usage info', (done) => {
+		plugins.submitUsageData((err) => {
+			assert.ifError(err);
+			done();
+		});
+	});
+
 	describe('install/activate/uninstall', () => {
 		let latest;
 		const pluginName = 'nodebb-plugin-imgur';
+		const oldValue = process.env.NODE_ENV;
+		before((done) => {
+			process.env.NODE_ENV = 'development';
+			done();
+		});
+		after((done) => {
+			process.env.NODE_ENV = oldValue;
+			done();
+		});
+
 		it('should install a plugin', function (done) {
 			this.timeout(0);
 			plugins.toggleInstall(pluginName, '1.0.16', (err, pluginData) => {
@@ -245,6 +262,18 @@ describe('Plugins', () => {
 			});
 		});
 
+		it('should error if plugin id is invalid', async () => {
+			await assert.rejects(
+				plugins.toggleActive('\t\nnodebb-plugin'),
+				{ message: '[[error:invalid-plugin-id]]' }
+			);
+
+			await assert.rejects(
+				plugins.toggleActive('notaplugin'),
+				{ message: '[[error:invalid-plugin-id]]' }
+			);
+		});
+
 		it('should upgrade plugin', function (done) {
 			this.timeout(0);
 			plugins.upgrade(pluginName, 'latest', (err, isActive) => {
@@ -274,31 +303,104 @@ describe('Plugins', () => {
 	});
 
 	describe('static assets', () => {
-		it('should 404 if resource does not exist', (done) => {
-			request.get(`${nconf.get('url')}/plugins/doesnotexist/should404.tpl`, (err, res, body) => {
+		it('should 404 if resource does not exist', async () => {
+			const { response, body } = await request.get(`${nconf.get('url')}/plugins/doesnotexist/should404.tpl`);
+			assert.equal(response.statusCode, 404);
+			assert(body);
+		});
+
+		it('should 404 if resource does not exist', async () => {
+			const url = `${nconf.get('url')}/plugins/nodebb-plugin-dbsearch/dbsearch/templates/admin/plugins/should404.tpl`;
+			const { response, body } = await request.get(url);
+			assert.equal(response.statusCode, 404);
+			assert(body);
+		});
+
+		it('should get resource', async () => {
+			const url = `${nconf.get('url')}/assets/templates/admin/plugins/dbsearch.tpl`;
+			const { response, body } = await request.get(url);
+			assert.equal(response.statusCode, 200);
+			assert(body);
+		});
+	});
+
+	describe('plugin state set in configuration', () => {
+		const activePlugins = [
+			'nodebb-plugin-markdown',
+			'nodebb-plugin-mentions',
+		];
+		const inactivePlugin = 'nodebb-plugin-emoji';
+		beforeEach((done) => {
+			nconf.set('plugins:active', activePlugins);
+			done();
+		});
+		afterEach((done) => {
+			nconf.set('plugins:active', undefined);
+			done();
+		});
+
+		it('should return active plugin state from configuration', (done) => {
+			plugins.isActive(activePlugins[0], (err, isActive) => {
 				assert.ifError(err);
-				assert.equal(res.statusCode, 404);
-				assert(body);
+				assert(isActive);
 				done();
 			});
 		});
 
-		it('should 404 if resource does not exist', (done) => {
-			request.get(`${nconf.get('url')}/plugins/nodebb-plugin-dbsearch/dbsearch/templates/admin/plugins/should404.tpl`, (err, res, body) => {
+		it('should return inactive plugin state if not in configuration', (done) => {
+			plugins.isActive(inactivePlugin, (err, isActive) => {
 				assert.ifError(err);
-				assert.equal(res.statusCode, 404);
-				assert(body);
+				assert(!isActive);
 				done();
 			});
 		});
 
-		it('should get resource', (done) => {
-			request.get(`${nconf.get('url')}/plugins/nodebb-plugin-dbsearch/dbsearch/templates/admin/plugins/dbsearch.tpl`, (err, res, body) => {
+		it('should get a list of plugins from configuration', (done) => {
+			plugins.list((err, data) => {
 				assert.ifError(err);
-				assert.equal(res.statusCode, 200);
-				assert(body);
+				const keys = ['id', 'name', 'url', 'description', 'latest', 'installed', 'active', 'latest'];
+				assert(Array.isArray(data));
+				keys.forEach((key) => {
+					assert(data[0].hasOwnProperty(key));
+				});
+				data.forEach((pluginData) => {
+					assert.equal(pluginData.active, activePlugins.includes(pluginData.id));
+				});
 				done();
+			});
+		});
+
+		it('should return a list of only active plugins from configuration', (done) => {
+			plugins.getActive((err, data) => {
+				assert.ifError(err);
+				assert(Array.isArray(data));
+				data.forEach((pluginData) => {
+					assert(activePlugins.includes(pluginData));
+				});
+				done();
+			});
+		});
+
+		it('should not deactivate a plugin if active plugins are set in configuration', (done) => {
+			assert.rejects(plugins.toggleActive(activePlugins[0]), Error).then(() => {
+				plugins.isActive(activePlugins[0], (err, isActive) => {
+					assert.ifError(err);
+					assert(isActive);
+					done();
+				});
+			});
+		});
+
+		it('should not activate a plugin if active plugins are set in configuration', (done) => {
+			assert.rejects(plugins.toggleActive(inactivePlugin), Error).then(() => {
+				plugins.isActive(inactivePlugin, (err, isActive) => {
+					assert.ifError(err);
+					assert(!isActive);
+					done();
+				});
 			});
 		});
 	});
 });
+
+

@@ -1,7 +1,9 @@
 'use strict';
 
-define('forum/flags/detail', ['forum/flags/list', 'components', 'translator', 'benchpress', 'forum/account/header', 'accounts/delete', 'api'], function (FlagsList, components, translator, Benchpress, AccountHeader, AccountsDelete, api) {
-	var Detail = {};
+define('forum/flags/detail', [
+	'components', 'benchpress', 'accounts/moderate', 'accounts/delete', 'api', 'modals', 'alerts',
+], function (components, Benchpress, AccountModerate, AccountsDelete, api, modals, alerts) {
+	const Detail = {};
 
 	Detail.init = function () {
 		// Update attributes
@@ -9,9 +11,9 @@ define('forum/flags/detail', ['forum/flags/list', 'components', 'translator', 'b
 		$('#assignee').val(ajaxify.data.assignee).removeAttr('disabled');
 
 		$('#content > div').on('click', '[data-action]', function () {
-			var action = this.getAttribute('data-action');
-			var uid = $(this).parents('[data-uid]').attr('data-uid');
-			var noteEl = document.getElementById('note');
+			const action = this.getAttribute('data-action');
+			const uid = $(this).parents('[data-uid]').attr('data-uid');
+			const noteEl = document.getElementById('note');
 
 			switch (action) {
 				case 'assign':
@@ -24,46 +26,92 @@ define('forum/flags/detail', ['forum/flags/list', 'components', 'translator', 'b
 						return memo;
 					}, {});
 
-					api.put(`/flags/${ajaxify.data.flagId}`, data).then((history) => {
-						app.alertSuccess('[[flags:updated]]');
+					api.put(`/flags/${ajaxify.data.flagId}`, data).then(({ history }) => {
+						alerts.success('[[flags:updated]]');
 						Detail.reloadHistory(history);
-					}).catch(app.alertError);
+					}).catch(alerts.error);
+					break;
+				}
+
+				case 'addEditNote': {
+					const noteEl = this.closest('[component="flag/note"]');
+					let datetime;
+					let value;
+					if (noteEl) {
+						datetime = noteEl.getAttribute('data-datetime');
+						const index = noteEl.getAttribute('data-index');
+						value = ajaxify.data.notes[index].content;
+					}
+
+					modals.prompt({
+						title: `[[flags:${datetime ? 'edit' : 'add'}-note]]`,
+						inputType: 'textarea',
+						rows: 3,
+						value,
+						callback: (result) => {
+							if (!result) {
+								return;
+							}
+
+							api.post(`/flags/${ajaxify.data.flagId}/notes`, {
+								note: result,
+								datetime,
+							}).then((payload) => {
+								alerts.success('[[flags:note-added]]');
+								Detail.reloadNotes(payload.notes);
+								Detail.reloadHistory(payload.history);
+							}).catch(alerts.error);
+						},
+					});
 					break;
 				}
 
 				case 'appendNote':
-					// socket.emit('flags.appendNote', {
 					api.post(`/flags/${ajaxify.data.flagId}/notes`, {
 						note: noteEl.value,
 						datetime: parseInt(noteEl.getAttribute('data-datetime'), 10),
 					}).then((payload) => {
-						app.alertSuccess('[[flags:note-added]]');
+						alerts.success('[[flags:note-added]]');
 						Detail.reloadNotes(payload.notes);
 						Detail.reloadHistory(payload.history);
 
 						noteEl.removeAttribute('data-datetime');
-					}).catch(app.alertError);
+					}).catch(alerts.error);
 					break;
 
-				case 'delete-note':
-					var datetime = parseInt(this.closest('[data-datetime]').getAttribute('data-datetime'), 10);
-					bootbox.confirm('[[flags:delete-note-confirm]]', function (ok) {
+				case 'delete-note': {
+					const datetime = parseInt(this.closest('[data-datetime]').getAttribute('data-datetime'), 10);
+					modals.confirm('[[flags:delete-note-confirm]]', function (ok) {
 						if (ok) {
-							api.delete(`/flags/${ajaxify.data.flagId}/notes/${datetime}`, {}).then((payload) => {
-								app.alertSuccess('[[flags:note-deleted]]');
+							api.del(`/flags/${ajaxify.data.flagId}/notes/${datetime}`, {}).then((payload) => {
+								alerts.success('[[flags:note-deleted]]');
 								Detail.reloadNotes(payload.notes);
 								Detail.reloadHistory(payload.history);
-							}).catch(app.alertError);
+							}).catch(alerts.error);
 						}
 					});
 					break;
-
+				}
 				case 'chat':
-					app.newChat(uid);
+					require(['chat'], function (chat) {
+						chat.newChat(uid);
+					});
 					break;
 
 				case 'ban':
-					AccountHeader.banAccount(uid, ajaxify.refresh);
+					AccountModerate.banAccount(uid, ajaxify.refresh);
+					break;
+
+				case 'unban':
+					AccountModerate.unbanAccount(uid);
+					break;
+
+				case 'mute':
+					AccountModerate.muteAccount(uid, ajaxify.refresh);
+					break;
+
+				case 'unmute':
+					AccountModerate.unmuteAccount(uid);
 					break;
 
 				case 'delete-account':
@@ -79,55 +127,49 @@ define('forum/flags/detail', ['forum/flags/list', 'components', 'translator', 'b
 					break;
 
 				case 'delete-post':
-					postAction('delete', ajaxify.data.target.pid, ajaxify.data.target.tid);
+					postAction('delete', api.del, `/posts/${ajaxify.data.target.pid}/state`);
 					break;
 
 				case 'purge-post':
-					postAction('purge', ajaxify.data.target.pid, ajaxify.data.target.tid);
+					postAction('purge', api.del, `/posts/${ajaxify.data.target.pid}`);
 					break;
 
 				case 'restore-post':
-					postAction('restore', ajaxify.data.target.pid, ajaxify.data.target.tid);
+					postAction('restore', api.put, `/posts/${ajaxify.data.target.pid}/state`);
 					break;
 
-				case 'prepare-edit':
-					var selectedNoteEl = this.closest('[data-index]');
-					var index = selectedNoteEl.getAttribute('data-index');
-					var textareaEl = document.getElementById('note');
-					textareaEl.value = ajaxify.data.notes[index].content;
-					textareaEl.setAttribute('data-datetime', ajaxify.data.notes[index].datetime);
-
-					var siblings = selectedNoteEl.parentElement.children;
-					for (var el in siblings) {
-						if (siblings.hasOwnProperty(el)) {
-							siblings[el].classList.remove('editing');
+				case 'delete-message': {
+					modals.confirm('[[flags:delete-message-confirm]]', function (confirm) {
+						if (!confirm) {
+							return;
 						}
-					}
-					selectedNoteEl.classList.add('editing');
-					textareaEl.focus();
+						api.del(`/chats/${ajaxify.data.target.roomId}/messages/${ajaxify.data.target.mid}`, {}).then(ajaxify.refresh).catch(alerts.error);
+					});
 					break;
+				}
+
+				case 'delete-flag': {
+					modals.confirm('[[flags:delete-flag-confirm]]', function (ok) {
+						if (ok) {
+							api.del(`/flags/${ajaxify.data.flagId}`, {}).then(() => {
+								alerts.success('[[flags:flag-deleted]]');
+								ajaxify.go('flags');
+							}).catch(alerts.error);
+						}
+					});
+					break;
+				}
 			}
 		});
 	};
 
-	function postAction(action, pid, tid) {
-		translator.translate('[[topic:post_' + action + '_confirm]]', function (msg) {
-			bootbox.confirm(msg, function (confirm) {
-				if (!confirm) {
-					return;
-				}
+	function postAction(action, method, path) {
+		modals.confirm(`[[topic:post-${action}-confirm]]`, function (confirm) {
+			if (!confirm) {
+				return;
+			}
 
-				socket.emit('posts.' + action, {
-					pid: pid,
-					tid: tid,
-				}, function (err) {
-					if (err) {
-						app.alertError(err.message);
-					}
-
-					ajaxify.refresh();
-				});
-			});
+			method(path).then(ajaxify.refresh).catch(alerts.error);
 		});
 	}
 
@@ -136,11 +178,10 @@ define('forum/flags/detail', ['forum/flags/list', 'components', 'translator', 'b
 		Benchpress.render('flags/detail', {
 			notes: notes,
 		}, 'notes').then(function (html) {
-			var wrapperEl = components.get('flag/notes');
+			const wrapperEl = components.get('flag/notes');
 			wrapperEl.empty();
 			wrapperEl.html(html);
 			wrapperEl.find('span.timeago').timeago();
-			document.getElementById('note').value = '';
 		});
 	};
 
@@ -148,7 +189,7 @@ define('forum/flags/detail', ['forum/flags/list', 'components', 'translator', 'b
 		app.parseAndTranslate('flags/detail', 'history', {
 			history: history,
 		}, function (html) {
-			var wrapperEl = components.get('flag/history');
+			const wrapperEl = components.get('flag/history');
 			wrapperEl.empty();
 			wrapperEl.html(html);
 			wrapperEl.find('span.timeago').timeago();

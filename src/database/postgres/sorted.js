@@ -1,8 +1,10 @@
 'use strict';
 
 module.exports = function (module) {
-	const helpers = require('./helpers');
 	const util = require('util');
+
+	const helpers = require('./helpers');
+	const dbHelpers = require('../helpers');
 	const Cursor = require('pg-cursor');
 	Cursor.prototype.readAsync = util.promisify(Cursor.prototype.read);
 	const sleep = util.promisify(setTimeout);
@@ -221,16 +223,42 @@ SELECT o."_key" k,
 		return keys.map(k => parseInt((res.rows.find(r => r.k === k) || { c: 0 }).c, 10));
 	};
 
-	module.sortedSetsCardSum = async function (keys) {
+	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
 		if (!keys || (Array.isArray(keys) && !keys.length)) {
 			return 0;
 		}
 		if (!Array.isArray(keys)) {
 			keys = [keys];
 		}
-		const counts = await module.sortedSetsCard(keys);
-		const sum = counts.reduce((acc, val) => acc + val, 0);
-		return sum;
+		let counts;
+		if (min !== '-inf' || max !== '+inf') {
+			if (min === '-inf') {
+				min = null;
+			}
+			if (max === '+inf') {
+				max = null;
+			}
+
+			const res = await module.pool.query({
+				name: 'sortedSetsCardSum',
+				text: `
+	SELECT o."_key" k,
+		COUNT(*) c
+	FROM "legacy_object_live" o
+	INNER JOIN "legacy_zset" z
+			 ON o."_key" = z."_key"
+			AND o."type" = z."type"
+	WHERE o."_key" = ANY($1::TEXT[])
+		AND (z."score" >= $2::NUMERIC OR $2::NUMERIC IS NULL)
+		AND (z."score" <= $3::NUMERIC OR $3::NUMERIC IS NULL)
+	GROUP BY o."_key"`,
+				values: [keys, min, max],
+			});
+			counts = keys.map(k => parseInt((res.rows.find(r => r.k === k) || { c: 0 }).c, 10));
+		} else {
+			counts = await module.sortedSetsCard(keys);
+		}
+		return counts.reduce((acc, val) => acc + val, 0);
 	};
 
 	module.sortedSetRank = async function (key, value) {
@@ -457,6 +485,11 @@ SELECT o."_key" k
 		return data && data[0];
 	};
 
+	module.getSortedSetMembersWithScores = async function (key) {
+		const data = await module.getSortedSetsMembersWithScores([key]);
+		return data && data[0];
+	};
+
 	module.getSortedSetsMembers = async function (keys) {
 		if (!Array.isArray(keys) || !keys.length) {
 			return [];
@@ -467,6 +500,23 @@ SELECT o."_key" k
 			text: `
 SELECT "_key" k,
        "nodebb_get_sorted_set_members"("_key") m
+  FROM UNNEST($1::TEXT[]) "_key";`,
+			values: [keys],
+		});
+
+		return keys.map(k => (res.rows.find(r => r.k === k) || {}).m || []);
+	};
+
+	module.getSortedSetsMembersWithScores = async function (keys) {
+		if (!Array.isArray(keys) || !keys.length) {
+			return [];
+		}
+
+		const res = await module.pool.query({
+			name: 'getSortedSetsMembersWithScores',
+			text: `
+SELECT "_key" k,
+       "nodebb_get_sorted_set_members_withscores"("_key") m
   FROM UNNEST($1::TEXT[]) "_key";`,
 			values: [keys],
 		});
@@ -495,6 +545,42 @@ RETURNING "score" s`,
 				values: [key, value, increment],
 			});
 			return parseFloat(res.rows[0].s);
+		});
+	};
+
+	module.sortedSetIncrByBulk = async function (data) {
+		if (!Array.isArray(data) || !data.length) {
+			return [];
+		}
+
+		const aggregated = dbHelpers.aggregateIncrByBulk(data);
+		return await module.transaction(async (client) => {
+			await helpers.ensureLegacyObjectsType(client, aggregated.map(item => item[0]), 'zset');
+
+			const values = [];
+			const queryParams = [];
+			let paramIndex = 1;
+
+			aggregated.forEach(([key, increment, value]) => {
+				value = helpers.valueToString(value);
+				increment = parseFloat(increment);
+				values.push(key, value, increment);
+				queryParams.push(`($${paramIndex}::TEXT, $${paramIndex + 1}::TEXT, $${paramIndex + 2}::NUMERIC)`);
+				paramIndex += 3;
+			});
+
+			const query = `
+INSERT INTO "legacy_zset" ("_key", "value", "score")
+VALUES ${queryParams.join(', ')}
+ON CONFLICT ("_key", "value")
+DO UPDATE SET "score" = "legacy_zset"."score" + EXCLUDED."score"
+RETURNING "value", "score"`;
+
+			const res = await client.query({
+				text: query,
+				values,
+			});
+			return res.rows.map(row => parseFloat(row.score));
 		});
 	};
 
@@ -572,11 +658,11 @@ DELETE FROM "legacy_zset" z
 
 		if (min !== '-') {
 			if (min.match(/^\(/)) {
-				q.values.push(min.substr(1));
+				q.values.push(min.slice(1));
 				q.suffix += 'GT';
 				q.where += ` AND z."value" > $${q.values.length}::TEXT COLLATE "C"`;
 			} else if (min.match(/^\[/)) {
-				q.values.push(min.substr(1));
+				q.values.push(min.slice(1));
 				q.suffix += 'GE';
 				q.where += ` AND z."value" >= $${q.values.length}::TEXT COLLATE "C"`;
 			} else {
@@ -588,11 +674,11 @@ DELETE FROM "legacy_zset" z
 
 		if (max !== '+') {
 			if (max.match(/^\(/)) {
-				q.values.push(max.substr(1));
+				q.values.push(max.slice(1));
 				q.suffix += 'LT';
 				q.where += ` AND z."value" < $${q.values.length}::TEXT COLLATE "C"`;
 			} else if (max.match(/^\[/)) {
-				q.values.push(max.substr(1));
+				q.values.push(max.slice(1));
 				q.suffix += 'LE';
 				q.where += ` AND z."value" <= $${q.values.length}::TEXT COLLATE "C"`;
 			} else {
@@ -624,9 +710,9 @@ SELECT z."value",
          ON o."_key" = z."_key"
         AND o."type" = z."type"
  WHERE o."_key" = $1::TEXT
-  AND z."value" LIKE '${match}'
+  AND z."value" LIKE $3
   LIMIT $2::INTEGER`,
-			values: [params.key, params.limit],
+			values: [params.key, params.limit, match],
 		});
 		if (!params.withScores) {
 			return res.rows.map(r => r.value);
@@ -637,6 +723,9 @@ SELECT z."value",
 	module.processSortedSet = async function (setKey, process, options) {
 		const client = await module.pool.connect();
 		const batchSize = (options || {}).batch || 100;
+		const sort = options.reverse ? 'DESC' : 'ASC';
+		const min = options.min && options.min !== '-inf' ? options.min : null;
+		const max = options.max && options.max !== '+inf' ? options.max : null;
 		const cursor = client.query(new Cursor(`
 SELECT z."value", z."score"
   FROM "legacy_object_live" o
@@ -644,12 +733,14 @@ SELECT z."value", z."score"
          ON o."_key" = z."_key"
         AND o."type" = z."type"
  WHERE o."_key" = $1::TEXT
- ORDER BY z."score" ASC, z."value" ASC`, [setKey]));
+   AND (z."score" >= $2::NUMERIC OR $2::NUMERIC IS NULL)
+   AND (z."score" <= $3::NUMERIC OR $3::NUMERIC IS NULL)
+ ORDER BY z."score" ${sort}, z."value" ${sort}`, [setKey, min, max]));
 
 		if (process && process.constructor && process.constructor.name !== 'AsyncFunction') {
 			process = util.promisify(process);
 		}
-
+		let iteration = 1;
 		while (true) {
 			/* eslint-disable no-await-in-loop */
 			let rows = await cursor.readAsync(batchSize);
@@ -664,13 +755,14 @@ SELECT z."value", z."score"
 				rows = rows.map(r => r.value);
 			}
 			try {
+				if (iteration > 1 && options.interval) {
+					await sleep(options.interval);
+				}
 				await process(rows);
+				iteration += 1;
 			} catch (err) {
 				await client.release();
 				throw err;
-			}
-			if (options.interval) {
-				await sleep(options.interval);
 			}
 		}
 	};

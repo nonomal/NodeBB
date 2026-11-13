@@ -23,8 +23,6 @@ get:
                     type: number
                   maximumAboutMeLength:
                     type: number
-                  maximumProfileImageSize:
-                    type: number
                   allowProfilePicture:
                     type: boolean
                   allowCoverPicture:
@@ -37,20 +35,33 @@ get:
                     type: boolean
                   allowAccountDelete:
                     type: boolean
-                  allowWebsite:
-                    type: boolean
                   allowAboutMe:
                     type: boolean
                   allowSignature:
                     type: boolean
-                  profileImageDimension:
-                    type: number
                   defaultAvatar:
                     type: string
+                  sso:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        associated:
+                          type: boolean
+                        url:
+                          type: string
+                        name:
+                          type: string
+                        icon:
+                          type: string
+                        deauthUrl:
+                          type: string
                   groupSelectSize:
                     type: number
                   title:
                     type: string
+                  customUserFields:
+                    type: array
                   editButtons:
                     type: array
                     items:

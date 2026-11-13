@@ -1,17 +1,20 @@
 'use strict';
 
 const nconf = require('nconf');
-const validator = require('validator');
+const mime = require('mime').default;
 
 const meta = require('../meta');
 const user = require('../user');
 const plugins = require('../plugins');
-const privileges = require('../privileges');
+const privilegesHelpers = require('../privileges/helpers');
 const helpers = require('./helpers');
+const utils = require('../utils');
 
 const Controllers = module.exports;
 
 Controllers.ping = require('./ping');
+Controllers['well-known'] = require('./well-known');
+Controllers.activitypub = require('./activitypub');
 Controllers.home = require('./home');
 Controllers.topics = require('./topics');
 Controllers.posts = require('./posts');
@@ -34,9 +37,11 @@ Controllers.globalMods = require('./globalmods');
 Controllers.mods = require('./mods');
 Controllers.sitemap = require('./sitemap');
 Controllers.osd = require('./osd');
+Controllers['service-worker'] = require('./service-worker');
 Controllers['404'] = require('./404');
 Controllers.errors = require('./errors');
 Controllers.composer = require('./composer');
+Controllers.intents = require('./intents');
 
 Controllers.write = require('./write');
 
@@ -60,11 +65,11 @@ Controllers.reset = async function (req, res) {
 			minimumPasswordStrength: meta.config.minimumPasswordStrength,
 			breadcrumbs: helpers.buildBreadcrumbs([
 				{
-					text: '[[reset_password:reset_password]]',
+					text: '[[reset_password:reset-password]]',
 					url: '/reset',
 				},
 				{
-					text: '[[reset_password:update_password]]',
+					text: '[[reset_password:update-password]]',
 				},
 			]),
 			title: '[[pages:reset]]',
@@ -85,7 +90,7 @@ Controllers.reset = async function (req, res) {
 		res.render('reset', {
 			code: null,
 			breadcrumbs: helpers.buildBreadcrumbs([{
-				text: '[[reset_password:reset_password]]',
+				text: '[[reset_password:reset-password]]',
 			}]),
 			title: '[[pages:reset]]',
 		});
@@ -102,17 +107,20 @@ Controllers.login = async function (req, res) {
 	if (req.query.error === 'csrf-invalid') {
 		errorText = '[[error:csrf-invalid]]';
 	} else if (req.query.error) {
-		errorText = validator.escape(String(req.query.error));
+		errorText = req.query.error;
 	}
 
 	if (req.headers['x-return-to']) {
-		req.session.returnTo = req.headers['x-return-to'];
+		req.session.returnTo = helpers.normalizeReturnToPath(req.headers['x-return-to']) || '/';
+	} else if (req.session.returnTo) {
+		const normalizedReturnTo = helpers.normalizeReturnToPath(req.session.returnTo);
+		if (normalizedReturnTo) {
+			req.session.returnTo = normalizedReturnTo;
+		}
 	}
 
-	// Occasionally, x-return-to is passed a full url.
-	req.session.returnTo = req.session.returnTo && req.session.returnTo.replace(nconf.get('base_url'), '').replace(nconf.get('relative_path'), '');
-
 	data.alternate_logins = loginStrategies.length > 0;
+	data.osw_logins = !!meta.config.activitypubEnabled;
 	data.authentication = loginStrategies;
 	data.allowRegistration = registrationType === 'normal';
 	data.allowLoginWith = `[[login:${allowLoginWith}]]`;
@@ -123,17 +131,19 @@ Controllers.login = async function (req, res) {
 	data.title = '[[pages:login]]';
 	data.allowPasswordReset = !meta.config['password:disableEdit'];
 
-	const hasLoginPrivilege = await privileges.global.canGroup('local:login', 'registered-users');
+	const loginPrivileges = await privilegesHelpers.getGroupPrivileges(0, ['groups:local:login']);
+	const hasLoginPrivilege = !!loginPrivileges.find(privilege => privilege.privileges['groups:local:login']);
 	data.allowLocalLogin = hasLoginPrivilege || parseInt(req.query.local, 10) === 1;
 
 	if (!data.allowLocalLogin && !data.allowRegistration && data.alternate_logins && data.authentication.length === 1) {
 		return helpers.redirect(res, { external: data.authentication[0].url });
 	}
 
+	// Re-auth challenge, pre-fill username
 	if (req.loggedIn) {
-		const userData = await user.getUserFields(req.uid, ['username', 'email']);
-		data.username = allowLoginWith === 'email' ? userData.email : userData.username;
-		data.alternate_logins = false;
+		const userData = await user.getUserFields(req.uid, ['username']);
+		data.username = userData.username;
+		data.reauthNotice = !!req.session.forceLogin;
 	}
 	res.render('login', data);
 };
@@ -146,7 +156,6 @@ Controllers.register = async function (req, res, next) {
 	}
 
 	let errorText;
-	const returnTo = (req.headers['x-return-to'] || '').replace(nconf.get('base_url') + nconf.get('relative_path'), '');
 	if (req.query.error === 'csrf-invalid') {
 		errorText = '[[error:csrf-invalid]]';
 	}
@@ -161,14 +170,15 @@ Controllers.register = async function (req, res, next) {
 			}
 		}
 
-		if (returnTo) {
-			req.session.returnTo = returnTo;
+		if (req.headers['x-return-to']) {
+			req.session.returnTo = helpers.normalizeReturnToPath(req.headers['x-return-to']) || '/';
 		}
 
 		const loginStrategies = require('../routes/authentication').getLoginStrategies();
 		res.render('register', {
 			'register_window:spansize': loginStrategies.length ? 'col-md-6' : 'col-md-12',
 			alternate_logins: !!loginStrategies.length,
+			osw_logins: !!meta.config.activitypubEnabled,
 			authentication: loginStrategies,
 
 			minimumUsernameLength: meta.config.minimumUsernameLength,
@@ -187,15 +197,13 @@ Controllers.register = async function (req, res, next) {
 	}
 };
 
+// GET /register/complete
 Controllers.registerInterstitial = async function (req, res, next) {
 	if (!req.session.hasOwnProperty('registration')) {
 		return res.redirect(`${nconf.get('relative_path')}/register`);
 	}
 	try {
-		const data = await plugins.hooks.fire('filter:register.interstitial', {
-			userData: req.session.registration,
-			interstitials: [],
-		});
+		const data = await user.interstitials.get(req, req.session.registration);
 
 		if (!data.interstitials.length) {
 			// No interstitials, redirect to home
@@ -212,7 +220,8 @@ Controllers.registerInterstitial = async function (req, res, next) {
 
 		res.render('registerComplete', {
 			title: '[[pages:registration-complete]]',
-			sections: sections,
+			register: data.userData.register,
+			sections,
 			errors,
 		});
 	} catch (err) {
@@ -220,13 +229,33 @@ Controllers.registerInterstitial = async function (req, res, next) {
 	}
 };
 
-Controllers.confirmEmail = function (req, res) {
-	user.email.confirmByCode(req.params.code, (err) => {
+Controllers.confirmEmail = async (req, res) => {
+	function renderPage(opts = {}) {
 		res.render('confirm', {
-			error: err ? err.message : '',
 			title: '[[pages:confirm]]',
+			...opts,
 		});
-	});
+	}
+
+	if (req.method === 'HEAD') {
+		return renderPage();
+	}
+	try {
+		await user.email.confirmByCode(req.params.code, req.session.id);
+		if (req.session.registration) {
+			// After confirmation, no need to send user back to email change form
+			delete req.session.registration.updateEmail;
+		}
+
+		renderPage();
+	} catch (e) {
+		if (e.message === '[[error:invalid-data]]' || e.message === '[[error:confirm-email-expired]]') {
+			renderPage({ error: true });
+			return;
+		}
+
+		throw e;
+	}
 };
 
 Controllers.robots = function (req, res) {
@@ -247,6 +276,7 @@ Controllers.manifest = async function (req, res) {
 	const manifest = {
 		name: meta.config.title || 'NodeBB',
 		short_name: meta.config['title:short'] || meta.config.title || 'NodeBB',
+		...(meta.config.description && { description: meta.config.description }),
 		start_url: nconf.get('url'),
 		display: 'standalone',
 		orientation: 'portrait',
@@ -255,55 +285,68 @@ Controllers.manifest = async function (req, res) {
 		icons: [],
 	};
 
-	if (meta.config['brand:touchIcon']) {
-		manifest.icons.push({
-			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-36.png`,
-			sizes: '36x36',
-			type: 'image/png',
-			density: 0.75,
-		}, {
-			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-48.png`,
-			sizes: '48x48',
-			type: 'image/png',
-			density: 1.0,
-		}, {
-			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-72.png`,
-			sizes: '72x72',
-			type: 'image/png',
-			density: 1.5,
-		}, {
-			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-96.png`,
-			sizes: '96x96',
-			type: 'image/png',
-			density: 2.0,
-		}, {
-			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-144.png`,
-			sizes: '144x144',
-			type: 'image/png',
-			density: 3.0,
-		}, {
-			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-192.png`,
-			sizes: '192x192',
-			type: 'image/png',
-			density: 4.0,
-		}, {
-			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-512.png`,
-			sizes: '512x512',
-			type: 'image/png',
-			density: 10.0,
-		});
+	if (meta.config['brand:screenshot']) {
+		const width = meta.config['brand:screenshot:width'];
+		const height = meta.config['brand:screenshot:height'];
+		const sizes = width && height ? `${width}x${height}` : '';
+		const screenshotSrc = utils.cacheBustedUrl(
+			meta.config['brand:screenshot'],
+			meta.config['brand:screenshot:updatedAt']
+		);
+		manifest.screenshots = [
+			{
+				src: `${nconf.get('relative_path')}${screenshotSrc}`,
+				sizes: sizes || '',
+				type: mime.getType(meta.config['brand:screenshot']),
+			},
+		];
+	} else {
+		manifest.screenshots = [
+			{
+				src: `${nconf.get('relative_path')}/assets/images/screenshot-default.png`,
+				sizes: '446x778',
+				type: 'image/png',
+				form_factor: 'narrow',
+				label: 'Default home page of a vanilla NodeBB installation.',
+			},
+		];
 	}
 
+	const custom = meta.config['brand:touchIcon'];
+	const basePath = custom ?
+		`${nconf.get('relative_path')}/assets/uploads/system` :
+		`${nconf.get('relative_path')}/assets/images/touch`;
+
+	const sizes = [36, 48, 72, 96, 144, 192, 512];
+	const densities = [0.75, 1, 1.5, 2, 3, 4, 10];
+
+	sizes.forEach((size, index) => {
+		const src = custom ?
+			utils.cacheBustedUrl(`touchicon-${size}.png`, meta.config['brand:touchIcon:updatedAt']) :
+			`${size}.png`;
+		manifest.icons.push({
+			src: `${basePath}/${src}`,
+			sizes: `${size}x${size}`,
+			type: 'image/png',
+			density: densities[index],
+		});
+	});
 
 	if (meta.config['brand:maskableIcon']) {
+		const maskableIconSrc = utils.cacheBustedUrl(
+			`/assets/uploads/system/maskableicon-orig.png`,
+			meta.config['brand:maskableIcon:updatedAt']
+		);
 		manifest.icons.push({
-			src: `${nconf.get('relative_path')}/assets/uploads/system/maskableicon-orig.png`,
+			src: `${nconf.get('relative_path')}${maskableIconSrc}`,
+			sizes: '512x512',
 			type: 'image/png',
 			purpose: 'maskable',
 		});
 	} else if (meta.config['brand:touchIcon']) {
 		manifest.icons.push({
 			src: `${nconf.get('relative_path')}/assets/uploads/system/touchicon-orig.png`,
+			sizes: '512x512',
 			type: 'image/png',
 			purpose: 'maskable',
 		});
@@ -319,21 +362,27 @@ Controllers.manifest = async function (req, res) {
 
 Controllers.outgoing = function (req, res, next) {
 	const url = req.query.url || '';
+	let parsed;
+	try {
+		parsed = new URL(url);
+	} catch (err) {
+		return next();
+	}
+
 	const allowedProtocols = [
 		'http', 'https', 'ftp', 'ftps', 'mailto', 'news', 'irc', 'gopher',
 		'nntp', 'feed', 'telnet', 'mms', 'rtsp', 'svn', 'tel', 'fax', 'xmpp', 'webcal',
 	];
-	const parsed = require('url').parse(url);
 
 	if (!url || !parsed.protocol || !allowedProtocols.includes(parsed.protocol.slice(0, -1))) {
 		return next();
 	}
 
 	res.render('outgoing', {
-		outgoing: validator.escape(String(url)),
+		outgoing: url,
 		title: meta.config.title,
 		breadcrumbs: helpers.buildBreadcrumbs([{
-			text: '[[notifications:outgoing_link]]',
+			text: '[[notifications:outgoing-link]]',
 		}]),
 	});
 };

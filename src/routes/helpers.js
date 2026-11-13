@@ -1,38 +1,35 @@
 'use strict';
 
 const helpers = module.exports;
+const winston = require('winston');
 const middleware = require('../middleware');
 const controllerHelpers = require('../controllers/helpers');
 
-function _handleArgs(middleware, middlewares, controller) {
-	if (typeof middlewares === 'function') {
-		if (controller) {
-			middlewares = [middlewares];
-		} else {
-			controller = middlewares;
-			middlewares = [];
-		}
+// router, name, middleware(deprecated), middlewares(optional), controller
+helpers.setupPageRoute = function (...args) {
+	const [router, name] = args;
+	let middlewares = args.length > 3 ? args[args.length - 2] : [];
+	const controller = args[args.length - 1];
+
+	if (args.length === 5) {
+		winston.warn(`[helpers.setupPageRoute(${name})] passing \`middleware\` as the third param is deprecated, it can now be safely removed`);
 	}
 
 	middlewares = [
+		middleware.autoLocale,
+		middleware.applyBlacklist,
+		middleware.authenticateRequest,
+		middleware.redirectToHomeIfBanned,
 		middleware.maintenanceMode,
 		middleware.registrationComplete,
-		middleware.authenticateRequest,
 		middleware.pluginHooks,
 		...middlewares,
+		middleware.pageView,
 	];
-
-	return { middlewares, controller };
-}
-
-helpers.setupPageRoute = function (router, name, middleware, middlewares, controller) {
-	({ middlewares, controller } = _handleArgs(middleware, middlewares, controller));
-	middlewares.push(middleware.pageView);
 
 	router.get(
 		name,
 		middleware.busyCheck,
-		middleware.applyCSRF,
 		middlewares,
 		middleware.buildHeader,
 		helpers.tryRoute(controller)
@@ -40,13 +37,40 @@ helpers.setupPageRoute = function (router, name, middleware, middlewares, contro
 	router.get(`/api${name}`, middlewares, helpers.tryRoute(controller));
 };
 
-helpers.setupAdminPageRoute = function (router, name, middleware, middlewares, controller) {
-	router.get(name, middleware.admin.buildHeader, middlewares, helpers.tryRoute(controller));
-	router.get(`/api${name}`, middlewares, helpers.tryRoute(controller));
+// router, name, middleware(deprecated), middlewares(optional), controller
+helpers.setupAdminPageRoute = function (...args) {
+	const [router, name] = args;
+	const middlewares = args.length > 3 ? args[args.length - 2] : [];
+	const controller = args[args.length - 1];
+	if (args.length === 5) {
+		winston.warn(`[helpers.setupAdminPageRoute(${name})] passing \`middleware\` as the third param is deprecated, it can now be safely removed`);
+	}
+	const adminMiddlewares = [
+		middleware.admin.isAdminPage,
+		...middlewares,
+	];
+	router.get(name, middleware.autoLocale, middleware.admin.buildHeader, adminMiddlewares, helpers.tryRoute(controller));
+	router.get(`/api${name}`, adminMiddlewares, helpers.tryRoute(controller));
 };
 
-helpers.setupApiRoute = function (router, verb, name, middlewares, controller) {
-	({ middlewares, controller } = _handleArgs(middleware, middlewares, controller));
+// router, verb, name, middlewares(optional), controller
+helpers.setupApiRoute = function (...args) {
+	const [router, verb, name] = args;
+	let middlewares = args.length > 4 ? args[args.length - 2] : [];
+	const controller = args[args.length - 1];
+	const upload = require('../middleware/multer');
+	const uploadVerbs = new Set(['post', 'put', 'patch']);
+	middlewares = [
+		middleware.autoLocale,
+		middleware.applyBlacklist,
+		middleware.authenticateRequest,
+		middleware.maintenanceMode,
+		middleware.registrationComplete,
+		middleware.pluginHooks,
+		middleware.logApiUsage,
+		...(uploadVerbs.has(verb) ? [upload.any()] : []),
+		...middlewares,
+	];
 
 	router[verb](name, middlewares, helpers.tryRoute(controller, (err, res) => {
 		controllerHelpers.formatApiResponse(400, res, err);

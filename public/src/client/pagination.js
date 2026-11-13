@@ -1,12 +1,12 @@
 'use strict';
 
 
-define('forum/pagination', function () {
-	var pagination = {};
+define('forum/pagination', ['modals'], function (modals) {
+	const pagination = {};
 
 	pagination.init = function () {
 		$('body').on('click', '[component="pagination/select-page"]', function () {
-			bootbox.prompt('[[global:enter_page_number]]', function (pageNum) {
+			modals.prompt('[[global:enter-page-number]]', function (pageNum) {
 				pagination.loadPage(pageNum);
 			});
 			return false;
@@ -20,10 +20,10 @@ define('forum/pagination', function () {
 			return;
 		}
 
-		var query = utils.params();
+		const query = utils.params();
 		query.page = page;
 
-		var url = window.location.pathname + '?' + $.param(query);
+		const url = window.location.pathname + '?' + $.param(query);
 		ajaxify.go(url, callback);
 	};
 

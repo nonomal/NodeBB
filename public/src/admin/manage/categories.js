@@ -1,37 +1,41 @@
 'use strict';
 
 define('admin/manage/categories', [
-	'translator',
 	'benchpress',
 	'categorySelector',
 	'api',
 	'Sortable',
-	'bootbox',
-], function (translator, Benchpress, categorySelector, api, Sortable, bootbox) {
-	var	Categories = {};
-	var newCategoryId = -1;
-	var sortables;
+	'modals',
+	'alerts',
+], function (Benchpress, categorySelector, api, Sortable, modals, alerts) {
+	Sortable = Sortable.default;
+	const Categories = {};
+	let newCategoryId = '-1';
+	let sortables;
 
 	Categories.init = function () {
-		categorySelector.init($('.category [component="category-selector"]'), {
+		categorySelector.init($('[component="category-selector"]'), {
 			parentCid: ajaxify.data.selectedCategory ? ajaxify.data.selectedCategory.cid : 0,
 			onSelect: function (selectedCategory) {
 				ajaxify.go('/admin/manage/categories' + (selectedCategory.cid ? '?cid=' + selectedCategory.cid : ''));
 			},
+			cacheList: false,
 			localCategories: [],
+			template: 'admin/partials/category/selector-dropdown-right',
 		});
 		Categories.render(ajaxify.data.categoriesTree);
 
-		$('button[data-action="create"]').on('click', Categories.throwCreateModal);
+		$('[data-action="create"]').on('click', Categories.throwCreateModal);
+		$('[data-action="add"]').on('click', Categories.throwAddModal);
 
 		// Enable/Disable toggle events
 		$('.categories').on('click', '.category-tools [data-action="toggle"]', function () {
-			var $this = $(this);
-			var cid = $this.attr('data-disable-cid');
-			var parentEl = $this.parents('li[data-cid="' + cid + '"]');
-			var disabled = parentEl.hasClass('disabled');
-			var childrenEls = parentEl.find('li[data-cid]');
-			var childrenCids = childrenEls.map(function () {
+			const $this = $(this);
+			const cid = $this.attr('data-disable-cid');
+			const parentEl = $this.parents('li[data-cid="' + cid + '"]');
+			const disabled = parentEl.hasClass('disabled');
+			const childrenEls = parentEl.find('li[data-cid]');
+			const childrenCids = childrenEls.map(function () {
 				return $(this).attr('data-cid');
 			}).get();
 
@@ -39,30 +43,34 @@ define('admin/manage/categories', [
 		});
 
 		$('.categories').on('click', '.toggle', function () {
-			var el = $(this);
-			el.find('i').toggleClass('fa-minus').toggleClass('fa-plus');
+			const el = $(this);
+			el.find('i').toggleClass('fa-chevron-down').toggleClass('fa-chevron-right');
 			el.closest('[data-cid]').find('> ul[data-cid]').toggleClass('hidden');
+			const hasMoreEl = el.closest('[data-cid]').find('> ul.has-more-categories');
+			if (parseInt(hasMoreEl.attr('data-hasmore'), 10) === 1) {
+				hasMoreEl.toggleClass('hidden');
+			}
 		});
 
-		$('.categories').on('click', '.set-order', function () {
-			var cid = $(this).attr('data-cid');
-			var order = $(this).attr('data-order');
-			var modal = bootbox.dialog({
+		$('.categories').on('click', '.set-order', async function () {
+			const cid = $(this).attr('data-cid');
+			const order = $(this).attr('data-order');
+			const modal = await modals.dialog({
 				title: '[[admin/manage/categories:set-order]]',
-				message: '<input type="number" min="1" class="form-control input-lg" value=' + order + ' /><p class="help-block">[[admin/manage/categories:set-order-help]]</p>',
+				message: `<input type="number" min="1" class="form-control input-lg" value="${order}" /><p class="form-text">[[admin/manage/categories:set-order-help]]</p>`,
 				show: true,
 				buttons: {
 					save: {
 						label: '[[modules:bootbox.confirm]]',
 						className: 'btn-primary',
 						callback: function () {
-							var val = modal.find('input').val();
+							const val = modal.find('input').val();
 							if (val && cid) {
-								var modified = {};
+								const modified = {};
 								modified[cid] = { order: Math.max(1, parseInt(val, 10)) };
-								api.put('/categories/' + cid, modified[cid]).then(function () {
+								api.put('/categories/' + encodeURIComponent(cid), modified[cid]).then(function () {
 									ajaxify.refresh();
-								}).catch(err => app.alertError(err));
+								}).catch(alerts.error);
 							} else {
 								return false;
 							}
@@ -72,35 +80,53 @@ define('admin/manage/categories', [
 			});
 		});
 
-		$('#collapse-all').on('click', function () {
-			toggleAll(false);
+		$('.categories').on('click', 'a[data-action]', function () {
+			const action = this.getAttribute('data-action');
+			const cid = this.getAttribute('data-cid');
+			switch (action) {
+				case 'remove': {
+					Categories.remove(cid);
+					break;
+				}
+
+				case 'rename': {
+					Categories.rename(cid);
+					break;
+				}
+			}
 		});
 
-		$('#expand-all').on('click', function () {
-			toggleAll(true);
+		$('#toggle-collapse-all').on('click', function () {
+			const $this = $(this);
+			const isCollapsed = parseInt($this.attr('data-collapsed'), 10) === 1;
+			toggleAll(isCollapsed);
+			$this.attr('data-collapsed', isCollapsed ? 0 : 1)
+				.translateText(isCollapsed ?
+					'[[admin/manage/categories:collapse-all]]' :
+					'[[admin/manage/categories:expand-all]]');
 		});
 
 		function toggleAll(expand) {
-			var el = $('.categories .toggle');
-			el.find('i').toggleClass('fa-minus', expand).toggleClass('fa-plus', !expand);
+			const el = $('.categories .toggle');
+			el.find('i').toggleClass('fa-chevron-down', expand).toggleClass('fa-chevron-right', !expand);
 			el.closest('[data-cid]').find('> ul[data-cid]').toggleClass('hidden', !expand);
 		}
 	};
 
 	Categories.throwCreateModal = function () {
-		Benchpress.render('admin/partials/categories/create', {}).then(function (html) {
-			var modal = bootbox.dialog({
+		Benchpress.render('admin/partials/categories/create', {}).then(async (html) => {
+			const modal = await modals.dialog({
 				title: '[[admin/manage/categories:alert.create]]',
 				message: html,
 				buttons: {
 					save: {
-						label: '[[global:save]]',
+						label: '[[global:create]]',
 						className: 'btn-primary',
 						callback: submit,
 					},
 				},
 			});
-			var options = {
+			const options = {
 				localCategories: [
 					{
 						cid: 0,
@@ -108,11 +134,12 @@ define('admin/manage/categories', [
 						icon: 'fa-none',
 					},
 				],
+				template: 'admin/partials/category/selector-dropdown-left',
 			};
-			var parentSelector = categorySelector.init(modal.find('#parentCidGroup [component="category-selector"]'), options);
-			var cloneFromSelector = categorySelector.init(modal.find('#cloneFromCidGroup [component="category-selector"]'), options);
+			const parentSelector = categorySelector.init(modal.find('#parentCidGroup [component="category-selector"]'), options);
+			const cloneFromSelector = categorySelector.init(modal.find('#cloneFromCidGroup [component="category-selector"]'), options);
 			function submit() {
-				var formData = modal.find('form').serializeObject();
+				const formData = modal.find('form').serializeObject();
 				formData.description = '';
 				formData.icon = 'fa-comments';
 				formData.uid = app.user.uid;
@@ -125,8 +152,8 @@ define('admin/manage/categories', [
 			}
 
 			$('#cloneChildren').on('change', function () {
-				var check = $(this);
-				var parentSelect = modal.find('#parentCidGroup [component="category-selector"] .dropdown-toggle');
+				const check = $(this);
+				const parentSelect = modal.find('#parentCidGroup [component="category-selector"] .dropdown-toggle');
 
 				if (check.prop('checked')) {
 					parentSelect.attr('disabled', 'disabled');
@@ -140,13 +167,58 @@ define('admin/manage/categories', [
 		});
 	};
 
+	Categories.throwAddModal = function () {
+		Benchpress.render('admin/partials/categories/add', {}).then(async (html) => {
+			const modal = await modals.dialog({
+				title: '[[admin/manage/categories:alert.add]]',
+				message: html,
+				buttons: {
+					save: {
+						label: '[[global:save]]',
+						className: 'btn-primary',
+						callback: submit,
+					},
+				},
+			});
+
+			function submit() {
+				const formData = modal.find('form').serializeObject();
+				api.post('/api/admin/manage/categories', formData).then(() => {
+					ajaxify.refresh();
+					modal.modal('hide');
+				}).catch(alerts.error);
+				return false;
+			}
+
+			modal.find('form').on('submit', submit);
+		});
+	};
+
+	Categories.remove = function (cid) {
+		modals.confirm('[[admin/manage/categories:alert.confirm-remove]]', (ok) => {
+			if (ok) {
+				api.del(`/api/admin/manage/categories/${encodeURIComponent(cid)}`).then(ajaxify.refresh);
+			}
+		});
+	};
+
+	Categories.rename = function (cid) {
+		modals.prompt({
+			title: '[[admin/manage/categories:alert.rename]]',
+			message: '<p class="mb-3">[[admin/manage/categories:alert.rename-help]]</p>',
+			callback: (name) => {
+				api.post(`/api/admin/manage/categories/${encodeURIComponent(cid)}/name`, { name }).then(ajaxify.refresh);
+			},
+		});
+	};
+
 	Categories.create = function (payload) {
 		api.post('/categories', payload, function (err, data) {
 			if (err) {
-				return app.alertError(err.message);
+				return alerts.error(err);
 			}
 
-			app.alert({
+			alerts.alert({
 				alert_id: 'category_created',
 				title: '[[admin/manage/categories:alert.created]]',
 				message: '[[admin/manage/categories:alert.create-success]]',
@@ -159,56 +231,78 @@ define('admin/manage/categories', [
 	};
 
 	Categories.render = function (categories) {
-		var container = $('.categories');
+		const container = $('.categories');
 
 		if (!categories || !categories.length) {
-			translator.translate('[[admin/manage/categories:alert.none-active]]', function (text) {
-				$('<div></div>')
-					.addClass('alert alert-info text-center')
-					.text(text)
-					.appendTo(container);
-			});
+			$('<div></div>')
+				.addClass('alert alert-info text-center')
+				.translateText('[[admin/manage/categories:alert.none-active]]')
+				.appendTo(container);
 		} else {
 			sortables = {};
-			renderList(categories, container, 0);
+			renderList(categories, container, { cid: 0 });
 		}
 	};
 
 	Categories.toggle = function (cids, disabled) {
-		const listEl = document.querySelector('.categories ul');
-		Promise.all(cids.map(cid => api.put('/categories/' + cid, {
+		const listEl = document.querySelector('.categories [data-cid="0"]');
+		Promise.all(cids.map(cid => api.put('/categories/' + encodeURIComponent(cid), {
 			disabled: disabled ? 1 : 0,
 		}).then(() => {
 			const categoryEl = listEl.querySelector(`li[data-cid="${cid}"]`);
 			categoryEl.classList[disabled ? 'add' : 'remove']('disabled');
-			$(categoryEl).find('li a[data-action="toggle"]').first().translateText(disabled ? '[[admin/manage/categories:enable]]' : '[[admin/manage/categories:disable]]');
-		}).catch(app.alertError)));
+			$(categoryEl).find('li a[data-action="toggle"]').first()
+				.translateText(disabled ?
+					'[[admin/manage/categories:enable]]' :
+					'[[admin/manage/categories:disable]]'
+				);
+		}).catch(alerts.error)));
 	};
 
 	function itemDidAdd(e) {
-		newCategoryId = e.to.dataset.cid;
+		newCategoryId = String(e.to.dataset.cid);
 	}
 
 	function itemDragDidEnd(e) {
-		var isCategoryUpdate = parseInt(newCategoryId, 10) !== -1;
+		const isCategoryUpdate = String(newCategoryId) !== '-1';
 
 		// Update needed?
 		if ((e.newIndex != null && parseInt(e.oldIndex, 10) !== parseInt(e.newIndex, 10)) || isCategoryUpdate) {
-			var cid = e.item.dataset.cid;
-			var modified = {};
+			const cid = String(e.item.dataset.cid);
+			const modified = {};
 			// on page 1 baseIndex is 0, on page n baseIndex is (n - 1) * ajaxify.data.categoriesPerPage
 			// this makes sure order is correct when drag & drop is used on pages > 1
-			var baseIndex = (ajaxify.data.pagination.currentPage - 1) * ajaxify.data.categoriesPerPage;
+			const baseIndex = (ajaxify.data.pagination.currentPage - 1) * ajaxify.data.categoriesPerPage;
 			modified[cid] = {
 				order: baseIndex + e.newIndex + 1,
 			};
 
 			if (isCategoryUpdate) {
 				modified[cid].parentCid = newCategoryId;
+
+				// Show/hide expand buttons after drag completion
+				const oldParentCid = String(e.from.getAttribute('data-cid') || '');
+				const newParentCid = String(e.to.getAttribute('data-cid') || '');
+				if (oldParentCid !== newParentCid) {
+					const toggle = document.querySelector(`.categories li[data-cid="${newParentCid}"] .toggle`);
+					if (toggle) {
+						toggle.classList.toggle('invisible', false);
+					}
+
+					const children = document.querySelectorAll(`.categories li[data-cid="${oldParentCid}"] ul[data-cid] li[data-cid]`);
+					if (!children.length) {
+						const toggle = document.querySelector(`.categories li[data-cid="${oldParentCid}"] .toggle`);
+						if (toggle) {
+							toggle.classList.toggle('invisible', true);
+						}
+					}
+
+					e.item.dataset.parentCid = newParentCid;
+				}
 			}
 
 			newCategoryId = -1;
-			api.put('/categories/' + cid, modified[cid]);
+			api.put('/categories/' + encodeURIComponent(cid), modified[cid]).catch(alerts.error);
 		}
 	}
 
@@ -220,50 +314,42 @@ define('admin/manage/categories', [
 	 * @param container {object} parent jquery element for the list
 	 * @param parentId {number} parent category identifier
 	 */
-	function renderList(categories, container, parentId) {
-		// Translate category names if needed
-		var count = 0;
-		categories.forEach(function (category, idx, parent) {
-			translator.translate(category.name, function (translated) {
-				if (category.name !== translated) {
-					category.name = translated;
-				}
-				count += 1;
+	function renderList(categories, container, parentCategory) {
+		const parentId = parentCategory.cid;
 
-				if (count === parent.length) {
-					continueRender();
-				}
+		app.parseAndTranslate('admin/partials/categories/category-rows', {
+			cid: parentCategory.cid,
+			categories: categories,
+			parentCategory: parentCategory,
+		}, function (html) {
+			if (container.find('.category-row').length) {
+				container.find('.category-row').after(html);
+			} else {
+				container.append(html);
+			}
+
+			// Disable expand toggle
+			if (!categories.length) {
+				const toggleEl = container.get(0).querySelector('.toggle');
+				toggleEl.classList.toggle('invisible', true);
+			}
+
+			// Handle and children categories in this level have
+			for (let x = 0, numCategories = categories.length; x < numCategories; x += 1) {
+				renderList(categories[x].children, $('li[data-cid="' + categories[x].cid + '"]'), categories[x]);
+			}
+
+			// Make list sortable
+			sortables[parentId] = Sortable.create($('ul[data-cid="' + parentId + '"]')[0], {
+				group: 'cross-categories',
+				animation: 150,
+				handle: '.information',
+				dataIdAttr: 'data-cid',
+				ghostClass: 'placeholder',
+				onAdd: itemDidAdd,
+				onEnd: itemDragDidEnd,
 			});
 		});
-
-		if (!categories.length) {
-			continueRender();
-		}
-
-		function continueRender() {
-			app.parseAndTranslate('admin/partials/categories/category-rows', {
-				cid: parentId,
-				categories: categories,
-			}, function (html) {
-				container.append(html);
-
-				// Handle and children categories in this level have
-				for (var x = 0, numCategories = categories.length; x < numCategories; x += 1) {
-					renderList(categories[x].children, $('li[data-cid="' + categories[x].cid + '"]'), categories[x].cid);
-				}
-
-				// Make list sortable
-				sortables[parentId] = Sortable.create($('ul[data-cid="' + parentId + '"]')[0], {
-					group: 'cross-categories',
-					animation: 150,
-					handle: '.information',
-					dataIdAttr: 'data-cid',
-					ghostClass: 'placeholder',
-					onAdd: itemDidAdd,
-					onEnd: itemDragDidEnd,
-				});
-			});
-		}
 	}
 
 	return Categories;

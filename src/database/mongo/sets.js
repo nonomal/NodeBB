@@ -1,7 +1,9 @@
 'use strict';
 
 module.exports = function (module) {
+	const _ = require('lodash');
 	const helpers = require('./helpers');
+	const { secureRandom } = require('../../utils');
 
 	module.setAdd = async function (key, value) {
 		if (!Array.isArray(value)) {
@@ -12,17 +14,25 @@ module.exports = function (module) {
 		}
 		value = value.map(v => helpers.valueToString(v));
 
-		await module.client.collection('objects').updateOne({
-			_key: key,
-		}, {
-			$addToSet: {
-				members: {
-					$each: value,
+		try {
+			await module.client.collection('objects').updateOne({
+				_key: key,
+			}, {
+				$addToSet: {
+					members: {
+						$each: value,
+					},
 				},
-			},
-		}, {
-			upsert: true,
-		});
+			}, {
+				upsert: true,
+			});
+		} catch (err) {
+			if (err && err.message.includes('E11000 duplicate key error')) {
+				console.log(new Error('e11000').stack, key, value);
+				return await module.setAdd(key, value);
+			}
+			throw err;
+		}
 	};
 
 	module.setsAdd = async function (keys, value) {
@@ -50,31 +60,64 @@ module.exports = function (module) {
 		try {
 			await bulk.execute();
 		} catch (err) {
-			if (err && err.message.startsWith('E11000 duplicate key error')) {
+			if (err && err.message.includes('E11000 duplicate key error')) {
+				console.log(new Error('e11000').stack, keys, value);
 				return await module.setsAdd(keys, value);
 			}
 			throw err;
 		}
 	};
 
-	module.setRemove = async function (key, value) {
-		if (!Array.isArray(value)) {
-			value = [value];
+	module.setAddBulk = async function (data) {
+		if (!data.length) {
+			return;
 		}
 
-		value = value.map(v => helpers.valueToString(v));
+		const bulk = module.client.collection('objects').initializeUnorderedBulkOp();
 
-		await module.client.collection('objects').updateMany({ _key: Array.isArray(key) ? { $in: key } : key }, { $pullAll: { members: value } });
+		data.forEach(([key, member]) => {
+			bulk.find({ _key: key }).upsert().updateOne({
+				$addToSet: {
+					members: helpers.valueToString(member),
+				},
+			});
+		});
+		try {
+			await bulk.execute();
+		} catch (err) {
+			if (err && err.message.includes('E11000 duplicate key error')) {
+				console.log(new Error('e11000').stack, data);
+				return await module.setAddBulk(data);
+			}
+			throw err;
+		}
+	};
+
+	module.setRemove = async function (key, value) {
+		await bulkSetRemove(key, value);
 	};
 
 	module.setsRemove = async function (keys, value) {
 		if (!Array.isArray(keys) || !keys.length) {
 			return;
 		}
-		value = helpers.valueToString(value);
-
-		await module.client.collection('objects').updateMany({ _key: { $in: keys } }, { $pull: { members: value } });
+		await bulkSetRemove(keys, value);
 	};
+
+	async function bulkSetRemove(key, values) {
+		const isKeyArray = Array.isArray(key);
+		if (!key || (isKeyArray && !key.length)) return;
+
+		const filterKey = isKeyArray ? { $in: key } : key;
+		const update = Array.isArray(values) ?
+			{ $pullAll: { members: values.map(helpers.valueToString) } } :
+			{ $pull: { members: helpers.valueToString(values) } };
+
+		await module.client.collection('objects').bulkWrite([
+			{ updateMany: { filter: { _key: filterKey }, update: update } },
+			{ deleteMany: { filter: { _key: filterKey, members: [] } } },
+		], { ordered: true });
+	}
 
 	module.isSetMember = async function (key, value) {
 		if (!key) {
@@ -82,7 +125,13 @@ module.exports = function (module) {
 		}
 		value = helpers.valueToString(value);
 
-		const item = await module.client.collection('objects').findOne({ _key: key, members: value }, { projection: { _id: 0, members: 0 } });
+		const item = await module.client.collection('objects').findOne({
+			_key: key, members: value,
+		}, {
+			projection: { _id: 0, _key: 1 },
+			hint: { members: 1, _key: 1 },
+		});
+
 		return item !== null && item !== undefined;
 	};
 
@@ -90,11 +139,35 @@ module.exports = function (module) {
 		if (!key || !Array.isArray(values) || !values.length) {
 			return [];
 		}
-		values = values.map(v => helpers.valueToString(v));
+		const stringValues = values.map(v => helpers.valueToString(v));
 
-		const result = await module.client.collection('objects').findOne({ _key: key }, { projection: { _id: 0, _key: 0 } });
-		const membersSet = new Set(result && Array.isArray(result.members) ? result.members : []);
-		return values.map(v => membersSet.has(v));
+		const pipeline = [
+			{
+				$match: {
+					_key: key,
+					members: { $in: stringValues, $exists: true }, // Trigger the partial index
+				},
+			},
+			{
+				$project: {
+					_id: 0,
+					results: {
+						$map: {
+							input: stringValues,
+							as: 'val',
+							in: { $in: ['$$val', '$members'] },
+						},
+					},
+				},
+			},
+		];
+
+		const [doc] = await module.client.collection('objects')
+			.aggregate(
+				pipeline,
+				{ hint: { members: 1, _key: 1 } }
+			).toArray();
+		return doc ? doc.results : values.map(() => false);
 	};
 
 	module.isMemberOfSets = async function (sets, value) {
@@ -103,14 +176,15 @@ module.exports = function (module) {
 		}
 		value = helpers.valueToString(value);
 
-		const result = await module.client.collection('objects').find({ _key: { $in: sets }, members: value }, { projection: { _id: 0, members: 0 } }).toArray();
+		const result = await module.client.collection('objects').find({
+			_key: { $in: sets }, members: value,
+		}, {
+			projection: { _id: 0, _key: 1 },
+			hint: { members: 1, _key: 1 },
+		}).toArray();
 
-		const map = {};
-		result.forEach((item) => {
-			map[item._key] = true;
-		});
-
-		return sets.map(set => !!map[set]);
+		const foundMembers = new Set(result.map(item => item._key));
+		return sets.map(set => foundMembers.has(set));
 	};
 
 	module.getSetMembers = async function (key) {
@@ -118,7 +192,12 @@ module.exports = function (module) {
 			return [];
 		}
 
-		const data = await module.client.collection('objects').findOne({ _key: key }, { projection: { _id: 0, _key: 0 } });
+		const data = await module.client.collection('objects').findOne({
+			_key: key,
+		}, {
+			projection: { _id: 0, members: 1 },
+			hint: { _key:1, score: -1 },
+		});
 		return data ? data.members : [];
 	};
 
@@ -126,9 +205,14 @@ module.exports = function (module) {
 		if (!Array.isArray(keys) || !keys.length) {
 			return [];
 		}
-		const data = await module.client.collection('objects').find({ _key: { $in: keys } }, { projection: { _id: 0 } }).toArray();
+		const data = await module.client.collection('objects').find({
+			_key: { $in: keys },
+		}, {
+			projection: { _id: 0 },
+			hint: { _key: 1, score: -1 },
+		}).toArray();
 
-		const sets = {};
+		const sets = Object.create(null);
 		data.forEach((set) => {
 			sets[set._key] = set.members || [];
 		});
@@ -140,14 +224,20 @@ module.exports = function (module) {
 		if (!key) {
 			return 0;
 		}
-		const data = await module.client.collection('objects').findOne({ _key: key }, { projection: { _id: 0 } });
-		return data ? data.members.length : 0;
+		const data = await module.client.collection('objects').aggregate([
+			{ $match: { _key: key } },
+			{ $project: { _id: 0, count: { $size: '$members' } } },
+		], { hint: { _key: 1, score: -1 } }).toArray();
+		return Array.isArray(data) && data.length ? data[0].count : 0;
 	};
 
 	module.setsCount = async function (keys) {
-		const setsMembers = await module.getSetsMembers(keys);
-		const counts = setsMembers.map(members => (members && members.length) || 0);
-		return counts;
+		const data = await module.client.collection('objects').aggregate([
+			{ $match: { _key: { $in: keys } } },
+			{ $project: { _id: 0, _key: 1, count: { $size: '$members' } } },
+		], { hint: { _key: 1, score: -1 } }).toArray();
+		const map = _.keyBy(data, '_key');
+		return keys.map(key => (map.hasOwnProperty(key) ? map[key].count : 0));
 	};
 
 	module.setRemoveRandom = async function (key) {
@@ -156,7 +246,7 @@ module.exports = function (module) {
 			return;
 		}
 
-		const randomIndex = Math.floor(Math.random() * data.members.length);
+		const randomIndex = secureRandom(0, data.members.length - 1);
 		const value = data.members[randomIndex];
 		await module.setRemove(data._key, value);
 		return value;

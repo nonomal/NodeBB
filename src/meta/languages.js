@@ -4,13 +4,8 @@ const _ = require('lodash');
 const nconf = require('nconf');
 const path = require('path');
 const fs = require('fs');
-const util = require('util');
-let mkdirp = require('mkdirp');
+const { mkdirp } = require('mkdirp');
 
-mkdirp = mkdirp.hasOwnProperty('native') ? mkdirp : util.promisify(mkdirp);
-const rimraf = require('rimraf');
-
-const rimrafAsync = util.promisify(rimraf);
 
 const file = require('../file');
 const Plugins = require('../plugins');
@@ -18,6 +13,8 @@ const { paths } = require('../constants');
 
 const buildLanguagesPath = path.join(paths.baseDir, 'build/public/language');
 const coreLanguagesPath = path.join(paths.baseDir, 'public/language');
+
+let allLanguages = {};
 
 async function getTranslationMetadata() {
 	const paths = await file.walk(coreLanguagesPath);
@@ -88,18 +85,31 @@ async function buildTranslations(ref) {
 
 async function buildNamespaceLanguage(lang, namespace, plugins) {
 	const translations = {};
-	// core first
-	await assignFileToTranslations(translations, path.join(coreLanguagesPath, lang, `${namespace}.json`));
+	// core first, en-GB fills keys that are missing or untranslated in lang
+	await assignFileToTranslations(translations, path.join(coreLanguagesPath, 'en-GB', `${namespace}.json`));
+	if (lang !== 'en-GB') {
+		await assignFileToTranslations(translations, path.join(coreLanguagesPath, lang, `${namespace}.json`));
+	}
 
 	await Promise.all(plugins.map(pluginData => addPlugin(translations, pluginData, lang, namespace)));
 
 	if (Object.keys(translations).length) {
 		await writeLanguageFile(lang, namespace, translations);
+		allLanguages[lang] = allLanguages[lang] || { full: {}, client: {} };
+		allLanguages[lang].full[namespace] = translations;
+		if (!namespace.startsWith('admin/')) {
+			allLanguages[lang].client[namespace] = translations;
+		}
 	}
 }
 
 async function addPlugin(translations, pluginData, lang, namespace) {
-	const pluginLanguages = path.join(paths.nodeModules, pluginData.id, pluginData.languages);
+	// if plugin doesn't have this namespace no need to continue
+	if (pluginData.languageData && !pluginData.languageData.namespaces.includes(namespace)) {
+		return;
+	}
+
+	const pathToPluginLanguageFolder = path.join(paths.nodeModules, pluginData.id, pluginData.languages);
 	const defaultLang = pluginData.defaultLang || 'en-GB';
 
 	// for each plugin, fallback in this order:
@@ -116,14 +126,16 @@ async function addPlugin(translations, pluginData, lang, namespace) {
 
 	for (const language of langs) {
 		/* eslint-disable no-await-in-loop */
-		await assignFileToTranslations(translations, path.join(pluginLanguages, language, `${namespace}.json`));
+		await assignFileToTranslations(translations, path.join(pathToPluginLanguageFolder, language, `${namespace}.json`));
 	}
 }
 
 async function assignFileToTranslations(translations, path) {
 	try {
 		const fileData = await fs.promises.readFile(path, 'utf8');
-		Object.assign(translations, JSON.parse(fileData));
+		// Transifex exports untranslated strings as "", which must not override a fallback
+		const entries = Object.entries(JSON.parse(fileData)).filter(([, value]) => value !== '');
+		Object.assign(translations, Object.fromEntries(entries));
 	} catch (err) {
 		if (err.code !== 'ENOENT') {
 			throw err;
@@ -132,7 +144,24 @@ async function assignFileToTranslations(translations, path) {
 }
 
 exports.build = async function buildLanguages() {
-	await rimrafAsync(buildLanguagesPath);
+	allLanguages = {};
+	await fs.promises.rm(buildLanguagesPath, { recursive: true, force: true });
 	const data = await getTranslationMetadata();
 	await buildTranslations(data);
+
+	for (const lang of Object.keys(allLanguages)) {
+		const jsonfilePath = path.join(buildLanguagesPath, lang, `full.json`);
+		const jsFilePath = path.join(buildLanguagesPath, lang, `full.min.js`);
+		const clientJsonFilePath = path.join(buildLanguagesPath, lang, `client.json`);
+		const clientJsFilePath = path.join(buildLanguagesPath, lang, `client.min.js`);
+		await mkdirp(path.dirname(jsonfilePath));
+		const fullJsonStr = JSON.stringify(allLanguages[lang].full);
+		const clientJsonStr = JSON.stringify(allLanguages[lang].client);
+		await Promise.all([
+			fs.promises.writeFile(jsonfilePath, fullJsonStr),
+			fs.promises.writeFile(jsFilePath, `window._i18n = ${fullJsonStr}`),
+			fs.promises.writeFile(clientJsonFilePath, clientJsonStr),
+			fs.promises.writeFile(clientJsFilePath, `window._i18n = ${clientJsonStr}`),
+		]);
+	}
 };

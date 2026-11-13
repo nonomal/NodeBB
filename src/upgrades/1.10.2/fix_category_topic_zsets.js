@@ -1,6 +1,5 @@
 'use strict';
 
-const async = require('async');
 const db = require('../../database');
 
 const batch = require('../../batch');
@@ -8,32 +7,28 @@ const batch = require('../../batch');
 module.exports = {
 	name: 'Fix category topic zsets',
 	timestamp: Date.UTC(2018, 9, 11),
-	method: function (callback) {
+	method: async function () {
 		const { progress } = this;
 
 		const topics = require('../../topics');
-		batch.processSortedSet('topics:tid', (tids, next) => {
-			async.eachSeries(tids, (tid, next) => {
-				progress.incr();
-
-				async.waterfall([
-					function (next) {
-						db.getObjectFields(`topic:${tid}`, ['cid', 'pinned', 'postcount'], next);
-					},
-					function (topicData, next) {
-						if (parseInt(topicData.pinned, 10) === 1) {
-							return setImmediate(next);
-						}
-						topicData.postcount = parseInt(topicData.postcount, 10) || 0;
-						db.sortedSetAdd(`cid:${topicData.cid}:tids:posts`, topicData.postcount, tid, next);
-					},
-					function (next) {
-						topics.updateLastPostTimeFromLastPid(tid, next);
-					},
-				], next);
-			}, next);
+		progress.total = await db.sortedSetCard('topics:tid');
+		await batch.processSortedSet('topics:tid', async (tids) => {
+			progress.incr(tids.length);
+			const topicData = await db.getObjectsFields(
+				tids.map(tid => `topic:${tid}`),
+				['tid', 'cid', 'pinned', 'postcount'],
+			);
+			const bulkAdd = [];
+			topicData.forEach((topic) => {
+				if (topic && parseInt(topic.pinned, 10) !== 1) {
+					topic.postcount = parseInt(topic.postcount, 10) || 0;
+					bulkAdd.push([`cid:${topic.cid}:tids:posts`, topic.postcount, topic.tid]);
+				}
+			});
+			await db.sortedSetAddBulk(bulkAdd);
+			await Promise.all(tids.map(tid => topics.updateLastPostTimeFromLastPid(tid)));
 		}, {
-			progress: progress,
-		}, callback);
+			batch: 500,
+		});
 	},
 };

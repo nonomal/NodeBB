@@ -1,12 +1,12 @@
 'use strict';
 
-define('accounts/delete', ['api', 'bootbox'], function (api) {
-	var Delete = {};
+define('accounts/delete', ['api', 'modals', 'alerts'], function (api, modals, alerts) {
+	const Delete = {};
 
 	Delete.account = function (uid, callback) {
 		executeAction(
 			uid,
-			'[[user:delete_this_account_confirm]]',
+			'[[user:delete-this-account-confirm]]',
 			'/account',
 			'[[user:account-deleted]]',
 			callback
@@ -16,7 +16,7 @@ define('accounts/delete', ['api', 'bootbox'], function (api) {
 	Delete.content = function (uid, callback) {
 		executeAction(
 			uid,
-			'[[user:delete_account_content_confirm]]',
+			'[[user:delete-account-content-confirm]]',
 			'/content',
 			'[[user:account-content-deleted]]',
 			callback
@@ -26,7 +26,7 @@ define('accounts/delete', ['api', 'bootbox'], function (api) {
 	Delete.purge = function (uid, callback) {
 		executeAction(
 			uid,
-			'[[user:delete_all_confirm]]',
+			'[[user:delete-all-confirm]]',
 			'',
 			'[[user:account-deleted]]',
 			callback
@@ -34,20 +34,18 @@ define('accounts/delete', ['api', 'bootbox'], function (api) {
 	};
 
 	function executeAction(uid, confirmText, path, successText, callback) {
-		bootbox.confirm(confirmText, function (confirm) {
+		modals.confirm(confirmText, function (confirm) {
 			if (!confirm) {
 				return;
 			}
 
-			api.del(`/users/${uid}${path}`, {}).then(() => {
-				app.alertSuccess(successText);
+			api.del(`/users/${encodeURIComponent(uid)}${path}`, {}).then(() => {
+				alerts.success(successText);
 
 				if (typeof callback === 'function') {
 					return callback();
 				}
-			}).catch(function (err) {
-				app.alertError(err);
-			});
+			}).catch(alerts.error);
 		});
 	}
 

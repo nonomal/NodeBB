@@ -1,16 +1,24 @@
 'use strict';
 
-const util = require('util');
 const winston = require('winston');
 const plugins = require('.');
 const utils = require('../utils');
+const als = require('../als');
 
 const Hooks = module.exports;
 
-Hooks.deprecatedHooks = {
-	'filter:email.send': 'static:email.send',	// 👋 @ 1.18.0
-	'filter:router.page': 'response:router.page',	// 👋 @ 2.0.0
-};
+Hooks._deprecated = new Map([
+	/* ['filter:old.hook.name', {
+		new: 'filter:new.hook.name',
+		since: 'v4.0.0',
+		until: 'v5.0.0',
+	}], */
+	['action:topic.purge', {
+		new: 'action:topics.purge',
+		since: 'v4.9.0',
+		until: 'v5.0.0',
+	}],
+]);
 
 Hooks.internals = {
 	_register: function (data) {
@@ -39,14 +47,13 @@ Hooks.register = function (id, data) {
 	}
 
 	// `hasOwnProperty` needed for hooks with no alternative (set to null)
-	if (Hooks.deprecatedHooks.hasOwnProperty(data.hook)) {
-		const deprecated = Hooks.deprecatedHooks[data.hook];
-
-		if (deprecated) {
-			winston.warn(`[plugins/${id}] Hook "${data.hook}" is deprecated, please use "${deprecated}" instead.`);
-		} else {
-			winston.warn(`[plugins/${id}] Hook "${data.hook}" is deprecated, there is no alternative.`);
+	if (Hooks._deprecated.has(data.hook)) {
+		const deprecation = Hooks._deprecated.get(data.hook);
+		if (!deprecation.hasOwnProperty('affected')) {
+			deprecation.affected = new Set();
 		}
+		deprecation.affected.add(id);
+		Hooks._deprecated.set(data.hook, deprecation);
 	}
 
 	data.id = id;
@@ -88,13 +95,18 @@ Hooks.unregister = function (id, hook, method) {
 Hooks.fire = async function (hook, params) {
 	const hookList = plugins.loadedHooks[hook];
 	const hookType = hook.split(':')[0];
-	if (global.env === 'development' && hook !== 'action:plugins.firehook' && hook !== 'filter:plugins.firehook') {
-		winston.verbose(`[plugins/fireHook] ${hook}`);
+	if (process.env.NODE_ENV === 'development' && hook !== 'action:plugins.firehook' && hook !== 'filter:plugins.firehook') {
+		winston.debug(`[plugins/fireHook] ${hook}`);
 	}
 
 	if (!hookTypeToMethod[hookType]) {
 		winston.warn(`[plugins] Unknown hookType: ${hookType}, hook : ${hook}`);
 		return;
+	}
+	let deleteCaller = false;
+	if (params && typeof params === 'object' && !Array.isArray(params) && !params.hasOwnProperty('caller')) {
+		params.caller = als.getStore();
+		deleteCaller = true;
 	}
 	const result = await hookTypeToMethod[hookType](hook, hookList, params);
 
@@ -103,6 +115,9 @@ Hooks.fire = async function (hook, params) {
 		Hooks.fire('action:plugins.firehook', payload);
 	}
 	if (result !== undefined) {
+		if (deleteCaller && result && result.hasOwnProperty('caller')) {
+			delete result.caller;
+		}
 		return result;
 	}
 };
@@ -111,47 +126,52 @@ Hooks.hasListeners = function (hook) {
 	return !!(plugins.loadedHooks[hook] && plugins.loadedHooks[hook].length > 0);
 };
 
+function hookHandlerPromise(hook, hookObj, params) {
+	return new Promise((resolve, reject) => {
+		let resolved = false;
+		function _resolve(result) {
+			if (resolved) {
+				winston.warn(`[plugins] ${hook} already resolved in plugin ${hookObj.id}`);
+				return;
+			}
+			resolved = true;
+			resolve(result);
+		}
+		const returned = hookObj.method(params, (err, result) => {
+			if (err) reject(err); else _resolve(result);
+		});
+
+		if (utils.isPromise(returned)) {
+			returned.then(
+				payload => _resolve(payload),
+				err => reject(err)
+			);
+			return;
+		}
+
+		if (hook.startsWith('filter:') && returned !== undefined) {
+			_resolve(returned);
+		} else if (hook.startsWith('static:') && hookObj.method.length <= 1) {
+			// make sure it is resolved if static hook doesn't use callback
+			_resolve();
+		}
+	});
+}
+
 async function fireFilterHook(hook, hookList, params) {
 	if (!Array.isArray(hookList) || !hookList.length) {
 		return params;
 	}
 
 	async function fireMethod(hookObj, params) {
-		if (typeof hookObj.method !== 'function') {
-			if (global.env === 'development') {
-				winston.warn(`[plugins] Expected method for hook '${hook}' in plugin '${hookObj.id}' not found, skipping.`);
-			}
+		if (!isHookValid(hook, hookObj)) {
 			return params;
 		}
 
 		if (hookObj.method.constructor && hookObj.method.constructor.name === 'AsyncFunction') {
 			return await hookObj.method(params);
 		}
-		return new Promise((resolve, reject) => {
-			let resolved = false;
-			function _resolve(result) {
-				if (resolved) {
-					winston.warn(`[plugins] ${hook} already resolved in plugin ${hookObj.id}`);
-					return;
-				}
-				resolved = true;
-				resolve(result);
-			}
-			const returned = hookObj.method(params, (err, result) => {
-				if (err) reject(err); else _resolve(result);
-			});
-
-			if (utils.isPromise(returned)) {
-				returned.then(
-					payload => _resolve(payload),
-					err => reject(err)
-				);
-				return;
-			}
-			if (returned) {
-				_resolve(returned);
-			}
-		});
+		return hookHandlerPromise(hook, hookObj, params);
 	}
 
 	for (const hookObj of hookList) {
@@ -166,50 +186,23 @@ async function fireActionHook(hook, hookList, params) {
 		return;
 	}
 	for (const hookObj of hookList) {
-		if (typeof hookObj.method !== 'function') {
-			if (global.env === 'development') {
-				winston.warn(`[plugins] Expected method for hook '${hook}' in plugin '${hookObj.id}' not found, skipping.`);
+		if (isHookValid(hook, hookObj)) {
+			try {
+				// eslint-disable-next-line
+				await hookObj.method(params);
+			} catch (err) {
+				winston.error(`[plugins] Error in hook ${hookObj.id}@${hookObj.hook} \n${err.stack}`);
 			}
-		} else {
-			// eslint-disable-next-line
-			await hookObj.method(params);
 		}
 	}
 }
 
-async function fireStaticHook(hook, hookList, params) {
-	if (!Array.isArray(hookList) || !hookList.length) {
-		return;
+function isHookValid(hook, hookObj) {
+	const isValid = typeof hookObj.method === 'function';
+	if (!isValid && process.env.NODE_ENV === 'development') {
+		winston.warn(`[plugins] Expected method for hook '${hook}' in plugin '${hookObj.id}' not found, skipping.`);
 	}
-	// don't bubble errors from these hooks, so bad plugins don't stop startup
-	const noErrorHooks = ['static:app.load', 'static:assets.prepare', 'static:app.preload'];
-
-	for (const hookObj of hookList) {
-		if (typeof hookObj.method !== 'function') {
-			if (global.env === 'development') {
-				winston.warn(`[plugins] Expected method for hook '${hook}' in plugin '${hookObj.id}' not found, skipping.`);
-			}
-		} else {
-			let hookFn = hookObj.method;
-			if (hookFn.constructor && hookFn.constructor.name !== 'AsyncFunction') {
-				hookFn = util.promisify(hookFn);
-			}
-
-			try {
-				// eslint-disable-next-line
-				await timeout(hookFn(params), 5000, 'timeout');
-			} catch (err) {
-				if (err && err.message === 'timeout') {
-					winston.warn(`[plugins] Callback timed out, hook '${hook}' in plugin '${hookObj.id}'`);
-				} else {
-					winston.error(`[plugins] Error executing '${hook}' in plugin '${hookObj.id}'\n${err.stack}`);
-					if (!noErrorHooks.includes(hook)) {
-						throw err;
-					}
-				}
-			}
-		}
-	}
+	return isValid;
 }
 
 // https://advancedweb.hu/how-to-add-timeout-to-a-promise-in-javascript/
@@ -223,21 +216,55 @@ const timeout = (prom, time, error) => {
 	]).finally(() => clearTimeout(timer));
 };
 
+async function fireStaticHook(hook, hookList, params) {
+	if (!Array.isArray(hookList) || !hookList.length) {
+		return;
+	}
+	// don't bubble errors from these hooks, so bad plugins don't stop startup
+	const noErrorHooks = ['static:app.load', 'static:assets.prepare', 'static:app.preload'];
+
+	async function fireMethod(hookObj, params) {
+		if (!isHookValid(hook, hookObj)) {
+			return params;
+		}
+
+		if (hookObj.method.constructor && hookObj.method.constructor.name === 'AsyncFunction') {
+			return timeout(hookObj.method(params), 10000, 'timeout');
+		}
+
+		return hookHandlerPromise(hook, hookObj, params);
+	}
+
+	for (const hookObj of hookList) {
+		try {
+			// eslint-disable-next-line
+			await fireMethod(hookObj, params);
+		} catch (err) {
+			if (err && err.message === 'timeout') {
+				winston.warn(`[plugins] Callback timed out, hook '${hook}' in plugin '${hookObj.id}'`);
+			} else {
+				if (!noErrorHooks.includes(hook)) {
+					throw err;
+				}
+
+				winston.error(`[plugins] Error executing '${hook}' in plugin '${hookObj.id}'\n${err.stack}`);
+			}
+		}
+	}
+}
+
 async function fireResponseHook(hook, hookList, params) {
 	if (!Array.isArray(hookList) || !hookList.length) {
 		return;
 	}
 	for (const hookObj of hookList) {
-		if (typeof hookObj.method !== 'function') {
-			if (global.env === 'development') {
-				winston.warn(`[plugins] Expected method for hook '${hook}' in plugin '${hookObj.id}' not found, skipping.`);
-			}
-		} else {
+		if (isHookValid(hook, hookObj)) {
 			// Skip remaining hooks if headers have been sent
 			if (params.res.headersSent) {
 				return;
 			}
-			// eslint-disable-next-line
+
+			// eslint-disable-next-line no-await-in-loop
 			await hookObj.method(params);
 		}
 	}

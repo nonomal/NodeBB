@@ -6,27 +6,59 @@ define('admin/manage/category', [
 	'categorySelector',
 	'benchpress',
 	'api',
-], function (uploader, iconSelect, categorySelector, Benchpress, api) {
-	var	Category = {};
-	var updateHash = {};
+	'modals',
+	'translator',
+	'alerts',
+	'admin/settings',
+], function (uploader, iconSelect, categorySelector, Benchpress, api, modals, translator, alerts, settings) {
+	const Category = {};
+	let updateHash = {};
 
 	Category.init = function () {
-		$('#category-settings select').each(function () {
-			var $this = $(this);
+		const categorySettings = $('#category-settings');
+		const previewEl = $('[component="category/preview"]');
+		categorySettings.find('select').each(function () {
+			const $this = $(this);
 			$this.val($this.attr('data-value'));
 		});
 
-		categorySelector.init($('[component="category-selector"]'), {
+		// category switcher
+		categorySelector.init($('[component="settings/main/header"] [component="category-selector"]'), {
 			onSelect: function (selectedCategory) {
 				ajaxify.go('admin/manage/categories/' + selectedCategory.cid);
 			},
+			cacheList: false,
 			showLinks: true,
+			template: 'admin/partials/category/selector-dropdown-right',
+		});
+
+		// parent selector
+		categorySelector.init($('#parent-category-selector [component="category-selector"]'), {
+			onSelect: function (selectedCategory) {
+				const parentCidInput = $('#parent-cid');
+				parentCidInput.val(selectedCategory.cid);
+				modified(parentCidInput[0]);
+			},
+			selectedCategory: ajaxify.data.category.parent, // switch selection to parent
+			localCategories: [
+				{
+					cid: 0,
+					name: '[[admin/manage/categories:parent-category-none]]',
+					icon: 'fa-list',
+				},
+			],
+			cacheList: false,
+			showLinks: true,
+			template: 'admin/partials/category/selector-dropdown-right',
 		});
 
 		handleTags();
 
-		$('#category-settings input, #category-settings select, #category-settings textarea').on('change', function (ev) {
+		categorySettings.find('input, select, textarea').on('change', function (ev) {
 			modified(ev.target);
+		});
+		$('[type="checkbox"]').on('change', function () {
+			modified($(this));
 		});
 
 		$('[data-name="imageClass"]').on('change', function () {
@@ -34,8 +66,7 @@ define('admin/manage/category', [
 		});
 
 		$('[data-name="bgColor"], [data-name="color"]').on('input', function () {
-			var $inputEl = $(this);
-			var previewEl = $inputEl.parents('[data-cid]').find('.category-preview');
+			const $inputEl = $(this);
 			if ($inputEl.attr('data-name') === 'bgColor') {
 				previewEl.css('background-color', $inputEl.val());
 			} else if ($inputEl.attr('data-name') === 'color') {
@@ -46,34 +77,28 @@ define('admin/manage/category', [
 		});
 
 		$('#save').on('click', function () {
-			var tags = $('#tag-whitelist').val() ? $('#tag-whitelist').val().split(',') : [];
+			const tags = $('#tag-whitelist').val() ? $('#tag-whitelist').val().split(',') : [];
 			if (tags.length && tags.length < parseInt($('#cid-min-tags').val(), 10)) {
-				return app.alertError('[[admin/manage/categories:alert.not-enough-whitelisted-tags]]');
+				return alerts.error('[[admin/manage/categories:alert.not-enough-whitelisted-tags]]');
 			}
 
-			var cid = ajaxify.data.category.cid;
-			api.put('/categories/' + cid, updateHash).then((res) => {
+			const cid = ajaxify.data.category.cid;
+			api.put('/categories/' + cid, updateHash).then(() => {
 				app.flags._unsaved = false;
-				app.alert({
-					title: 'Updated Categories',
-					message: 'Category "' + res.name + '" was successfully updated.',
-					type: 'success',
-					timeout: 5000,
-				});
+				settings.toggleSaveSuccess($('#save'));
 				updateHash = {};
-			}).catch(app.alertError);
+			}).catch(alerts.error);
 
 			return false;
 		});
 
-		$('.purge').on('click', function (e) {
+		$('.purge').on('click', async function (e) {
 			e.preventDefault();
-
 			Benchpress.render('admin/partials/categories/purge', {
 				name: ajaxify.data.category.name,
 				topic_count: ajaxify.data.category.topic_count,
-			}).then(function (html) {
-				var modal = bootbox.dialog({
+			}).then(async function (html) {
+				const modal = await modals.dialog({
 					title: '[[admin/manage/categories:purge]]',
 					message: html,
 					size: 'large',
@@ -84,19 +109,25 @@ define('admin/manage/category', [
 							callback: function () {
 								modal.find('.modal-footer button').prop('disabled', true);
 
-								var intervalId = setInterval(function () {
-									socket.emit('categories.getTopicCount', ajaxify.data.category.cid, function (err, count) {
-										if (err) {
-											return app.alertError(err);
-										}
+								const intervalId = setInterval(async () => {
+									if (!ajaxify.data.category) {
+										// Already navigated away
+										return;
+									}
 
-										var percent = 0;
+									try {
+										const { count } = await api.get(`/categories/${ajaxify.data.category.cid}/count`);
+
+										let percent = 0;
 										if (ajaxify.data.category.topic_count > 0) {
 											percent = Math.max(0, (1 - (count / ajaxify.data.category.topic_count))) * 100;
 										}
 
 										modal.find('.progress-bar').css({ width: percent + '%' });
-									});
+									} catch (err) {
+										clearInterval(intervalId);
+										alerts.error(err);
+									}
 								}, 1000);
 
 								api.del('/categories/' + ajaxify.data.category.cid).then(() => {
@@ -104,9 +135,11 @@ define('admin/manage/category', [
 										clearInterval(intervalId);
 									}
 									modal.modal('hide');
-									app.alertSuccess('[[admin/manage/categories:alert.purge-success]]');
-									ajaxify.go('admin/manage/categories');
-								}).catch(app.alertError);
+									alerts.success('[[admin/manage/categories:alert.purge-success]]');
+									setTimeout(() => {
+										ajaxify.go('admin/manage/categories');
+									}, 2500);
+								}).catch(alerts.error);
 
 								return false;
 							},
@@ -117,17 +150,17 @@ define('admin/manage/category', [
 		});
 
 		$('.copy-settings').on('click', function () {
-			Benchpress.render('admin/partials/categories/copy-settings', {}).then(function (html) {
-				var selectedCid;
-				var modal = bootbox.dialog({
-					title: '[[modules:composer.select_category]]',
+			Benchpress.render('admin/partials/categories/copy-settings', {}).then(async (html) => {
+				let selectedCid;
+				const modal = await modals.dialog({
+					title: '[[modules:composer.select-category]]',
 					message: html,
 					buttons: {
 						save: {
 							label: '[[modules:bootbox.confirm]]',
 							className: 'btn-primary',
 							callback: function () {
-								if (!selectedCid || parseInt(selectedCid, 10) === parseInt(ajaxify.data.category.cid, 10)) {
+								if (!selectedCid || String(selectedCid) === String(ajaxify.data.category.cid)) {
 									return;
 								}
 
@@ -137,11 +170,11 @@ define('admin/manage/category', [
 									copyParent: modal.find('#copyParent').prop('checked'),
 								}, function (err) {
 									if (err) {
-										return app.alertError(err.message);
+										return alerts.error(err);
 									}
 
 									modal.modal('hide');
-									app.alertSuccess('[[admin/manage/categories:alert.copy-success]]');
+									alert.success('[[admin/manage/categories:alert.copy-success]]');
 									ajaxify.refresh();
 								});
 								return false;
@@ -164,8 +197,8 @@ define('admin/manage/category', [
 		});
 
 		$('.upload-button').on('click', function () {
-			var inputEl = $(this);
-			var cid = inputEl.attr('data-cid');
+			const inputEl = $(this);
+			const cid = inputEl.attr('data-cid');
 
 			uploader.show({
 				title: '[[admin/manage/categories:alert.upload-image]]',
@@ -173,70 +206,57 @@ define('admin/manage/category', [
 				params: { cid: cid },
 			}, function (imageUrlOnServer) {
 				$('#category-image').val(imageUrlOnServer);
-				var previewBox = inputEl.parent().parent().siblings('.category-preview');
-				previewBox.css('background', 'url(' + imageUrlOnServer + '?' + new Date().getTime() + ')');
+				previewEl.css('background-image', `url(${imageUrlOnServer}?v=${Date.now()})`);
 
 				modified($('#category-image'));
 			});
 		});
 
 		$('#category-image').on('change', function () {
-			$('.category-preview').css('background-image', $(this).val() ? ('url("' + $(this).val() + '")') : '');
+			previewEl.css('background-image', $(this).val() ? ('url("' + $(this).val() + '")') : '');
 			modified($('#category-image'));
 		});
 
 		$('.delete-image').on('click', function (e) {
 			e.preventDefault();
-
-			var inputEl = $('#category-image');
-			var previewBox = $('.category-preview');
-
+			const inputEl = $('#category-image');
 			inputEl.val('');
-			previewBox.css('background-image', '');
+			previewEl.css('background-image', '');
 			modified(inputEl[0]);
-			$(this).parent().addClass('hide').hide();
 		});
 
-		$('.category-preview').on('click', function () {
+		previewEl.on('click', function () {
 			iconSelect.init($(this).find('i'), modified);
 		});
 
-		$('[type="checkbox"]').on('change', function () {
-			modified($(this));
-		});
-
-		$('button[data-action="setParent"], button[data-action="changeParent"]').on('click', Category.launchParentSelector);
-		$('button[data-action="removeParent"]').on('click', function () {
-			api.put('/categories/' + ajaxify.data.category.cid, {
-				parentCid: 0,
-			}).then(() => {
-				$('button[data-action="removeParent"]').parent().addClass('hide');
-				$('button[data-action="changeParent"]').parent().addClass('hide');
-				$('button[data-action="setParent"]').removeClass('hide');
-			}).catch(app.alertError);
-		});
 		$('button[data-action="toggle"]').on('click', function () {
-			var $this = $(this);
-			var disabled = $this.attr('data-disabled') === '1';
+			const $this = $(this);
+			const disabled = $this.attr('data-disabled') === '1';
 			api.put('/categories/' + ajaxify.data.category.cid, {
 				disabled: disabled ? 0 : 1,
 			}).then(() => {
-				$this.translateText(!disabled ? '[[admin/manage/categories:enable]]' : '[[admin/manage/categories:disable]]');
-				$this.toggleClass('btn-primary', !disabled).toggleClass('btn-danger', disabled);
+				$this.find('.label').translateText(
+					!disabled ?
+						'[[admin/manage/categories:enable]]' :
+						'[[admin/manage/categories:disable]]'
+				);
+				$this.find('i')
+					.toggleClass(['fa-check', 'text-success'], !disabled)
+					.toggleClass(['fa-ban', 'text-danger'], disabled);
 				$this.attr('data-disabled', disabled ? 0 : 1);
-			}).catch(app.alertError);
+			}).catch(alerts.error);
 		});
 	};
 
 	function modified(el) {
-		var value;
+		let value;
 		if ($(el).is(':checkbox')) {
 			value = $(el).is(':checked') ? 1 : 0;
 		} else {
 			value = $(el).val();
 		}
-		var dataName = $(el).attr('data-name');
-		var fields = dataName.match(/[^\][.]+/g);
+		const dataName = $(el).attr('data-name');
+		const fields = dataName.match(/[^\][.]+/g);
 
 		function setNestedFields(obj, index) {
 			if (index === fields.length) {
@@ -262,8 +282,9 @@ define('admin/manage/category', [
 	}
 
 	function handleTags() {
-		var tagEl = $('#tag-whitelist');
+		const tagEl = $('#tag-whitelist');
 		tagEl.tagsinput({
+			tagClass: 'badge bg-info',
 			confirmKeys: [13, 44],
 			trimValue: true,
 		});
@@ -276,31 +297,6 @@ define('admin/manage/category', [
 			modified(tagEl);
 		});
 	}
-
-	Category.launchParentSelector = function () {
-		categorySelector.modal({
-			onSubmit: function (selectedCategory) {
-				var parentCid = selectedCategory.cid;
-				if (!parentCid) {
-					return;
-				}
-				api.put('/categories/' + ajaxify.data.category.cid, {
-					parentCid: parentCid,
-				}).then(() => {
-					api.get(`/categories/${parentCid}`, {}).then(function (parent) {
-						if (parent && parent.icon && parent.name) {
-							var buttonHtml = '<i class="fa ' + parent.icon + '"></i> ' + parent.name;
-							$('button[data-action="changeParent"]').html(buttonHtml).parent().removeClass('hide');
-						}
-					});
-
-					$('button[data-action="removeParent"]').parent().removeClass('hide');
-					$('button[data-action="setParent"]').addClass('hide');
-				}).catch(app.alertError);
-			},
-			showLinks: true,
-		});
-	};
 
 	return Category;
 });

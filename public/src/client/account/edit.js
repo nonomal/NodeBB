@@ -6,97 +6,116 @@ define('forum/account/edit', [
 	'translator',
 	'api',
 	'hooks',
-], function (header, picture, translator, api, hooks) {
-	var AccountEdit = {};
+	'modals',
+	'alerts',
+	'admin/modules/change-email',
+], function (header, picture, translator, api, hooks, modals, alerts, changeEmail) {
+	const AccountEdit = {};
 
 	AccountEdit.init = function () {
 		header.init();
 
 		$('#submitBtn').on('click', updateProfile);
 
-		app.loadJQueryUI(function () {
-			$('#inputBirthday').datepicker({
-				changeMonth: true,
-				changeYear: true,
-				yearRange: '1900:-5y',
-				defaultDate: '-13y',
-			});
-		});
+		if (ajaxify.data.groupTitleArray.length === 1 && ajaxify.data.groupTitleArray[0] === '') {
+			$('#groupTitle option[value=""]').attr('selected', true);
+		}
 
-		handleImageChange();
 		handleAccountDelete();
 		handleEmailConfirm();
 		updateSignature();
 		updateAboutMe();
-		handleGroupSort();
+		handleGroupControls();
+
+		if (!ajaxify.data.isSelf && ajaxify.data.canEdit) {
+			$(`a[href="${config.relative_path}/user/${ajaxify.data.userslug}/edit/email"]`).on('click', () => {
+				api.post(`/users/reauth/verify`).then(() => {
+					changeEmail.init({
+						uid: ajaxify.data.uid,
+						email: ajaxify.data.email,
+						onSuccess: function (newEmail) {
+							ajaxify.data.email = newEmail;
+							alerts.success('[[user:email-updated]]');
+						},
+					});
+				}).catch(alerts.error);
+				return false;
+			});
+		}
 	};
 
 	function updateProfile() {
-		const userData = $('form[component="profile/edit/form"]').serializeObject();
+		function getGroupSelection() {
+			const els = $('[component="group/badge/list"] [component="group/badge/item"][data-selected="true"]');
+			return els.map((i, el) => $(el).attr('data-value')).get();
+		}
+		const editForm = $('form[component="profile/edit/form"]');
+		const userData = editForm.serializeObject();
+
+		// stringify multi selects
+		editForm.find('select[multiple]').each((i, el) => {
+			const name = $(el).attr('name');
+			if (userData[name] && !Array.isArray(userData[name])) {
+				userData[name] = [userData[name]];
+			}
+			userData[name] = JSON.stringify(userData[name] || []);
+		});
+
 		userData.uid = ajaxify.data.uid;
-		userData.groupTitle = JSON.stringify(
-			Array.isArray(userData.groupTitle) ? userData.groupTitle : [userData.groupTitle]
-		);
+		userData.groupTitle = userData.groupTitle || '';
+		userData.groupTitle = JSON.stringify(getGroupSelection());
 
 		hooks.fire('action:profile.update', userData);
 
 		api.put('/users/' + userData.uid, userData).then((res) => {
-			app.alertSuccess('[[user:profile_update_success]]');
+			alerts.success('[[user:profile-update-success]]');
 
 			if (res.picture) {
 				$('#user-current-picture').attr('src', res.picture);
 			}
 
 			picture.updateHeader(res.picture);
-		}).catch(app.alertError);
+		}).catch(alerts.error);
 
 		return false;
 	}
 
-	function handleImageChange() {
-		$('#changePictureBtn').on('click', function () {
-			picture.openChangeModal();
-			return false;
-		});
-	}
+
 
 	function handleAccountDelete() {
-		$('#deleteAccountBtn').on('click', function () {
-			translator.translate('[[user:delete_account_confirm]]', function (translated) {
-				var modal = bootbox.confirm(translated + '<p><input type="password" class="form-control" id="confirm-password" /></p>', function (confirm) {
-					if (!confirm) {
-						return;
+		$('#deleteAccountBtn').on('click', async function () {
+			const modal = await modals.confirm('<p>[[user:delete-account-confirm]]</p><p><input type="password" class="form-control" id="confirm-password" /></p>', function (confirm) {
+				if (!confirm) {
+					return;
+				}
+
+				const confirmBtn = modal.find('.btn-primary');
+				confirmBtn.html('<i class="fa fa-spinner fa-spin"></i>');
+				confirmBtn.prop('disabled', true);
+				api.del(`/users/${ajaxify.data.uid}/account`, {
+					password: $('#confirm-password').val(),
+				}, function (err) {
+					function restoreButton() {
+						translator.translate('[[modules:bootbox.confirm]]', function (confirmText) {
+							confirmBtn.text(confirmText);
+							confirmBtn.prop('disabled', false);
+						});
 					}
 
-					var confirmBtn = modal.find('.btn-primary');
-					confirmBtn.html('<i class="fa fa-spinner fa-spin"></i>');
-					confirmBtn.prop('disabled', true);
+					if (err) {
+						restoreButton();
+						return alerts.error(err);
+					}
 
-					socket.emit('user.deleteAccount', {
-						password: $('#confirm-password').val(),
-					}, function (err) {
-						function restoreButton() {
-							translator.translate('[[modules:bootbox.confirm]]', function (confirmText) {
-								confirmBtn.text(confirmText);
-								confirmBtn.prop('disabled', false);
-							});
-						}
-
-						if (err) {
-							restoreButton();
-							return app.alertError(err.message);
-						}
-
-						confirmBtn.html('<i class="fa fa-check"></i>');
-						app.logout();
-					});
-
-					return false;
+					confirmBtn.html('<i class="fa fa-check"></i>');
+					window.location.href = `${config.relative_path}/`;
 				});
 
-				modal.on('shown.bs.modal', function () {
-					modal.find('input').focus();
-				});
+				return false;
+			});
+
+			modal.on('shown.bs.modal', function () {
+				modal.find('input').focus();
 			});
 			return false;
 		});
@@ -104,13 +123,13 @@ define('forum/account/edit', [
 
 	function handleEmailConfirm() {
 		$('#confirm-email').on('click', function () {
-			var btn = $(this).attr('disabled', true);
+			const btn = $(this).attr('disabled', true);
 			socket.emit('user.emailConfirm', {}, function (err) {
 				btn.removeAttr('disabled');
 				if (err) {
-					return app.alertError(err.message);
+					return alerts.error(err);
 				}
-				app.alertSuccess('[[notifications:email-confirm-sent]]');
+				alerts.success('[[notifications:email-confirm-sent]]');
 			});
 		});
 	}
@@ -120,43 +139,51 @@ define('forum/account/edit', [
 	}
 
 	function updateSignature() {
-		var el = $('#signature');
-		$('#signatureCharCountLeft').html(getCharsLeft(el, ajaxify.data.maximumSignatureLength));
+		const el = $('#signature');
+		$('#signatureCharCountLeft').text(getCharsLeft(el, ajaxify.data.maximumSignatureLength));
 
 		el.on('keyup change', function () {
-			$('#signatureCharCountLeft').html(getCharsLeft(el, ajaxify.data.maximumSignatureLength));
+			$('#signatureCharCountLeft').text(getCharsLeft(el, ajaxify.data.maximumSignatureLength));
 		});
 	}
 
 	function updateAboutMe() {
-		var el = $('#aboutme');
-		$('#aboutMeCharCountLeft').html(getCharsLeft(el, ajaxify.data.maximumAboutMeLength));
+		const el = $('#aboutme');
+		$('#aboutMeCharCountLeft').text(getCharsLeft(el, ajaxify.data.maximumAboutMeLength));
 
 		el.on('keyup change', function () {
-			$('#aboutMeCharCountLeft').html(getCharsLeft(el, ajaxify.data.maximumAboutMeLength));
+			$('#aboutMeCharCountLeft').text(getCharsLeft(el, ajaxify.data.maximumAboutMeLength));
 		});
 	}
 
-	function handleGroupSort() {
-		function move(direction) {
-			var selected = $('#groupTitle').val();
-			if (!ajaxify.data.allowMultipleBadges || (Array.isArray(selected) && selected.length > 1)) {
-				return;
+	function handleGroupControls() {
+		const { allowMultipleBadges } = ajaxify.data;
+		$('[component="group/toggle/hide"]').on('click', function () {
+			const groupEl = $(this).parents('[component="group/badge/item"]');
+			groupEl.attr('data-selected', 'false');
+			$(this).addClass('hidden');
+			groupEl.find('[component="group/toggle/show"]').removeClass('hidden');
+		});
+
+		$('[component="group/toggle/show"]').on('click', function () {
+			if (!allowMultipleBadges) {
+				$('[component="group/badge/list"] [component="group/toggle/show"]').removeClass('hidden');
+				$('[component="group/badge/list"] [component="group/toggle/hide"]').addClass('hidden');
+				$('[component="group/badge/list"] [component="group/badge/item"]').attr('data-selected', 'false');
 			}
-			var el = $('#groupTitle').find(':selected');
-			if (el.length && el.val()) {
-				if (direction > 0) {
-					el.insertAfter(el.next());
-				} else if (el.prev().val()) {
-					el.insertBefore(el.prev());
-				}
-			}
-		}
+			const groupEl = $(this).parents('[component="group/badge/item"]');
+			groupEl.attr('data-selected', 'true');
+			$(this).addClass('hidden');
+			groupEl.find('[component="group/toggle/hide"]').removeClass('hidden');
+		});
+
 		$('[component="group/order/up"]').on('click', function () {
-			move(-1);
+			const el = $(this).parents('[component="group/badge/item"]');
+			el.insertBefore(el.prev());
 		});
 		$('[component="group/order/down"]').on('click', function () {
-			move(1);
+			const el = $(this).parents('[component="group/badge/item"]');
+			el.insertAfter(el.next());
 		});
 	}
 

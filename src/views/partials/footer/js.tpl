@@ -1,3 +1,4 @@
+<script defer src="{relative_path}/assets/language/{config.userLang}/client.min.js?{config.cache-buster}"></script>
 <script defer src="{relative_path}/assets/nodebb.min.js?{config.cache-buster}"></script>
 
 {{{each scripts}}}
@@ -12,9 +13,9 @@
     }
 
     function prepareFooter() {
-        <!-- IF useCustomJS -->
+        {{{ if useCustomJS }}}
         {{customJS}}
-        <!-- ENDIF useCustomJS -->
+        {{{ end }}}
 
         $(document).ready(function () {
             app.coldLoad();

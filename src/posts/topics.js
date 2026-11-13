@@ -2,12 +2,14 @@
 'use strict';
 
 const topics = require('../topics');
+const user = require('../user');
 const utils = require('../utils');
 
 module.exports = function (Posts) {
 	Posts.getPostsFromSet = async function (set, start, stop, uid, reverse) {
 		const pids = await Posts.getPidsFromSet(set, start, stop, reverse);
-		return await Posts.getPostsByPids(pids, uid);
+		const posts = await Posts.getPostsByPids(pids, uid);
+		return await user.blocks.filter(uid, posts);
 	};
 
 	Posts.isMain = async function (pids) {
@@ -15,7 +17,7 @@ module.exports = function (Posts) {
 		pids = isArray ? pids : [pids];
 		const postData = await Posts.getPostsFields(pids, ['tid']);
 		const topicData = await topics.getTopicsFields(postData.map(t => t.tid), ['mainPid']);
-		const result = pids.map((pid, i) => parseInt(pid, 10) === parseInt(topicData[i].mainPid, 10));
+		const result = pids.map((pid, i) => String(pid) === String(topicData[i].mainPid));
 		return isArray ? result : result[0];
 	};
 
@@ -42,7 +44,8 @@ module.exports = function (Posts) {
 			const postIndex = utils.isNumber(indices[index]) ? parseInt(indices[index], 10) + 1 : null;
 
 			if (slug && postIndex) {
-				return `/topic/${slug}/${postIndex}`;
+				const index = postIndex === 1 ? '' : `/${postIndex}`;
+				return `/topic/${slug}${index}`;
 			}
 			return null;
 		});

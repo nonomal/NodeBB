@@ -2,15 +2,10 @@
 'use strict';
 
 const fs = require('fs');
-const util = require('util');
 const path = require('path');
-const os = require('os');
 const nconf = require('nconf');
 const express = require('express');
-
-const app = express();
-app.renderAsync = util.promisify((tpl, data, callback) => app.render(tpl, data, callback));
-let server;
+const chalk = require('chalk').default;
 const winston = require('winston');
 const flash = require('connect-flash');
 const bodyParser = require('body-parser');
@@ -18,12 +13,13 @@ const cookieParser = require('cookie-parser');
 const session = require('express-session');
 const useragent = require('express-useragent');
 const favicon = require('serve-favicon');
-const detector = require('spider-detector');
+const detector = require('@nodebb/spider-detector');
 const helmet = require('helmet');
 
 const Benchpress = require('benchpressjs');
 const db = require('./database');
 const analytics = require('./analytics');
+const errors = require('./meta/errors');
 const file = require('./file');
 const emailer = require('./emailer');
 const meta = require('./meta');
@@ -31,11 +27,40 @@ const logger = require('./logger');
 const plugins = require('./plugins');
 const flags = require('./flags');
 const topicEvents = require('./topics/events');
+const privileges = require('./privileges');
 const routes = require('./routes');
 const auth = require('./routes/authentication');
+const helpers = require('./helpers');
+const user = require('./user');
+const languages = require('./languages');
+const als = require('./als');
 
-const helpers = require('../public/src/modules/helpers');
+const app = express();
 
+app.renderAsync = async (tpl, data) => {
+	let renderData = data;
+	if (!Object.hasOwn(data, '_i18n')) {
+		const store = als.getStore();
+		if (!store) {
+			const stack = new Error().stack.split('\n')[2];
+			winston.warn(`[app.renderAsync] No ALS store found, unable to determine user language for template rendering, using default language instead. Template: ${tpl}\n${stack}`);
+		}
+		const uid = store?.uid || 0;
+		const { userLang, acpLang } = await user.getSettings(uid);
+		renderData = {
+			...renderData,
+			_i18n: languages.getFull(tpl.startsWith('admin/') ? acpLang : userLang),
+		};
+	}
+	return new Promise((resolve, reject) => {
+		app.render(tpl, renderData, (err, html) => {
+			if (err) return reject(err);
+			resolve(html);
+		});
+	});
+};
+
+let server;
 if (nconf.get('ssl')) {
 	server = require('https').createServer({
 		key: fs.readFileSync(nconf.get('ssl').key),
@@ -68,11 +93,20 @@ server.on('connection', (conn) => {
 	});
 });
 
-exports.destroy = function (callback) {
-	server.close(callback);
-	for (const connection of Object.values(connections)) {
-		connection.destroy();
-	}
+exports.destroy = function () {
+	return new Promise((resolve, reject) => {
+		server.close((err) => {
+			if (err) reject(err);
+			else resolve();
+		});
+		for (const connection of Object.values(connections)) {
+			connection.destroy();
+		}
+	});
+};
+
+exports.getConnectionCount = function () {
+	return Object.keys(connections).length;
 };
 
 exports.listen = async function () {
@@ -81,12 +115,9 @@ exports.listen = async function () {
 	helpers.register();
 	logger.init(app);
 	await initializeNodeBB();
-	winston.info('NodeBB Ready');
+	winston.info('🎉 NodeBB Ready');
 
-	require('./socket.io').server.emit('event:nodebb.ready', {
-		'cache-buster': meta.config['cache-buster'],
-		hostname: os.hostname(),
-	});
+	require('./socket.io').server.emit('event:nodebb.ready', {});
 
 	plugins.hooks.fire('action:nodebb.ready');
 
@@ -103,10 +134,15 @@ async function initializeNodeBB() {
 		middleware: middleware,
 	});
 	await routes(app, middleware);
+	await privileges.init();
 	await meta.blacklist.load();
 	await flags.init();
 	await analytics.init();
+	await errors.init();
 	await topicEvents.init();
+	if (nconf.get('runJobs')) {
+		await require('./widgets').moveMissingAreasToDrafts();
+	}
 }
 
 function setupExpressApp(app) {
@@ -123,12 +159,18 @@ function setupExpressApp(app) {
 	});
 	app.set('view engine', 'tpl');
 	app.set('views', viewsDir);
-	app.set('json spaces', global.env === 'development' ? 4 : 0);
+	app.set('json spaces', process.env.NODE_ENV === 'development' ? 4 : 0);
+
+	// https://github.com/NodeBB/NodeBB/issues/13918
+	const qs = require('qs');
+	app.set('query parser', str => qs.parse(str, {
+		arrayLimit: Math.min(100, nconf.get('queryParser:arrayLimit') || 50),
+	}));
 	app.use(flash());
 
 	app.enable('view cache');
 
-	if (global.env !== 'development') {
+	if (process.env.NODE_ENV !== 'development') {
 		app.enable('cache');
 		app.enable('minification');
 	}
@@ -136,6 +178,14 @@ function setupExpressApp(app) {
 	if (meta.config.useCompression) {
 		const compression = require('compression');
 		app.use(compression());
+	}
+	if (relativePath) {
+		app.use((req, res, next) => {
+			if (!req.path.startsWith(relativePath)) {
+				return require('./controllers/helpers').redirect(res, req.path);
+			}
+			next();
+		});
 	}
 
 	app.get(`${relativePath}/ping`, pingController.ping);
@@ -148,15 +198,8 @@ function setupExpressApp(app) {
 	configureBodyParser(app);
 
 	app.use(cookieParser(nconf.get('secret')));
-	const userAgentMiddleware = useragent.express();
-	app.use((req, res, next) => {
-		userAgentMiddleware(req, res, next);
-	});
-	const spiderDetectorMiddleware = detector.middleware();
-	app.use((req, res, next) => {
-		spiderDetectorMiddleware(req, res, next);
-	});
-
+	app.use(useragent.express());
+	app.use(detector.middleware());
 	app.use(session({
 		store: db.sessionStore,
 		secret: nconf.get('secret'),
@@ -171,7 +214,14 @@ function setupExpressApp(app) {
 	app.use(middleware.addHeaders);
 	app.use(middleware.processRender);
 	auth.initialize(app, middleware);
-	app.use(middleware.autoLocale);	// must be added after auth middlewares are added
+	const als = require('./als');
+	const apiHelpers = require('./api/helpers');
+	app.use((req, res, next) => {
+		als.run({
+			uid: req.uid,
+			req: apiHelpers.buildReqObject(req),
+		}, next);
+	});
 
 	const toobusy = require('toobusy-js');
 	toobusy.maxLag(meta.config.eventLoopLagThreshold);
@@ -179,22 +229,28 @@ function setupExpressApp(app) {
 }
 
 function setupHelmet(app) {
-	app.use(helmet.dnsPrefetchControl());
-	app.use(helmet.expectCt());
-	app.use(helmet.frameguard());
-	app.use(helmet.hidePoweredBy());
-	app.use(helmet.ieNoOpen());
-	app.use(helmet.noSniff());
-	app.use(helmet.permittedCrossDomainPolicies());
-	app.use(helmet.xssFilter());
+	const options = {
+		contentSecurityPolicy: false, // defaults are too restrive and break plugins that load external assets... 🔜
+		crossOriginOpenerPolicy: { policy: meta.config['cross-origin-opener-policy'] },
+		crossOriginResourcePolicy: { policy: meta.config['cross-origin-resource-policy'] },
+		referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+		crossOriginEmbedderPolicy: !!meta.config['cross-origin-embedder-policy'],
+	};
 
-	app.use(helmet.referrerPolicy({ policy: 'strict-origin-when-cross-origin' }));
 	if (meta.config['hsts-enabled']) {
-		app.use(helmet.hsts({
-			maxAge: meta.config['hsts-maxage'],
+		options.strictTransportSecurity = {
+			maxAge: Math.max(0, meta.config['hsts-maxage']),
 			includeSubDomains: !!meta.config['hsts-subdomains'],
 			preload: !!meta.config['hsts-preload'],
-		}));
+		};
+	} else {
+		options.strictTransportSecurity = false;
+	}
+
+	try {
+		app.use(helmet(options));
+	} catch (err) {
+		winston.error(`[startup] unable to initialize helmet \n${err.stack}`);
 	}
 }
 
@@ -202,6 +258,9 @@ function setupHelmet(app) {
 function setupFavicon(app) {
 	let faviconPath = meta.config['brand:favicon'] || 'favicon.ico';
 	faviconPath = path.join(nconf.get('base_dir'), 'public', faviconPath.replace(/assets\/uploads/, 'uploads'));
+	if (!file.isPathInside(nconf.get('upload_path'), faviconPath)) {
+		faviconPath = path.join(nconf.get('base_dir'), 'public', 'favicon.ico');
+	}
 	if (file.existsSync(faviconPath)) {
 		app.use(nconf.get('relative_path'), favicon(faviconPath));
 	}
@@ -214,7 +273,18 @@ function configureBodyParser(app) {
 	}
 	app.use(bodyParser.urlencoded(urlencodedOpts));
 
-	const jsonOpts = nconf.get('bodyParser:json') || {};
+	const jsonOpts = {
+		type: [
+			'application/json',
+			'application/ld+json',
+			'application/activity+json',
+		],
+		limit: '1mb',
+		verify: (req, res, buf) => {
+			req.rawBody = buf;
+		},
+		...nconf.get('bodyParser:json'),
+	};
 	app.use(bodyParser.json(jsonOpts));
 }
 
@@ -246,9 +316,16 @@ async function listen() {
 		}
 	}
 	port = parseInt(port, 10);
-	if ((port !== 80 && port !== 443) || nconf.get('trust_proxy') === true) {
-		winston.info('Enabling \'trust proxy\'');
-		app.enable('trust proxy');
+
+	let trust_proxy = nconf.get('trust_proxy');
+	if (trust_proxy == null) {
+		trust_proxy = false;
+		winston.warn("[startup] 'trust_proxy' is not configured, so Express proxy trust is disabled by default. Set 'trust_proxy' in config.json only when NodeBB is behind a reverse proxy that strips or overwrites X-Forwarded-For from untrusted clients.");
+	}
+	if (trust_proxy != null) {
+		const trustProxyPrefix = trust_proxy ? '🤝' : '❌';
+		winston.info(`${trustProxyPrefix} Setting 'trust proxy' to ${JSON.stringify(trust_proxy)}`);
+		app.set('trust proxy', trust_proxy);
 	}
 
 	if ((port === 80 || port === 443) && process.env.NODE_ENV !== 'development') {
@@ -273,11 +350,12 @@ async function listen() {
 		server.listen(...args.concat([function (err) {
 			const onText = `${isSocket ? socketPath : `${bind_address}:${port}`}`;
 			if (err) {
-				winston.error(`[startup] NodeBB was unable to listen on: ${onText}`);
+				winston.error(`[startup] NodeBB was unable to listen on: ${chalk.yellow(onText)}`);
 				reject(err);
 			}
 
-			winston.info(`NodeBB is now listening on: ${onText}`);
+			winston.info(`📡 NodeBB is now listening on: ${chalk.yellow(onText)}`);
+			winston.info(`🔗 Canonical URL: ${chalk.yellow(nconf.get('url'))}`);
 			if (oldUmask) {
 				process.umask(oldUmask);
 			}

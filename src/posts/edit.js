@@ -1,6 +1,5 @@
 'use strict';
 
-const validator = require('validator');
 const _ = require('lodash');
 
 const db = require('../database');
@@ -12,14 +11,12 @@ const plugins = require('../plugins');
 const pubsub = require('../pubsub');
 const utils = require('../utils');
 const slugify = require('../slugify');
-const translator = require('../translator');
 
 module.exports = function (Posts) {
-	pubsub.on('post:edit', (pid) => {
-		require('./cache').del(pid);
-	});
+	pubsub.on('post:edit', pid => Posts.clearCachedPost(pid));
 
 	Posts.edit = async function (data) {
+		const { _activitypub } = data;
 		const canEdit = await privileges.posts.canEdit(data.pid, data.uid);
 		if (!canEdit.flag) {
 			throw new Error(canEdit.message);
@@ -29,11 +26,14 @@ module.exports = function (Posts) {
 			throw new Error('[[error:no-post]]');
 		}
 
-		const topicData = await topics.getTopicFields(postData.tid, ['cid', 'mainPid', 'title', 'timestamp', 'scheduled', 'slug']);
+		const topicData = await topics.getTopicFields(postData.tid, [
+			'cid', 'mainPid', 'title', 'timestamp', 'scheduled', 'slug', 'tags', 'thumbs',
+		]);
 
 		await scheduledTopicCheck(data, topicData);
 
-		const oldContent = postData.content; // for diffing purposes
+		data.content = data.content === null ? postData.content : data.content;
+		const oldContent = postData.sourceContent || postData.content; // for diffing purposes
 		const editPostData = getEditPostData(data, topicData, postData);
 
 		if (data.handle) {
@@ -47,20 +47,26 @@ module.exports = function (Posts) {
 			uid: data.uid,
 		});
 
+		// needs to be before editMainPost, otherwise scheduled topics use wrong timestamp
+		await Posts.setPostFields(data.pid, result.post);
+
 		const [editor, topic] = await Promise.all([
 			user.getUserFields(data.uid, ['username', 'userslug']),
 			editMainPost(data, postData, topicData),
 		]);
+		const newContent = data.sourceContent || data.content;
+		const contentChanged = (newContent !== oldContent) ||
+			topic.renamed ||
+			topic.tagsupdated;
 
-		await Posts.setPostFields(data.pid, result.post);
-
-		if (meta.config.enablePostHistory === 1) {
+		if (meta.config.enablePostHistory === 1 && contentChanged) {
 			await Posts.diffs.save({
 				pid: data.pid,
 				uid: data.uid,
 				oldContent: oldContent,
-				newContent: data.content,
+				newContent: newContent,
 				edited: editPostData.edited,
+				topic,
 			});
 		}
 		await Posts.uploads.sync(data.pid);
@@ -72,20 +78,30 @@ module.exports = function (Posts) {
 		returnPostData.cid = topic.cid;
 		returnPostData.topic = topic;
 		returnPostData.editedISO = utils.toISOString(editPostData.edited);
-		returnPostData.changed = oldContent !== data.content;
+		returnPostData.changed = newContent !== oldContent;
+		returnPostData.oldContent = oldContent;
+		returnPostData.newContent = data.content;
+		delete returnPostData.ip;
 
-		await topics.notifyFollowers(returnPostData, data.uid, {
-			type: 'post-edit',
-			bodyShort: translator.compile('notifications:user_edited_post', editor.username, topic.title),
-			nid: `edit_post:${data.pid}:uid:${data.uid}`,
+		await topics.syncBacklinks(returnPostData);
+
+		plugins.hooks.fire('action:post.edit', {
+			post: { ...returnPostData, _activitypub },
+			data: data,
+			uid: data.uid,
 		});
 
-		plugins.hooks.fire('action:post.edit', { post: _.clone(returnPostData), data: data, uid: data.uid });
-
-		require('./cache').del(String(postData.pid));
+		Posts.clearCachedPost(String(postData.pid));
 		pubsub.publish('post:edit', String(postData.pid));
 
 		await Posts.parsePost(returnPostData);
+
+		if (contentChanged) {
+			await topics.notifyFollowers(returnPostData, data.uid, {
+				type: 'post-edit',
+				nid: `edit_post:${data.pid}:uid:${data.uid}`,
+			});
+		}
 
 		return {
 			topic: topic,
@@ -98,14 +114,15 @@ module.exports = function (Posts) {
 		const { tid } = postData;
 		const title = data.title ? data.title.trim() : '';
 
-		const isMain = parseInt(data.pid, 10) === parseInt(topicData.mainPid, 10);
+		const isMain = String(data.pid) === String(topicData.mainPid);
 		if (!isMain) {
 			return {
 				tid: tid,
 				cid: topicData.cid,
-				title: validator.escape(String(topicData.title)),
+				title: topicData.title,
 				isMainPost: false,
 				renamed: false,
+				tagsupdated: false,
 			};
 		}
 
@@ -121,15 +138,25 @@ module.exports = function (Posts) {
 			newTopicData.slug = `${tid}/${slugify(title) || 'topic'}`;
 		}
 
-		data.tags = data.tags || [];
+		const tagsupdated = Array.isArray(data.tags) &&
+			!_.isEqual(data.tags, topicData.tags.map(tag => tag.value));
 
-		if (data.tags.length) {
+		if (tagsupdated) {
 			const canTag = await privileges.categories.can('topics:tag', topicData.cid, data.uid);
 			if (!canTag) {
 				throw new Error('[[error:no-privileges]]');
 			}
+			await topics.validateTags(data.tags, topicData.cid, data.uid, tid);
 		}
-		await topics.validateTags(data.tags, topicData.cid, data.uid, tid);
+
+		const thumbs = topics.thumbs.filterThumbs(data.thumbs);
+		const thumbsupdated = Array.isArray(data.thumbs) &&
+			!_.isEqual(data.thumbs, topicData.thumbs);
+
+		if (thumbsupdated) {
+			newTopicData.thumbs = JSON.stringify(thumbs);
+			newTopicData.numThumbs = thumbs.length;
+		}
 
 		const results = await plugins.hooks.fire('filter:topic.edit', {
 			req: data.req,
@@ -137,7 +164,9 @@ module.exports = function (Posts) {
 			data: data,
 		});
 		await db.setObject(`topic:${tid}`, results.topic);
-		await topics.updateTopicTags(tid, data.tags);
+		if (tagsupdated) {
+			await topics.updateTopicTags(tid, data.tags);
+		}
 		const tags = await topics.getTopicTagsObjects(tid);
 
 		if (rescheduling(data, topicData)) {
@@ -146,19 +175,22 @@ module.exports = function (Posts) {
 
 		newTopicData.tags = data.tags;
 		newTopicData.oldTitle = topicData.title;
-		const renamed = translator.escape(validator.escape(String(title))) !== topicData.title;
+		const renamed = title && String(title) !== topicData.title;
 		plugins.hooks.fire('action:topic.edit', { topic: newTopicData, uid: data.uid });
 		return {
 			tid: tid,
 			cid: newTopicData.cid,
 			uid: postData.uid,
-			title: validator.escape(String(title)),
+			title: title,
 			oldTitle: topicData.title,
 			slug: newTopicData.slug || topicData.slug,
 			isMainPost: true,
 			renamed: renamed,
-			rescheduled: rescheduling(data, topicData),
+			tagsupdated: tagsupdated,
 			tags: tags,
+			thumbsupdated: thumbsupdated,
+			oldTags: topicData.tags,
+			rescheduled: rescheduling(data, topicData),
 		};
 	}
 
@@ -171,7 +203,7 @@ module.exports = function (Posts) {
 			throw new Error('[[error:no-privileges]]');
 		}
 		const isMain = parseInt(data.pid, 10) === parseInt(topicData.mainPid, 10);
-		if (isMain && (isNaN(data.timestamp) || data.timestamp < Date.now())) {
+		if (isMain && isNaN(data.timestamp)) {
 			throw new Error('[[error:invalid-data]]');
 		}
 	}
@@ -179,6 +211,7 @@ module.exports = function (Posts) {
 	function getEditPostData(data, topicData, postData) {
 		const editPostData = {
 			content: data.content,
+			sourceContent: data.sourceContent,
 			editor: data.uid,
 		};
 

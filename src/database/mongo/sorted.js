@@ -9,6 +9,9 @@ module.exports = function (module) {
 	const util = require('util');
 	const sleep = util.promisify(setTimeout);
 
+	const hintKeyScore = { _key: 1, score: -1 };
+	const hintKeyValue = { _key: 1, value: -1 };
+
 	require('./sorted/add')(module);
 	require('./sorted/remove')(module);
 	require('./sorted/union')(module);
@@ -48,15 +51,15 @@ module.exports = function (module) {
 		}
 
 		if (min !== '-inf') {
-			query.score = { $gte: min };
+			query.score = { $gte: parseFloat(min) };
 		}
 		if (max !== '+inf') {
 			query.score = query.score || {};
-			query.score.$lte = max;
+			query.score.$lte = parseFloat(max);
 		}
 
 		if (max === min) {
-			query.score = max;
+			query.score = parseFloat(max);
 		}
 
 		const fields = { _id: 0, _key: 0 };
@@ -81,12 +84,15 @@ module.exports = function (module) {
 			limit = 0;
 		}
 
-		let result = [];
+		let result;
 		async function doQuery(_key, fields, skip, limit) {
-			return await module.client.collection('objects').find({ ...query, ...{ _key: _key } }, { projection: fields })
+			return await module.client.collection('objects').find({
+				...query, ...{ _key: _key },
+			}, { projection: fields })
 				.sort({ score: sort })
 				.skip(skip)
 				.limit(limit)
+				.hint(hintKeyScore)
 				.toArray();
 		}
 
@@ -154,33 +160,45 @@ module.exports = function (module) {
 			query.score.$lte = max;
 		}
 
-		const count = await module.client.collection('objects').countDocuments(query);
-		return count || 0;
+		return await module.client.collection('objects').countDocuments(query, {
+			hint: hintKeyScore,
+		});
 	};
 
 	module.sortedSetCard = async function (key) {
 		if (!key) {
 			return 0;
 		}
-		const count = await module.client.collection('objects').countDocuments({ _key: key });
-		return parseInt(count, 10) || 0;
+		return await module.client.collection('objects').countDocuments({ _key: key }, {
+			hint: hintKeyScore,
+		});
 	};
 
 	module.sortedSetsCard = async function (keys) {
 		if (!Array.isArray(keys) || !keys.length) {
 			return [];
 		}
-		const promises = keys.map(k => module.sortedSetCard(k));
-		return await Promise.all(promises);
+		return await Promise.all(keys.map(module.sortedSetCard));
 	};
 
-	module.sortedSetsCardSum = async function (keys) {
-		if (!keys || (Array.isArray(keys) && !keys.length)) {
+	module.sortedSetsCardSum = async function (keys, min = '-inf', max = '+inf') {
+		const isArray = Array.isArray(keys);
+		if (!keys || (isArray && !keys.length)) {
 			return 0;
 		}
 
-		const count = await module.client.collection('objects').countDocuments({ _key: Array.isArray(keys) ? { $in: keys } : keys });
-		return parseInt(count, 10) || 0;
+		const query = { _key: isArray ? { $in: keys } : keys };
+		if (min !== '-inf') {
+			query.score = { $gte: min };
+		}
+		if (max !== '+inf') {
+			query.score = query.score || {};
+			query.score.$lte = max;
+		}
+
+		return await module.client.collection('objects').countDocuments(query, {
+			hint: hintKeyScore,
+		});
 	};
 
 	module.sortedSetRank = async function (key, value) {
@@ -263,7 +281,13 @@ module.exports = function (module) {
 			return null;
 		}
 		value = helpers.valueToString(value);
-		const result = await module.client.collection('objects').findOne({ _key: key, value: value }, { projection: { _id: 0, _key: 0, value: 0 } });
+		const result = await module.client.collection('objects').findOne(
+			{ _key: key, value: value },
+			{
+				projection: { _id: 0, _key: 0, value: 0 },
+				hint: hintKeyValue,
+			}
+		);
 		return result ? result.score : null;
 	};
 
@@ -272,15 +296,18 @@ module.exports = function (module) {
 			return [];
 		}
 		value = helpers.valueToString(value);
-		const result = await module.client.collection('objects').find({ _key: { $in: keys }, value: value }, { projection: { _id: 0, value: 0 } }).toArray();
-		const map = {};
-		result.forEach((item) => {
-			if (item) {
-				map[item._key] = item;
+		const result = await module.client.collection('objects').find(
+			{ _key: { $in: keys }, value: value },
+			{
+				projection: { _id: 0, value: 0 },
+				hint: hintKeyValue,
 			}
+		).toArray();
+		const scoreMap = Object.create(null);
+		result.forEach((item) => {
+			scoreMap[item._key] = item.score;
 		});
-
-		return keys.map(key => (map[key] ? map[key].score : null));
+		return keys.map(key => (scoreMap[key] !== undefined ? scoreMap[key] : null));
 	};
 
 	module.sortedSetScores = async function (key, values) {
@@ -291,13 +318,17 @@ module.exports = function (module) {
 			return [];
 		}
 		values = values.map(helpers.valueToString);
-		const result = await module.client.collection('objects').find({ _key: key, value: { $in: values } }, { projection: { _id: 0, _key: 0 } }).toArray();
-
-		const valueToScore = {};
-		result.forEach((item) => {
-			if (item) {
-				valueToScore[item.value] = item.score;
+		const result = await module.client.collection('objects').find(
+			{ _key: key, value: { $in: values } },
+			{
+				projection: { _id: 0, _key: 0 },
+				hint: hintKeyValue,
 			}
+		).toArray();
+
+		const valueToScore = Object.create(null);
+		result.forEach((item) => {
+			valueToScore[item.value] = item.score;
 		});
 
 		return values.map(v => (utils.isNumber(valueToScore[v]) ? valueToScore[v] : null));
@@ -312,6 +343,7 @@ module.exports = function (module) {
 			_key: key, value: value,
 		}, {
 			projection: { _id: 0, value: 1 },
+			hint: hintKeyValue,
 		});
 		return !!result;
 	};
@@ -328,16 +360,11 @@ module.exports = function (module) {
 			_key: key, value: { $in: values },
 		}, {
 			projection: { _id: 0, value: 1 },
+			hint: hintKeyValue,
 		}).toArray();
 
-		const isMember = {};
-		results.forEach((item) => {
-			if (item) {
-				isMember[item.value] = true;
-			}
-		});
-
-		return values.map(value => !!isMember[value]);
+		const foundMembers = new Set(results.map(item => item.value));
+		return values.map(value => foundMembers.has(value));
 	};
 
 	module.isMemberOfSortedSets = async function (keys, value) {
@@ -349,47 +376,68 @@ module.exports = function (module) {
 			_key: { $in: keys }, value: value,
 		}, {
 			projection: { _id: 0, _key: 1, value: 1 },
+			hint: hintKeyValue,
 		}).toArray();
 
-		const isMember = {};
-		results.forEach((item) => {
-			if (item) {
-				isMember[item._key] = true;
-			}
-		});
-
-		return keys.map(key => !!isMember[key]);
+		const keysWithMember = new Set(results.map(item => item._key));
+		return keys.map(key => keysWithMember.has(key));
 	};
 
 	module.getSortedSetMembers = async function (key) {
-		const data = await module.getSortedSetsMembers([key]);
+		const data = await getSortedSetsMembersWithScores([key], false);
+		return data && data[0];
+	};
+
+	module.getSortedSetMembersWithScores = async function (key) {
+		const data = await getSortedSetsMembersWithScores([key], true);
 		return data && data[0];
 	};
 
 	module.getSortedSetsMembers = async function (keys) {
+		return await getSortedSetsMembersWithScores(keys, false);
+	};
+
+	module.getSortedSetsMembersWithScores = async function (keys) {
+		return await getSortedSetsMembersWithScores(keys, true);
+	};
+
+	async function getSortedSetsMembersWithScores(keys, withScores) {
 		if (!Array.isArray(keys) || !keys.length) {
 			return [];
 		}
 		const arrayOfKeys = keys.length > 1;
-		const projection = { _id: 0, value: 1 };
-		if (arrayOfKeys) {
-			projection._key = 1;
+		const projection = arrayOfKeys ?
+			{ _id: 0, _key: 1, value: 1} :
+			{ _id: 0, value: 1 };
+		if (withScores) {
+			projection.score = 1;
 		}
+
 		const data = await module.client.collection('objects').find({
 			_key: arrayOfKeys ? { $in: keys } : keys[0],
-		}, { projection: projection }).toArray();
+		}, { projection: projection })
+			.sort({ score: 1 })
+			.hint(hintKeyScore)
+			.toArray();
 
 		if (!arrayOfKeys) {
-			return [data.map(item => item.value)];
+			return [withScores ?
+				data.map(i => ({ value: i.value, score: i.score })) :
+				data.map(item => item.value),
+			];
 		}
-		const sets = {};
+		const sets = Object.create(null);
 		data.forEach((item) => {
 			sets[item._key] = sets[item._key] || [];
-			sets[item._key].push(item.value);
+			if (withScores) {
+				sets[item._key].push({ value: item.value, score: item.score });
+			} else {
+				sets[item._key].push(item.value);
+			}
 		});
 
 		return keys.map(k => sets[k] || []);
-	};
+	}
 
 	module.sortedSetIncrBy = async function (key, increment, value) {
 		if (!key) {
@@ -407,7 +455,9 @@ module.exports = function (module) {
 				$inc: data,
 			}, {
 				returnDocument: 'after',
+				includeResultMetadata: true,
 				upsert: true,
+				hint: hintKeyValue,
 			});
 			return result && result.value ? result.value.score : null;
 		} catch (err) {
@@ -415,11 +465,65 @@ module.exports = function (module) {
 			// https://github.com/NodeBB/NodeBB/issues/4467
 			// https://jira.mongodb.org/browse/SERVER-14322
 			// https://docs.mongodb.org/manual/reference/command/findAndModify/#upsert-and-unique-index
-			if (err && err.message.startsWith('E11000 duplicate key error')) {
+			if (err && err.message.includes('E11000 duplicate key error')) {
+				console.log(new Error('e11000').stack, key, increment, value);
 				return await module.sortedSetIncrBy(key, increment, value);
 			}
 			throw err;
 		}
+	};
+
+	module.sortedSetIncrByBulk = async function (data) {
+		if (!Array.isArray(data) || !data.length) {
+			return [];
+		}
+		const aggregated = dbHelpers.aggregateIncrByBulk(data);
+		const findQuery = { $or: [] };
+
+		const operations = aggregated.map(([key, incr, value]) => {
+			const query = { _key: key, value: value };
+			findQuery.$or.push(query);
+			return {
+				updateOne: {
+					filter: query,
+					update: { $inc: { score: parseFloat(incr) } },
+					upsert: true,
+					hint: hintKeyValue,
+				},
+			};
+		});
+
+		try {
+			await module.client.collection('objects').bulkWrite(operations);
+		} catch (err) {
+			// retry failed e11000 operations
+			if (err.code === 11000 || (err.writeErrors && err.writeErrors.some(e => e.code === 11000))) {
+				const failedIndices = err.writeErrors.filter(e => e.code === 11000).map(e => e.index);
+				const retryData = failedIndices.map(idx => aggregated[idx]);
+				await Promise.all(retryData.map(
+					([key, incr, value]) => module.sortedSetIncrBy(key, incr, value)
+				));
+			} else {
+				throw err;
+			}
+		}
+
+		const result = await module.client.collection('objects').find(
+			findQuery,
+			{
+				projection: { _id: 0, _key: 1, value: 1, score: 1 },
+				hint: hintKeyValue,
+			},
+		).toArray();
+
+		const map = Object.create(null);
+		result.forEach((item) => {
+			if (!map[item._key]) {
+				map[item._key] = Object.create(null);
+			}
+			map[item._key][item.value] = item.score;
+		});
+		return data.map(([key, , value]) => (map[key] && map[key][value]) || 0);
 	};
 
 	module.getSortedSetRangeByLex = async function (key, min, max, start, count) {
@@ -441,8 +545,10 @@ module.exports = function (module) {
 		count = count !== undefined ? count : 0;
 		buildLexQuery(query, min, max);
 
-		const data = await module.client.collection('objects').find(query, { projection: { _id: 0, value: 1 } })
-			.sort({ value: sort })
+		const data = await module.client.collection('objects').find(query, {
+			projection: { _id: 0, value: 1 },
+			hint: hintKeyValue,
+		}).sort({ value: sort })
 			.skip(start)
 			.limit(count === -1 ? 0 : count)
 			.toArray();
@@ -454,7 +560,9 @@ module.exports = function (module) {
 		const query = { _key: key };
 		buildLexQuery(query, min, max);
 
-		await module.client.collection('objects').deleteMany(query);
+		await module.client.collection('objects').deleteMany(query, {
+			hint: hintKeyValue,
+		});
 	};
 
 	function buildLexQuery(query, min, max) {
@@ -485,7 +593,7 @@ module.exports = function (module) {
 			project.score = 1;
 		}
 
-		const match = helpers.buildMatchQuery(params.match);
+		const match = dbHelpers.globToRegex(params.match);
 		let regex;
 		try {
 			regex = new RegExp(match);
@@ -495,7 +603,10 @@ module.exports = function (module) {
 
 		const cursor = module.client.collection('objects').find({
 			_key: params.key, value: { $regex: regex },
-		}, { projection: project });
+		}, {
+			projection: project,
+			hint: hintKeyValue,
+		});
 
 		if (params.limit) {
 			cursor.limit(params.limit);
@@ -512,18 +623,29 @@ module.exports = function (module) {
 		let done = false;
 		const ids = [];
 		const project = { _id: 0, _key: 0 };
-
+		const sort = options.reverse ? -1 : 1;
 		if (!options.withScores) {
 			project.score = 0;
 		}
-		const cursor = await module.client.collection('objects').find({ _key: setKey }, { projection: project })
-			.sort({ score: 1 })
+		const query = { _key: setKey };
+		if (options.min && options.min !== '-inf') {
+			query.score = { $gte: parseFloat(options.min) };
+		}
+		if (options.max && options.max !== '+inf') {
+			query.score = query.score || {};
+			query.score.$lte = parseFloat(options.max);
+		}
+
+		const cursor = await module.client.collection('objects')
+			.find(query, { projection: project })
+			.sort({ score: sort })
+			.hint(hintKeyScore)
 			.batchSize(options.batch);
 
 		if (processFn && processFn.constructor && processFn.constructor.name !== 'AsyncFunction') {
 			processFn = util.promisify(processFn);
 		}
-
+		let iteration = 1;
 		while (!done) {
 			/* eslint-disable no-await-in-loop */
 			const item = await cursor.next();
@@ -534,12 +656,12 @@ module.exports = function (module) {
 			}
 
 			if (ids.length >= options.batch || (done && ids.length !== 0)) {
-				await processFn(ids);
-
-				ids.length = 0;
-				if (options.interval) {
+				if (iteration > 1 && options.interval) {
 					await sleep(options.interval);
 				}
+				await processFn(ids);
+				iteration += 1;
+				ids.length = 0;
 			}
 		}
 	};

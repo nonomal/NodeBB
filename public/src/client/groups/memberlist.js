@@ -1,35 +1,58 @@
 'use strict';
 
-define('forum/groups/memberlist', ['api'], function (api) {
-	var MemberList = {};
-	var searchInterval;
-	var groupName;
-	var templateName;
+define('forum/groups/memberlist', [
+	'api', 'modals', 'alerts', 'helpers', 'benchpress',
+], function (api, modals, alerts, helpers, Benchpress) {
+	const MemberList = {};
+	let templateName;
 
 	MemberList.init = function (_templateName) {
 		templateName = _templateName || 'groups/details';
-		groupName = ajaxify.data.group.name;
 
 		handleMemberAdd();
 		handleMemberSearch();
 		handleMemberInfiniteScroll();
 	};
 
+	MemberList.refresh = async function (data) {
+		const { group } = data || await api.get(`/api/groups/${ajaxify.data.group.slug}`);
+		const html = await parseAndTranslate(group.members);
+		$('[component="groups/members"] tbody').html(html);
+		$('[component="group/member/count"]').text(
+			helpers.humanReadableNumber(group.memberCount)
+		);
+		$('[component="group/pending/count"]').text(
+			helpers.humanReadableNumber(group.pending.length)
+		);
+		$('[component="group/invited/count"]').text(
+			helpers.humanReadableNumber(group.invited.length)
+		);
+		ajaxify.data.group.members = group.members;
+		ajaxify.data.group.memberCount = group.memberCount;
+		ajaxify.data.group.invited = group.invited;
+		ajaxify.data.group.pending = group.pending;
+	};
+
 	function handleMemberAdd() {
-		$('[component="groups/members/add"]').on('click', function () {
-			app.parseAndTranslate('admin/partials/groups/add-members', {}, function (html) {
-				var foundUsers = [];
-				var modal = bootbox.dialog({
+		$('[component="groups/members/add"]').on('click', async function () {
+			const isAdminGroup = ajaxify.data.group.slug === 'administrators';
+			if (isAdminGroup) {
+				await api.post('/users/reauth/verify');
+			}
+			Benchpress.render('admin/partials/groups/add-members', {}).then(async function (html) {
+				const foundUsers = [];
+				const modal = await modals.dialog({
 					title: '[[groups:details.add-member]]',
 					message: html,
 					buttons: {
-						ok: {
+						OK: {
+							label: '[[groups:details.add-member]]',
 							callback: function () {
-								var users = [];
+								const users = [];
 								modal.find('[data-uid][data-selected]').each(function (index, el) {
 									users.push(foundUsers[$(el).attr('data-uid')]);
 								});
-								addUserToGroup(users, function () {
+								addUsersToGroup(users).then(() => {
 									modal.modal('hide');
 								});
 							},
@@ -37,7 +60,7 @@ define('forum/groups/memberlist', ['api'], function (api) {
 					},
 				});
 				modal.on('click', '[data-username]', function () {
-					var isSelected = $(this).attr('data-selected') === '1';
+					const isSelected = $(this).attr('data-selected') === '1';
 					if (isSelected) {
 						$(this).removeAttr('data-selected');
 					} else {
@@ -51,7 +74,7 @@ define('forum/groups/memberlist', ['api'], function (api) {
 						paginate: false,
 					}, function (err, result) {
 						if (err) {
-							return app.alertError(err.message);
+							return alerts.error(err);
 						}
 						result.users.forEach(function (user) {
 							foundUsers[user.uid] = user;
@@ -65,107 +88,90 @@ define('forum/groups/memberlist', ['api'], function (api) {
 		});
 	}
 
-	function addUserToGroup(users, callback) {
-		function done() {
-			users = users.filter(function (user) {
-				return !$('[component="groups/members"] [data-uid="' + user.uid + '"]').length;
-			});
-			parseAndTranslate(users, function (html) {
-				$('[component="groups/members"] tbody').prepend(html);
-			});
-			callback();
+	async function addUsersToGroup(users) {
+		let addedUsers = [];
+		for (const user of users) {
+			try {
+				// eslint-disable-next-line no-await-in-loop
+				await api.put(`/groups/${ajaxify.data.group.slug}/membership/${user.uid}`);
+				addedUsers.push(user);
+			} catch (err) {
+				alerts.error(err);
+			}
 		}
-		var uids = users.map(function (user) { return user.uid; });
-		if (groupName === 'administrators') {
-			socket.emit('admin.user.makeAdmins', uids, function (err) {
-				if (err) {
-					return app.alertError(err);
-				}
-				done();
-			});
-		} else {
-			Promise.all(uids.map(uid => api.put('/groups/' + ajaxify.data.group.slug + '/membership/' + uid))).then(done).catch(app.alertError);
-		}
+		const membersEl = $('[component="groups/members"]');
+		addedUsers = addedUsers.filter(user => !membersEl.find(`[data-uid="${user.uid}"]`).length);
+		const html = await parseAndTranslate(addedUsers);
+		$('[component="groups/members"] tbody').prepend(html);
 	}
 
 	function handleMemberSearch() {
-		$('[component="groups/members/search"]').on('keyup', function () {
-			var query = $(this).val();
-			if (searchInterval) {
-				clearInterval(searchInterval);
-				searchInterval = 0;
-			}
-
-			searchInterval = setTimeout(function () {
-				socket.emit('groups.searchMembers', { groupName: groupName, query: query }, function (err, results) {
-					if (err) {
-						return app.alertError(err.message);
-					}
-					parseAndTranslate(results.users, function (html) {
-						$('[component="groups/members"] tbody').html(html);
-						$('[component="groups/members"]').attr('data-nextstart', 20);
-					});
-				});
-			}, 250);
-		});
+		const searchEl = $('[component="groups/members/search"]');
+		searchEl.on('keyup', utils.debounce(async function () {
+			const query = searchEl.val();
+			const results = await api.get(`/groups/${ajaxify.data.group.slug}/members`, { query });
+			const html = await parseAndTranslate(results.users);
+			$('[component="groups/members"] tbody').html(html);
+			$('[component="groups/members"]').attr('data-nextstart', 20);
+		}, 250));
 	}
 
 	function handleMemberInfiniteScroll() {
-		$('[component="groups/members"] tbody').on('scroll', function () {
-			var $this = $(this);
-			var bottom = ($this[0].scrollHeight - $this.innerHeight()) * 0.9;
+		$('[component="groups/members"]').on('scroll', utils.debounce(function () {
+			const $this = $(this);
+			const bottom = ($this[0].scrollHeight - $this.innerHeight()) * 0.9;
 
 			if ($this.scrollTop() > bottom && !$('[component="groups/members/search"]').val()) {
 				loadMoreMembers();
 			}
-		});
+		}, 250));
 	}
 
-	function loadMoreMembers() {
-		var members = $('[component="groups/members"]');
+	async function loadMoreMembers() {
+		const members = $('[component="groups/members"]');
 		if (members.attr('loading')) {
 			return;
 		}
 
 		members.attr('loading', 1);
-		socket.emit('groups.loadMoreMembers', {
-			groupName: groupName,
+		const data = await api.get(`/groups/${ajaxify.data.group.slug}/members`, {
 			after: members.attr('data-nextstart'),
-		}, function (err, data) {
-			if (err) {
-				return app.alertError(err.message);
-			}
+		}).catch(alerts.error);
 
-			if (data && data.users.length) {
-				onMembersLoaded(data.users, function () {
-					members.removeAttr('loading');
-					members.attr('data-nextstart', data.nextStart);
-				});
-			} else {
-				members.removeAttr('loading');
-			}
-		});
+		if (data && data.users.length) {
+			await onMembersLoaded(data.users);
+			members.removeAttr('loading');
+			members.attr('data-nextstart', data.nextStart);
+		} else {
+			members.removeAttr('loading');
+		}
 	}
 
-	function onMembersLoaded(users, callback) {
+	async function onMembersLoaded(users) {
 		users = users.filter(function (user) {
 			return !$('[component="groups/members"] [data-uid="' + user.uid + '"]').length;
 		});
 
-		parseAndTranslate(users, function (html) {
-			$('[component="groups/members"] tbody').append(html);
-			callback();
-		});
+		const html = await parseAndTranslate(users);
+		$('[component="groups/members"] tbody').append(html);
 	}
 
-	function parseAndTranslate(users, callback) {
-		app.parseAndTranslate(templateName, 'group.members', {
+	async function parseAndTranslate(users) {
+		return await app.parseAndTranslate(templateName, 'group.members', {
 			group: {
 				members: users,
 				isOwner: ajaxify.data.group.isOwner,
 			},
-		}, callback);
+		});
 	}
+
+	MemberList.toggleOwnership = async function (groupslug, uid, isOwner) {
+		return await api[isOwner ? 'del' : 'put'](`/groups/${groupslug}/ownership/${encodeURIComponent(uid)}`);
+	};
+
+	MemberList.kickMember = async function (groupslug, uid) {
+		return await api.del(`/groups/${groupslug}/membership/${encodeURIComponent(uid)}`);
+	};
 
 	return MemberList;
 });

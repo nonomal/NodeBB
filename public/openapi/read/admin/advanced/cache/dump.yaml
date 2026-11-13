@@ -13,11 +13,19 @@ get:
       example: 'post'
   responses:
     "200":
-      description: ""
+      description: System cache information
       content:
         application/json:
           schema:
             type: object
-            properties: {}
-            additionalProperties:
-              description: The type of response is dependent on the database used. Please examine the output.
+            description: The type of response is dependent on the database used. Please examine the output.
+            properties:
+              cache:
+                type: array
+                description: Dump of the underlying LRU/TTL cache contents (array of key/entry tuples)
+                items: {}
+              invalidationVersions:
+                type: array
+                description: Dump of cache invalidation version tracking (array of key/entry tuples)
+                items: {}
+            additionalProperties: true

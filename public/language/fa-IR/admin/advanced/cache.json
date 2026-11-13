@@ -1,6 +1,6 @@
 {
-	"post-cache": "کش دیدگاه ",
+	"cache": "نهانگاه",
 	"percent-full": "%1% تمام شده",
-	"post-cache-size": "سایز کش دیدگاه",
-	"items-in-cache": "موارد موجود در کش"
+	"post-cache-size": "اندازه نهانگاه فرسته",
+	"items-in-cache": "موارد موجود در نهانگاه"
 }

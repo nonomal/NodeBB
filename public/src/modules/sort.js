@@ -1,37 +1,26 @@
 'use strict';
 
 
-define('sort', ['components', 'api'], function (components, api) {
-	var module = {};
+define('sort', ['components'], function (components) {
+	const Sort = {};
 
-	module.handleSort = function (field, gotoOnSave) {
-		var threadSort = components.get('thread/sort');
+	Sort.handleSort = function (field, gotoOnSave) {
+		const threadSort = components.get('thread/sort');
 		threadSort.find('i').removeClass('fa-check');
-		var currentSetting = threadSort.find('a[data-sort="' + config[field] + '"]');
+		const currentSort = ajaxify.data.sortOption || config[field];
+		const currentSetting = threadSort.find('a[data-sort="' + currentSort + '"]');
 		currentSetting.find('i').addClass('fa-check');
 
 		$('body')
-			.off('click', '[component="thread/sort"] a')
-			.on('click', '[component="thread/sort"] a', function () {
-				function refresh(newSetting, params) {
-					config[field] = newSetting;
-					var qs = decodeURIComponent($.param(params));
-					ajaxify.go(gotoOnSave + (qs ? '?' + qs : ''));
-				}
-				var newSetting = $(this).attr('data-sort');
-				if (app.user.uid) {
-					const payload = { settings: {} };
-					payload.settings[field] = newSetting;
-					api.put(`/users/${app.user.uid}/settings`, payload).then(() => {
-						refresh(newSetting, utils.params());
-					});
-				} else {
-					var urlParams = utils.params();
-					urlParams.sort = newSetting;
-					refresh(newSetting, urlParams);
-				}
+			.off('click', '[component="thread/sort"] a[data-sort]')
+			.on('click', '[component="thread/sort"] a[data-sort]', function () {
+				const newSetting = $(this).attr('data-sort');
+				const urlParams = utils.params();
+				urlParams.sort = newSetting;
+				const qs = $.param(urlParams);
+				ajaxify.go(gotoOnSave + (qs ? '?' + qs : ''));
 			});
 	};
 
-	return module;
+	return Sort;
 });

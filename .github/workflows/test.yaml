@@ -14,26 +14,32 @@ defaults:
   run:
     shell: bash
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    permissions:
+      checks: write  # for coverallsapp/github-action to create new checks
+      contents: read  # for actions/checkout to fetch code
     name: Lint and test
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        node: [12, 14]
+        node: [24]
         database: [mongo-dev, mongo, redis, postgres]
         include:
           # only run coverage once
           - os: ubuntu-latest
-            node: 14
+            node: 24
             coverage: true
           # test under development once
           - database: mongo-dev
             test_env: development
           # only run eslint once
           - os: ubuntu-latest
-            node: 14
+            node: 24
             database: mongo-dev
             lint: true
     runs-on: ${{ matrix.os }}
@@ -42,7 +48,7 @@ jobs:
 
     services:
       postgres:
-        image: 'postgres:10-alpine'
+        image: 'postgres:18-alpine'
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -57,7 +63,7 @@ jobs:
           - 5432:5432
 
       redis:
-        image: 'redis:2.8.9'
+        image: 'redis:8.10.1'
         # Set health checks to wait until redis has started
         options: >-
           --health-cmd "redis-cli ping"
@@ -69,18 +75,24 @@ jobs:
           - 6379:6379
 
       mongo:
-        image: 'mongo:3.2'
+        image: 'mongo:7.0'
         ports:
           # Maps port 27017 on service container to the host
           - 27017:27017
+        # set health checks to wait until mongo has started
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })' --quiet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
 
       - run: cp install/package.json package.json
 
       - name: Install Node
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
 
@@ -186,19 +198,23 @@ jobs:
         run: npm run coverage
 
       - name: Test coverage
-        uses: coverallsapp/github-action@1.1.3
+        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
         if: matrix.coverage
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           flag-name: ${{ matrix.os }}-node-${{ matrix.node }}-db-${{ matrix.database }}
           parallel: true
+          fail-on-error: false
 
   finish:
+    permissions:
+      checks: write  # for coverallsapp/github-action to create new checks
     needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Coveralls Finished
-        uses: coverallsapp/github-action@1.1.3
+        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           parallel-finished: true
+          fail-on-error: false

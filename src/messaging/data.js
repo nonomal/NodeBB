@@ -1,13 +1,15 @@
 'use strict';
 
-const validator = require('validator');
+const _ = require('lodash');
 
 const db = require('../database');
 const user = require('../user');
+const posts = require('../posts');
 const utils = require('../utils');
 const plugins = require('../plugins');
+const tx = require('../translator');
 
-const intFields = ['timestamp', 'edited', 'fromuid', 'roomId', 'deleted', 'system'];
+const intFields = ['mid', 'timestamp', 'edited', 'fromuid', 'roomId', 'deleted', 'system'];
 
 module.exports = function (Messaging) {
 	Messaging.newMessageCutoff = 1000 * 60 * 3;
@@ -27,7 +29,7 @@ module.exports = function (Messaging) {
 
 	Messaging.getMessageField = async (mid, field) => {
 		const fields = await Messaging.getMessageFields(mid, [field]);
-		return fields ? fields[field] : null;
+		return fields && fields.hasOwnProperty(field) ? fields[field] : null;
 	};
 
 	Messaging.getMessageFields = async (mid, fields) => {
@@ -43,19 +45,33 @@ module.exports = function (Messaging) {
 		await db.setObject(`message:${mid}`, data);
 	};
 
+	Messaging.getRoomIdByMid = async (mid) => {
+		const roomId = await Messaging.getMessageField(mid, 'roomId');
+		return roomId ? parseInt(roomId, 10) : null;
+	};
+
+	Messaging.getMessageData = async (mid, uid, roomId) => {
+		roomId = roomId || await Messaging.getRoomIdByMid(mid);
+		if (!roomId) {
+			return [];
+		}
+		const message = await Messaging.getMessagesData([mid], uid, roomId, false);
+		return message;
+	};
+
 	Messaging.getMessagesData = async (mids, uid, roomId, isNew) => {
 		let messages = await Messaging.getMessagesFields(mids, []);
-		messages = await user.blocks.filter(uid, 'fromuid', messages);
 		messages = messages
 			.map((msg, idx) => {
 				if (msg) {
-					msg.messageId = parseInt(mids[idx], 10);
+					msg.messageId = utils.isNumber(mids[idx]) ? parseInt(mids[idx], 10) : mids[idx];
 					msg.ip = undefined;
+					msg.isOwner = msg.fromuid === parseInt(uid, 10);
 				}
 				return msg;
 			})
 			.filter(Boolean);
-
+		messages = await user.blocks.filter(uid, 'fromuid', messages);
 		const users = await user.getUsersFields(
 			messages.map(msg => msg && msg.fromuid),
 			['uid', 'username', 'userslug', 'picture', 'status', 'banned']
@@ -71,22 +87,9 @@ module.exports = function (Messaging) {
 
 			message.newSet = false;
 			message.roomId = String(message.roomId || roomId);
-			message.deleted = !!message.deleted;
-			message.system = !!message.system;
 		});
 
-		messages = await Promise.all(messages.map(async (message) => {
-			if (message.system) {
-				message.content = validator.escape(String(message.content));
-				message.cleanedContent = utils.stripHTMLTags(utils.decodeHTMLEntities(message.content));
-				return message;
-			}
-
-			const result = await Messaging.parse(message.content, message.fromuid, uid, roomId, isNew);
-			message.content = result;
-			message.cleanedContent = utils.stripHTMLTags(utils.decodeHTMLEntities(result));
-			return message;
-		}));
+		await parseMessages(messages, uid, roomId, isNew);
 
 		if (messages.length > 1) {
 			// Add a spacer in between messages with time gaps between them
@@ -98,7 +101,9 @@ module.exports = function (Messaging) {
 				} else if (index > 0 && message.fromuid !== messages[index - 1].fromuid) {
 					// If the previous message was from the other person, this is also a new set
 					message.newSet = true;
-				} else if (index === 0) {
+				} else if (index > 0 && messages[index - 1].system) {
+					message.newSet = true;
+				} else if (index === 0 || message.toMid) {
 					message.newSet = true;
 				}
 
@@ -106,22 +111,23 @@ module.exports = function (Messaging) {
 			});
 		} else if (messages.length === 1) {
 			// For single messages, we don't know the context, so look up the previous message and compare
-			const key = `uid:${uid}:chat:room:${roomId}:mids`;
+			const key = `chat:room:${roomId}:mids`;
 			const index = await db.sortedSetRank(key, messages[0].messageId);
 			if (index > 0) {
 				const mid = await db.getSortedSetRange(key, index - 1, index - 1);
 				const fields = await Messaging.getMessageFields(mid, ['fromuid', 'timestamp']);
 				if ((messages[0].timestamp > fields.timestamp + Messaging.newMessageCutoff) ||
-					(messages[0].fromuid !== fields.fromuid)) {
+					(messages[0].fromuid !== fields.fromuid) ||
+					messages[0].system || messages[0].toMid) {
 					// If it's been 5 minutes, this is a new set of messages
 					messages[0].newSet = true;
 				}
 			} else {
 				messages[0].newSet = true;
 			}
-		} else {
-			messages = [];
 		}
+
+		await addParentMessages(messages, uid, roomId);
 
 		const data = await plugins.hooks.fire('filter:messaging.getMessages', {
 			messages: messages,
@@ -133,15 +139,90 @@ module.exports = function (Messaging) {
 
 		return data && data.messages;
 	};
+
+	async function addParentMessages(messages, uid, roomId) {
+		let parentMids = messages.map(msg => (msg && msg.hasOwnProperty('toMid') ? parseInt(msg.toMid, 10) : null)).filter(Boolean);
+
+		if (!parentMids.length) {
+			return;
+		}
+		parentMids = _.uniq(parentMids);
+		const canView = await Messaging.canViewMessage(parentMids, roomId, uid);
+		parentMids = parentMids.filter((mid, idx) => canView[idx]);
+
+		const [parentMessages, { userLang }] = await Promise.all([
+			Messaging.getMessagesFields(parentMids, [
+				'mid', 'fromuid', 'content', 'timestamp', 'deleted', 'system',
+			]),
+			user.getSettings(uid),
+		]);
+		const parentUids = _.uniq(parentMessages.map(msg => msg && msg.fromuid));
+		const usersMap = _.zipObject(
+			parentUids,
+			await user.getUsersFields(parentUids, ['uid', 'username', 'userslug', 'picture'])
+		);
+
+		await Promise.all(parentMessages.map(async (parentMsg) => {
+			if (parentMsg.deleted && parentMsg.fromuid !== parseInt(uid, 10)) {
+				parentMsg.content = `[[modules:chat.message-deleted]]`;
+				parentMsg.txContent = true;
+				return;
+			}
+			const foundMsg = messages.find(msg => parseInt(msg.mid, 10) === parseInt(parentMsg.mid, 10));
+			if (foundMsg) {
+				parentMsg.content = foundMsg.content;
+				return;
+			}
+			parentMsg.content = await parseMessage(parentMsg, uid, roomId, false, userLang);
+		}));
+
+		const parents = {};
+		parentMessages.forEach((msg, i) => {
+			if (usersMap[msg.fromuid]) {
+				msg.user = usersMap[msg.fromuid];
+				parents[parentMids[i]] = msg;
+			}
+		});
+
+		messages.forEach((msg) => {
+			if (parents[msg.toMid]) {
+				msg.parent = parents[msg.toMid];
+				msg.parent.mid = msg.toMid;
+			}
+		});
+	}
+
+	async function parseMessages(messages, uid, roomId, isNew) {
+		const { userLang } = await user.getSettings(uid);
+		await Promise.all(messages.map(async (msg) => {
+			if (msg.deleted && !msg.isOwner) {
+				msg.content = `[[modules:chat.message-deleted]]`;
+				msg.txContent = true;
+				return;
+			}
+			msg.content = await parseMessage(msg, uid, roomId, isNew, userLang);
+		}));
+	}
+
+	async function parseMessage(message, uid, roomId, isNew, userLang) {
+		if (message.system) {
+			return await tx.translate(posts.sanitize(message.content), userLang);
+		} else if (!utils.isNumber(message.mid)) {
+			return posts.sanitize(message.content);
+		}
+
+		return await Messaging.parse(message.content, message.fromuid, uid, roomId, isNew);
+	}
 };
 
 async function modifyMessage(message, fields, mid) {
 	if (message) {
+		const hasField = utils.createFieldChecker(fields);
 		db.parseIntFields(message, intFields, fields);
-		if (message.hasOwnProperty('timestamp')) {
+		if (hasField('timestamp')) {
 			message.timestampISO = utils.toISOString(message.timestamp);
 		}
-		if (message.hasOwnProperty('edited')) {
+		if (hasField('edited')) {
 			message.editedISO = utils.toISOString(message.edited);
 		}
 	}

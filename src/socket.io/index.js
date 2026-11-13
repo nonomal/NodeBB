@@ -4,16 +4,20 @@ const os = require('os');
 const nconf = require('nconf');
 const winston = require('winston');
 const util = require('util');
-const validator = require('validator');
 const cookieParser = require('cookie-parser')(nconf.get('secret'));
 
 const db = require('../database');
 const user = require('../user');
+const groups = require('../groups');
 const logger = require('../logger');
 const plugins = require('../plugins');
 const ratelimit = require('../middleware/ratelimit');
+const blacklist = require('../meta/blacklist');
+const als = require('../als');
+const apiHelpers = require('../api/helpers');
+const socketIp = require('../ip');
 
-const Namespaces = {};
+const Namespaces = Object.create(null);
 
 const Sockets = module.exports;
 
@@ -26,10 +30,6 @@ Sockets.init = async function (server) {
 	});
 
 	if (nconf.get('isCluster')) {
-		// socket.io-adapter-cluster needs update
-		// if (nconf.get('singleHostCluster')) {
-		// 	io.adapter(require('./single-host-cluster'));
-		// } else if (nconf.get('redis')) {
 		if (nconf.get('redis')) {
 			const adapter = await require('../database/redis').socketAdapter();
 			io.adapter(adapter);
@@ -38,22 +38,34 @@ Sockets.init = async function (server) {
 		}
 	}
 
-	io.use(authorize);
-
 	io.on('connection', onConnection);
 
 	const opts = {
 		transports: nconf.get('socket.io:transports') || ['polling', 'websocket'],
 		cookie: false,
+		allowRequest: (req, callback) => {
+			authorize(req, (err) => {
+				if (err) {
+					return callback(err);
+				}
+				const csrf = require('../middleware/csrf');
+				const isValid = csrf.isRequestValid({
+					session: req.session || {},
+					query: req._query,
+					headers: req.headers,
+				});
+				callback(null, isValid);
+			});
+		},
 	};
 	/*
 	 * Restrict socket.io listener to cookie domain. If none is set, infer based on url.
 	 * Production only so you don't get accidentally locked out.
 	 * Can be overridden via config (socket.io:origins)
 	 */
-	if (process.env.NODE_ENV !== 'development') {
+	if (process.env.NODE_ENV !== 'development' || nconf.get('socket.io:cors')) {
 		const origins = nconf.get('socket.io:origins');
-		opts.cors = {
+		opts.cors = nconf.get('socket.io:cors') || {
 			origin: origins,
 			methods: ['GET', 'POST'],
 			allowedHeaders: ['content-type'],
@@ -61,19 +73,46 @@ Sockets.init = async function (server) {
 		winston.info(`[socket.io] Restricting access to origin: ${origins}`);
 	}
 
-	io.listen(server, opts);
+	const eio = io.listen(server, opts);
+	if (process.env.NODE_ENV === 'development') {
+		if (eio?.engine?.on) {
+			eio.engine.on('connection_error', (err) => {
+				winston.error(`[socket.io] Connection error: [${err.code}]-${err.message}`);
+			});
+		}
+	}
 	Sockets.server = io;
 };
 
 function onConnection(socket) {
-	socket.ip = (socket.request.headers['x-forwarded-for'] || socket.request.connection.remoteAddress || '').split(',')[0];
+	socket.uid = socket.request.uid;
+	socket.data.uid = String(socket.uid); // socket.data is shared between nodes via fetchSockets
+	socket.ip = socketIp.getClientIp(socket.request);
 	socket.request.ip = socket.ip;
 	logger.io_one(socket, socket.uid);
 
 	onConnect(socket);
 	socket.onAny((event, ...args) => {
-		const payload = { data: [event].concat(args) };
-		onMessage(socket, payload);
+		const payload = { event: event, ...deserializePayload(args) };
+
+		als.run({
+			uid: socket.uid,
+			req: apiHelpers.buildReqObject(socket, payload),
+			socket: { ...payload },
+		}, onMessage, socket, payload);
+	});
+
+	socket.on('disconnecting', () => {
+		for (const room of socket.rooms) {
+			if (room && room.match(/^chat_room_\d+$/)) {
+				Sockets.server.in(room).emit('event:chats.typing', {
+					roomId: room.split('_').pop(),
+					uid: socket.uid,
+					username: '',
+					typing: false,
+				});
+			}
+		}
 	});
 
 	socket.on('disconnect', () => {
@@ -92,15 +131,15 @@ async function onConnect(socket) {
 	} catch (e) {
 		if (e.message === '[[error:invalid-session]]') {
 			socket.emit('event:invalid_session');
-			return;
 		}
-		throw e;
+
+		return;
 	}
 
-	if (socket.uid) {
+	if (socket.uid > 0) {
 		socket.join(`uid_${socket.uid}`);
 		socket.join('online_users');
-	} else {
+	} else if (socket.uid === 0) {
 		socket.join('online_guests');
 	}
 
@@ -110,53 +149,60 @@ async function onConnect(socket) {
 	plugins.hooks.fire('action:sockets.connect', { socket: socket });
 }
 
+function deserializePayload(payload) {
+	if (!Array.isArray(payload) || !payload.length) {
+		winston.warn('[socket.io] Empty payload');
+		return { params: {}, callback: () => {} };
+	}
+	const params = typeof payload[0] === 'function' ? {} : payload[0];
+	const callback = typeof payload[payload.length - 1] === 'function' ? payload[payload.length - 1] : function () {};
+	return { params, callback };
+}
+
 async function onMessage(socket, payload) {
-	if (!payload.data.length) {
-		return winston.warn('[socket.io] Empty payload');
-	}
-
-	const eventName = payload.data[0];
-	const params = typeof payload.data[1] === 'function' ? {} : payload.data[1];
-	const callback = typeof payload.data[payload.data.length - 1] === 'function' ? payload.data[payload.data.length - 1] : function () {};
-
-	if (!eventName) {
-		return winston.warn('[socket.io] Empty method name');
-	}
-
-	const parts = eventName.toString().split('.');
-	const namespace = parts[0];
-	const methodToCall = parts.reduce((prev, cur) => {
-		if (prev !== null && prev[cur]) {
-			return prev[cur];
-		}
-		return null;
-	}, Namespaces);
-
-	if (!methodToCall || typeof methodToCall !== 'function') {
-		if (process.env.NODE_ENV === 'development') {
-			winston.warn(`[socket.io] Unrecognized message: ${eventName}`);
-		}
-		const escapedName = validator.escape(String(eventName));
-		return callback({ message: `[[error:invalid-event, ${escapedName}]]` });
-	}
-
-	socket.previousEvents = socket.previousEvents || [];
-	socket.previousEvents.push(eventName);
-	if (socket.previousEvents.length > 20) {
-		socket.previousEvents.shift();
-	}
-
-	if (!eventName.startsWith('admin.') && ratelimit.isFlooding(socket)) {
-		winston.warn(`[socket.io] Too many emits! Disconnecting uid : ${socket.uid}. Events : ${socket.previousEvents}`);
-		return socket.disconnect();
-	}
-
+	const { event, params, callback } = payload;
 	try {
+		if (!event) {
+			return winston.warn('[socket.io] Empty method name');
+		}
+
+		if (typeof event !== 'string') {
+			return callback({ message: `[[error:invalid-event, ${typeof event}]]` });
+		}
+
+		const parts = event.split('.');
+		const namespace = parts[0];
+		const methodToCall = parts.reduce((prev, cur) => {
+			if (prev !== null && prev[cur] && (!prev.hasOwnProperty || prev.hasOwnProperty(cur))) {
+				return prev[cur];
+			}
+			return null;
+		}, Namespaces);
+
+		if (!methodToCall || typeof methodToCall !== 'function') {
+			if (process.env.NODE_ENV === 'development') {
+				winston.warn(`[socket.io] Unrecognized message: ${event}`);
+			}
+			return callback({ message: `[[error:invalid-event, ${event}]]` });
+		}
+
+		socket.previousEvents = socket.previousEvents || [];
+		socket.previousEvents.push(event);
+		if (socket.previousEvents.length > 20) {
+			socket.previousEvents.shift();
+		}
+
+		if (!event.startsWith('admin.') && ratelimit.isFlooding(socket)) {
+			winston.warn(`[socket.io] Too many emits! Disconnecting uid : ${socket.uid}. Events : ${socket.previousEvents}`);
+			return socket.disconnect();
+		}
+
+		await blacklist.test(socket.ip);
 		await checkMaintenance(socket);
 		await validateSession(socket, '[[error:revalidate-failure]]');
 
 		if (Namespaces[namespace].before) {
-			await Namespaces[namespace].before(socket, eventName, params);
+			await Namespaces[namespace].before(socket, event, params);
 		}
 
 		if (methodToCall.constructor && methodToCall.constructor.name === 'AsyncFunction') {
@@ -168,15 +214,16 @@ async function onMessage(socket, payload) {
 			});
 		}
 	} catch (err) {
-		winston.error(`${eventName}\n${err.stack ? err.stack : err.message}`);
+		winston.debug(`${event}\n${err.stack ? err.stack : err.message}`);
 		callback({ message: err.message });
 	}
 }
 
 function requireModules() {
-	const modules = ['admin', 'categories', 'groups', 'meta', 'modules',
-		'notifications', 'plugins', 'posts', 'topics', 'user', 'blacklist',
-		'flags', 'uploads',
+	const modules = [
+		'admin', 'categories', 'groups', 'meta', 'modules',
+		'notifications', 'plugins', 'posts', 'topics', 'user',
+		'blacklist', 'uploads',
 	];
 
 	modules.forEach((module) => {
@@ -189,54 +236,61 @@ async function checkMaintenance(socket) {
 	if (!meta.config.maintenanceMode) {
 		return;
 	}
-	const isAdmin = await user.isAdministrator(socket.uid);
-	if (isAdmin) {
+	const [isAdmin, isMemberOfExempt] = await Promise.all([
+		user.isAdministrator(socket.uid),
+		groups.isMemberOfAny(socket.uid, meta.config.groupsExemptFromMaintenanceMode),
+	]);
+	if (isAdmin || isMemberOfExempt) {
 		return;
 	}
-	const validator = require('validator');
-	throw new Error(`[[pages:maintenance.text, ${validator.escape(String(meta.config.title || 'NodeBB'))}]]`);
+	throw new Error(`[[pages:maintenance.text, ${meta.config.title || 'NodeBB'}]]`);
 }
-
-const getSessionAsync = util.promisify(
-	(sid, callback) => db.sessionStore.get(sid, (err, sessionObj) => callback(err, sessionObj || null))
-);
 
 async function validateSession(socket, errorMsg) {
 	const req = socket.request;
-	if (!req.signedCookies || !req.signedCookies[nconf.get('sessionKey')]) {
+	const { sessionId } = await plugins.hooks.fire('filter:sockets.sessionId', {
+		sessionId: req.signedCookies ? req.signedCookies[nconf.get('sessionKey')] : null,
+		request: req,
+	});
+
+	if (!sessionId) {
 		return;
 	}
-	const sessionData = await getSessionAsync(req.signedCookies[nconf.get('sessionKey')]);
+
+	const sessionData = await db.sessionStoreGet(sessionId);
 	if (!sessionData) {
 		throw new Error(errorMsg);
 	}
-	const result = await plugins.hooks.fire('static:sockets.validateSession', {
+
+	await plugins.hooks.fire('static:sockets.validateSession', {
 		req: req,
 		socket: socket,
 		session: sessionData,
 	});
-	return result;
 }
 
 const cookieParserAsync = util.promisify((req, callback) => cookieParser(req, {}, err => callback(err)));
 
-async function authorize(socket, callback) {
-	const { request } = socket;
-
+async function authorize(request, callback) {
 	if (!request) {
 		return callback(new Error('[[error:not-authorized]]'));
 	}
 
 	await cookieParserAsync(request);
-	const sessionData = await getSessionAsync(request.signedCookies[nconf.get('sessionKey')]);
+
+	const { sessionId } = await plugins.hooks.fire('filter:sockets.sessionId', {
+		sessionId: request.signedCookies ? request.signedCookies[nconf.get('sessionKey')] : null,
+		request: request,
+	});
+
+	const sessionData = await db.sessionStoreGet(sessionId);
+	request.session = sessionData;
+	let uid = 0;
 	if (sessionData && sessionData.passport && sessionData.passport.user) {
-		request.session = sessionData;
-		socket.uid = parseInt(sessionData.passport.user, 10);
-	} else {
-		socket.uid = 0;
+		uid = parseInt(sessionData.passport.user, 10);
 	}
-	request.uid = socket.uid;
-	callback();
+	request.uid = uid;
+	callback(null, uid);
 }
 
 Sockets.in = function (room) {
@@ -255,12 +309,34 @@ Sockets.getCountInRoom = function (room) {
 	return roomMap ? roomMap.size : 0;
 };
 
+// works across multiple nodes
+Sockets.getUidsInRoom = async function (room) {
+	if (!Sockets.server) {
+		return [];
+	}
+	const ioRoom = Sockets.server.in(room);
+	const uids = new Set();
+	if (ioRoom) {
+		const sockets = await ioRoom.fetchSockets();
+		for (const s of sockets) {
+			if (s && s.data && s.data.uid > 0) {
+				uids.add(s.data.uid);
+			}
+		}
+	}
+	return [...uids];
+};
+
 Sockets.warnDeprecated = (socket, replacement) => {
-	if (socket.previousEvents) {
+	if (socket.previousEvents && socket.emit) {
 		socket.emit('event:deprecated_call', {
 			eventName: socket.previousEvents[socket.previousEvents.length - 1],
 			replacement: replacement,
 		});
 	}
-	winston.warn(`[deprecated]\n ${new Error('-').stack.split('\n').slice(2, 5).join('\n')}\n     use ${replacement}`);
+	winston.warn([
+		'[deprecated]',
+		`${new Error('-').stack.split('\n').slice(2, 5).join('\n')}`,
+		`      ${replacement ? `use ${replacement}` : 'there is no replacement for this call.'}`,
+	].join('\n'));
 };

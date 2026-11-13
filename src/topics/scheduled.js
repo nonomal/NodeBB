@@ -2,19 +2,26 @@
 
 const _ = require('lodash');
 const winston = require('winston');
-const { CronJob } = require('cron');
 
 const db = require('../database');
 const posts = require('../posts');
 const socketHelpers = require('../socket.io/helpers');
 const topics = require('./index');
+const groups = require('../groups');
 const user = require('../user');
+const activitypub = require('../activitypub');
+const plugins = require('../plugins');
+const cron = require('../cron');
 
 const Scheduled = module.exports;
 
-Scheduled.startJobs = function () {
+Scheduled.startJobs = async function () {
 	winston.verbose('[scheduled topics] Starting jobs.');
-	new CronJob('*/1 * * * *', Scheduled.handleExpired, null, true);
+	await cron.addJob({
+		name: 'topics:publish:scheduled',
+		cronTime: '*/1 * * * *',
+		onTick: Scheduled.handleExpired,
+	});
 };
 
 Scheduled.handleExpired = async function () {
@@ -25,6 +32,11 @@ Scheduled.handleExpired = async function () {
 		return;
 	}
 
+	await postTids(tids);
+	await db.sortedSetsRemoveRangeByScore([`topics:scheduled`], '-inf', now);
+};
+
+async function postTids(tids) {
 	let topicsData = await topics.getTopicsData(tids);
 	// Filter deleted
 	topicsData = topicsData.filter(topicData => Boolean(topicData));
@@ -32,18 +44,19 @@ Scheduled.handleExpired = async function () {
 
 	// Restore first to be not filtered for being deleted
 	// Restoring handles "updateRecentTid"
-	await Promise.all([].concat(
-		topicsData.map(topicData => topics.restore(topicData.tid)),
-		topicsData.map(topicData => topics.updateLastPostTimeFromLastPid(topicData.tid))
-	));
+	await Promise.all(topicsData.map(t => topics.restore(t.tid)));
+	await Promise.all(topicsData.map(t => topics.updateLastPostTimeFromLastPid(t.tid)));
 
-	await Promise.all([].concat(
+	await Promise.all([
 		sendNotifications(uids, topicsData),
 		updateUserLastposttimes(uids, topicsData),
-		...topicsData.map(topicData => unpin(topicData.tid, topicData)),
-		db.sortedSetsRemoveRangeByScore([`topics:scheduled`], '-inf', now)
-	));
-};
+		updateGroupPosts(topicsData),
+	]);
+	await Promise.all(topicsData.map(topicData => unpin(topicData.tid, topicData)));
+	federatePosts(uids, topicsData).catch(
+		err => winston.error(`[scheduled topics] Error federating posts: ${err.message}`)
+	);
+}
 
 // topics/tools.js#pin/unpin would block non-admins/mods, thus the local versions
 Scheduled.pin = async function (tid, topicData) {
@@ -52,56 +65,79 @@ Scheduled.pin = async function (tid, topicData) {
 		db.sortedSetAdd(`cid:${topicData.cid}:tids:pinned`, Date.now(), tid),
 		db.sortedSetsRemove([
 			`cid:${topicData.cid}:tids`,
+			`cid:${topicData.cid}:tids:create`,
 			`cid:${topicData.cid}:tids:posts`,
 			`cid:${topicData.cid}:tids:votes`,
+			`cid:${topicData.cid}:tids:views`,
 		], tid),
 	]);
 };
 
 Scheduled.reschedule = async function ({ cid, tid, timestamp, uid }) {
-	await Promise.all([
-		db.sortedSetsAdd([
-			'topics:scheduled',
-			`uid:${uid}:topics`,
-			'topics:tid',
-			`cid:${cid}:uid:${uid}:tids`,
-		], timestamp, tid),
-		shiftPostTimes(tid, timestamp),
-	]);
-	return topics.updateLastPostTimeFromLastPid(tid);
+	if (timestamp < Date.now()) {
+		await postTids([tid]);
+	} else {
+		const mainPid = await topics.getTopicField(tid, 'mainPid');
+		await Promise.all([
+			db.sortedSetsAdd([
+				'topics:scheduled',
+				`uid:${uid}:topics`,
+				'topics:tid',
+				`cid:${cid}:uid:${uid}:tids`,
+			], timestamp, tid),
+			posts.setPostField(mainPid, 'timestamp', timestamp),
+			db.sortedSetsAdd([
+				'posts:pid',
+				`uid:${uid}:posts`,
+				`cid:${cid}:uid:${uid}:pids`,
+			], timestamp, mainPid),
+			shiftPostTimes(tid, timestamp),
+		]);
+		await topics.updateLastPostTimeFromLastPid(tid);
+	}
 };
 
-function unpin(tid, topicData) {
-	return [
+async function unpin(tid, topicData) {
+	await Promise.all([
 		topics.setTopicField(tid, 'pinned', 0),
 		topics.deleteTopicField(tid, 'pinExpiry'),
 		db.sortedSetRemove(`cid:${topicData.cid}:tids:pinned`, tid),
 		db.sortedSetAddBulk([
 			[`cid:${topicData.cid}:tids`, topicData.lastposttime, tid],
+			[`cid:${topicData.cid}:tids:create`, topicData.timestamp, tid],
 			[`cid:${topicData.cid}:tids:posts`, topicData.postcount, tid],
 			[`cid:${topicData.cid}:tids:votes`, parseInt(topicData.votes, 10) || 0, tid],
+			[`cid:${topicData.cid}:tids:views`, topicData.viewcount, tid],
 		]),
-	];
+	]);
 }
 
 async function sendNotifications(uids, topicsData) {
-	const usernames = await Promise.all(uids.map(uid => user.getUserField(uid, 'username')));
-	const uidToUsername = Object.fromEntries(uids.map((uid, idx) => [uid, usernames[idx]]));
+	const userData = await user.getUsersData(uids);
+	const uidToUserData = Object.fromEntries(uids.map((uid, idx) => [uid, userData[idx]]));
 
-	const postsData = await posts.getPostsData(topicsData.map(({ mainPid }) => mainPid));
+	let postsData = await posts.getPostsData(topicsData.map(t => t && t.mainPid));
+	topicsData = topicsData.filter((t, i) => t && postsData[i]);
+	postsData = postsData.filter(Boolean);
+	postsData = await Promise.all(postsData.map(p => posts.parsePost(p)));
 	postsData.forEach((postData, idx) => {
-		postData.user = {};
-		postData.user.username = uidToUsername[postData.uid];
-		postData.topic = topicsData[idx];
+		if (postData) {
+			postData.user = uidToUserData[topicsData[idx].uid];
+			postData.topic = topicsData[idx];
+		}
 	});
 
-	return Promise.all(topicsData.map(
+	await Promise.all(topicsData.map(
 		(t, idx) => user.notifications.sendTopicNotificationToFollowers(t.uid, t, postsData[idx])
 	).concat(
 		topicsData.map(
 			(t, idx) => socketHelpers.notifyNew(t.uid, 'newTopic', { posts: [postsData[idx]], topic: t })
 		)
 	));
+	plugins.hooks.fire('action:topics.scheduled.notify', {
+		posts: postsData,
+		topics: topicsData,
+	});
 }
 
 async function updateUserLastposttimes(uids, topicsData) {
@@ -119,8 +155,25 @@ async function updateUserLastposttimes(uids, topicsData) {
 	return Promise.all(uidsToUpdate.map(uid => user.setUserField(uid, 'lastposttime', tstampByUid[uid])));
 }
 
+async function updateGroupPosts(topicsData) {
+	const postsData = await posts.getPostsData(topicsData.map(t => t && t.mainPid));
+	await Promise.all(postsData.map(async (post, i) => {
+		if (post && topicsData[i]) {
+			post.cid = topicsData[i].cid;
+			await groups.onNewPostMade(post);
+		}
+	}));
+}
+
+async function federatePosts(uids, topicData) {
+	await Promise.all(topicData.map(async ({mainPid: pid}, idx) => {
+		const uid = uids[idx];
+		await activitypub.out.create.note(uid, pid);
+	}));
+}
+
 async function shiftPostTimes(tid, timestamp) {
 	const pids = (await posts.getPidsFromSet(`tid:${tid}:posts`, 0, -1, false));
 	// Leaving other related score values intact, since they reflect post order correctly, and it seems that's good enough
-	return db.setObjectBulk(pids.map(pid => `post:${pid}`), pids.map((_, idx) => ({ timestamp: timestamp + idx + 1 })));
+	return db.setObjectBulk(pids.map((pid, idx) => [`post:${pid}`, { timestamp: timestamp + idx + 1 }]));
 }

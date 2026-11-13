@@ -2,22 +2,22 @@
 
 const winston = require('winston');
 const express = require('express');
+const session = require('express-session');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
 const childProcess = require('child_process');
-const less = require('less');
-const util = require('util');
 
-const lessRenderAsync = util.promisify(
-	(style, opts, cb) => less.render(String(style), opts, cb)
-);
-const uglify = require('uglify-es');
+const webpack = require('webpack');
 const nconf = require('nconf');
 
 const Benchpress = require('benchpressjs');
-const mkdirp = require('mkdirp');
+const { mkdirp } = require('mkdirp');
 const { paths } = require('../src/constants');
+const utils = require('../src/utils');
+
+const sass = utils.getSass();
+const { generateToken, csrfSynchronisedProtection } = require('../src/middleware/csrf');
 
 const app = express();
 let server;
@@ -50,20 +50,13 @@ winston.configure({
 });
 
 const web = module.exports;
-
-const scripts = [
-	'node_modules/jquery/dist/jquery.js',
-	'node_modules/xregexp/xregexp-all.js',
-	'public/src/modules/slugify.js',
-	'public/src/utils.js',
-	'public/src/installer/install.js',
-	'node_modules/zxcvbn/dist/zxcvbn.js',
-];
-
 let installing = false;
 let success = false;
 let error = false;
 let launchUrl;
+let timeStart = 0;
+const totalTime = 1000 * 60 * 3;
+const availableDbs = ['mongo', 'redis', 'postgres'];
 
 const viewsDir = path.join(paths.baseDir, 'build/public/templates');
 
@@ -72,6 +65,8 @@ web.install = async function (port) {
 	winston.info(`Launching web installer on port ${port}`);
 
 	app.use(express.static('public', {}));
+	app.use('/assets', express.static(path.join(__dirname, '../build/public'), {}));
+
 	app.engine('tpl', (filepath, options, callback) => {
 		filepath = filepath.replace(/\.tpl$/, '.js');
 
@@ -82,11 +77,18 @@ web.install = async function (port) {
 	app.use(bodyParser.urlencoded({
 		extended: true,
 	}));
+
+	app.use(session({
+		secret: utils.generateUUID(),
+		resave: false,
+		saveUninitialized: false,
+	}));
+
 	try {
 		await Promise.all([
 			compileTemplate(),
-			compileLess(),
-			compileJS(),
+			compileSass(),
+			runWebpack(),
 			copyCSS(),
 			loadDefaults(),
 		]);
@@ -97,6 +99,13 @@ web.install = async function (port) {
 	}
 };
 
+async function runWebpack() {
+	const util = require('util');
+	const webpackCfg = require('../webpack.installer');
+	const compiler = webpack(webpackCfg);
+	const webpackRun = util.promisify(compiler.run).bind(compiler);
+	await webpackRun();
+}
 
 function launchExpress(port) {
 	server = app.listen(port, () => {
@@ -105,11 +114,35 @@ function launchExpress(port) {
 }
 
 function setupRoutes() {
-	app.get('/', welcome);
-	app.post('/', install);
-	app.post('/launch', launch);
+	app.get('/', csrfSynchronisedProtection, welcome);
+	app.post('/', csrfSynchronisedProtection, install);
+	app.get('/testdb', testDatabase);
 	app.get('/ping', ping);
 	app.get('/sping', ping);
+}
+
+async function testDatabase(req, res) {
+	let db;
+	try {
+		const keys = Object.keys(req.query);
+		const dbName = keys[0].split(':')[0];
+		if (!availableDbs.includes(dbName)) {
+			throw new Error(`Invalid database type: ${dbName}. Supported databases are: ${availableDbs.join(', ')}`);
+		}
+		db = require(`../src/database/${dbName}`);
+
+		const opts = {};
+		keys.forEach((key) => {
+			opts[key.replace(`${dbName}:`, '')] = req.query[key];
+		});
+
+		await db.init(opts);
+		const global = await db.getObject('global');
+		await db.close();
+		res.json({ success: 1, dbfull: !!global });
+	} catch (err) {
+		res.json({ error: err.message });
+	}
 }
 
 function ping(req, res) {
@@ -117,8 +150,8 @@ function ping(req, res) {
 }
 
 function welcome(req, res) {
-	const dbs = ['redis', 'mongo', 'postgres'];
-	const databases = dbs.map((databaseName) => {
+
+	const databases = availableDbs.map((databaseName) => {
 		const questions = require(`../src/database/${databaseName}`).questions.filter(question => question && !question.hideOnWebInstall);
 
 		return {
@@ -128,7 +161,6 @@ function welcome(req, res) {
 	});
 
 	const defaults = require('./data/defaults.json');
-
 	res.render('install/index', {
 		url: nconf.get('url') || (`${req.protocol}://${req.get('host')}`),
 		launchUrl: launchUrl,
@@ -141,6 +173,8 @@ function welcome(req, res) {
 		minimumPasswordLength: defaults.minimumPasswordLength,
 		minimumPasswordStrength: defaults.minimumPasswordStrength,
 		installing: installing,
+		percentInstalled: installing ? ((Date.now() - timeStart) / totalTime * 100).toFixed(2) : 0,
+		csrf_token: generateToken(req),
 	});
 }
 
@@ -148,50 +182,52 @@ function install(req, res) {
 	if (installing) {
 		return welcome(req, res);
 	}
+	timeStart = Date.now();
 	req.setTimeout(0);
 	installing = true;
-	const setupEnvVars = nconf.get();
-	for (const [key, value] of Object.entries(req.body)) {
-		if (!process.env.hasOwnProperty(key)) {
-			setupEnvVars[key.replace(':', '__')] = value;
-		}
-	}
 
-	// Flatten any objects in setupEnvVars
-	const pushToRoot = function (parentKey, key) {
-		setupEnvVars[`${parentKey}__${key}`] = setupEnvVars[parentKey][key];
+	const database = nconf.get('database') || req.body.database || 'mongo';
+	const setupEnvVars = {
+		...process.env,
+		CONFIG: nconf.get('config'),
+		NODEBB_CONFIG: nconf.get('config'),
+		NODEBB_URL: nconf.get('url') || req.body.url || (`${req.protocol}://${req.get('host')}`),
+		NODEBB_PORT: nconf.get('port') || 4567,
+		NODEBB_ADMIN_USERNAME: nconf.get('admin:username') || req.body['admin:username'],
+		NODEBB_ADMIN_PASSWORD: nconf.get('admin:password') || req.body['admin:password'],
+		NODEBB_ADMIN_EMAIL: nconf.get('admin:email') || req.body['admin:email'],
+		NODEBB_DB: database,
+		NODEBB_DB_HOST: nconf.get(`${database}:host`) || req.body[`${database}:host`],
+		NODEBB_DB_PORT: nconf.get(`${database}:port`) || req.body[`${database}:port`],
+		NODEBB_DB_USER: nconf.get(`${database}:username`) || req.body[`${database}:username`],
+		NODEBB_DB_PASSWORD: nconf.get(`${database}:password`) || req.body[`${database}:password`],
+		NODEBB_DB_NAME: nconf.get(`${database}:database`) || req.body[`${database}:database`],
+		NODEBB_DB_SSL: nconf.get(`${database}:ssl`) || req.body[`${database}:ssl`],
+		defaultPlugins: JSON.stringify(nconf.get('defaultplugins') || nconf.get('defaultPlugins') || []),
 	};
-	for (const [parentKey, value] of Object.entries(setupEnvVars)) {
-		if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-			Object.keys(value).forEach(key => pushToRoot(parentKey, key));
-			delete setupEnvVars[parentKey];
-		} else if (Array.isArray(value)) {
-			setupEnvVars[parentKey] = JSON.stringify(value);
-		}
-	}
 
 	winston.info('Starting setup process');
-	winston.info(setupEnvVars);
-	launchUrl = setupEnvVars.url;
+	launchUrl = setupEnvVars.NODEBB_URL;
 
 	const child = require('child_process').fork('app', ['--setup'], {
 		env: setupEnvVars,
 	});
-
+	child.on('error', (err) => {
+		error = true;
+		success = false;
+		winston.error(err.stack);
+	});
 	child.on('close', (data) => {
-		installing = false;
 		success = data === 0;
 		error = data !== 0;
-
-		welcome(req, res);
+		launch();
 	});
+	welcome(req, res);
 }
 
-async function launch(req, res) {
+async function launch() {
 	try {
-		res.json({});
 		server.close();
-		req.setTimeout(0);
 		let child;
 
 		if (!nconf.get('launchCmd')) {
@@ -213,15 +249,20 @@ async function launch(req, res) {
 		}
 
 		const filesToDelete = [
-			'installer.css',
-			'installer.min.js',
-			'bootstrap.min.css',
+			path.join(__dirname, '../public', 'installer.css'),
+			path.join(__dirname, '../public', 'bootstrap.min.css'),
+			path.join(__dirname, '../build/public', 'installer.min.js'),
 		];
-		await Promise.all(
-			filesToDelete.map(
-				filename => fs.promises.unlink(path.join(__dirname, '../public', filename))
-			)
-		);
+		try {
+			await Promise.all(
+				filesToDelete.map(
+					filename => fs.promises.unlink(filename)
+				)
+			);
+		} catch (err) {
+			console.log(err.stack);
+		}
+
 		child.unref();
 		process.exit(0);
 	} catch (err) {
@@ -249,51 +290,42 @@ async function compileTemplate() {
 	]);
 }
 
-async function compileLess() {
+async function compileSass() {
 	try {
-		const installSrc = path.join(__dirname, '../public/less/install.less');
+		const installSrc = path.join(__dirname, '../public/scss/install.scss');
 		const style = await fs.promises.readFile(installSrc);
-		const css = await lessRenderAsync(style, { filename: path.resolve(installSrc) });
-		await fs.promises.writeFile(path.join(__dirname, '../public/installer.css'), css.css);
+		const scssOutput = sass.compileString(String(style), {
+			loadPaths: [
+				path.join(__dirname, '../public/scss'),
+			],
+		});
+
+		await fs.promises.writeFile(path.join(__dirname, '../public/installer.css'), scssOutput.css.toString());
 	} catch (err) {
-		winston.error(`Unable to compile LESS: \n${err.stack}`);
+		winston.error(`Unable to compile SASS: \n${err.stack}`);
 		throw err;
 	}
 }
 
-async function compileJS() {
-	let code = '';
-
-	for (const srcPath of scripts) {
-		// eslint-disable-next-line no-await-in-loop
-		const buffer = await fs.promises.readFile(path.join(__dirname, '..', srcPath));
-		code += buffer.toString();
-	}
-	const minified = uglify.minify(code, {
-		compress: false,
-	});
-	if (!minified.code) {
-		throw new Error('[[error:failed-to-minify]]');
-	}
-	await fs.promises.writeFile(path.join(__dirname, '../public/installer.min.js'), minified.code);
-}
-
 async function copyCSS() {
-	const src = await fs.promises.readFile(
-		path.join(__dirname, '../node_modules/bootstrap/dist/css/bootstrap.min.css'), 'utf8'
+	await fs.promises.copyFile(
+		path.join(__dirname, '../node_modules/bootstrap/dist/css/bootstrap.min.css'),
+		path.join(__dirname, '../public/bootstrap.min.css'),
 	);
-	await fs.promises.writeFile(path.join(__dirname, '../public/bootstrap.min.css'), src);
 }
 
 async function loadDefaults() {
 	const setupDefaultsPath = path.join(__dirname, '../setup.json');
 	try {
-		await fs.promises.access(setupDefaultsPath, fs.constants.F_OK + fs.constants.R_OK);
+		// eslint-disable-next-line no-bitwise
+		await fs.promises.access(setupDefaultsPath, fs.constants.F_OK | fs.constants.R_OK);
 	} catch (err) {
 		// setup.json not found or inaccessible, proceed with no defaults
 		if (err.code !== 'ENOENT') {
 			throw err;
 		}
+
+		return;
 	}
 	winston.info('[installer] Found setup.json, populating default values');
 	nconf.file({

@@ -1,9 +1,18 @@
 {
-	"loading": "Loading Skins...",
-	"homepage": "Homepage",
-	"select-skin": "Select Skin",
-	"current-skin": "Current Skin",
-	"skin-updated": "Skin Updated",
-	"applied-success": "%1 skin was succesfully applied",
-	"revert-success": "Skin reverted to base colours"
+	"skins": "پوسته‌ها",
+	"bootswatch-skins": "Bootswatch Skins",
+	"custom-skins": "پوسته‌های سفارشی",
+	"add-skin": "افزودن پوسته",
+	"save-custom-skins": "ذخیره پوسته‌های سفارشی",
+	"save-custom-skins-success": "پوسته‌های سفارشی با موفقیت ذخیره شدند",
+	"custom-skin-name": "نام پوسته‌ی سفارشی",
+	"custom-skin-variables": "متغیرهای سفارشی پوسته",
+	"loading": "بارگزاری پوسته‌ها",
+	"homepage": "صفحه خانه",
+	"select-skin": "انتخاب پوسته",
+	"revert-skin": "بازگردانی پوسته",
+	"current-skin": "پوسته‌ی جاری",
+	"skin-updated": "پوسته‌های بروزشده",
+	"applied-success": "% 1 پوسته با موفقیت اعمال شد",
+	"revert-success": "پوسته به رنگ های پایه بارگردانی شد"
 }

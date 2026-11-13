@@ -1,5 +1,7 @@
 'use strict';
 
+const nconf = require('nconf');
+
 const user = require('../user');
 const meta = require('../meta');
 
@@ -8,8 +10,11 @@ const pagination = require('../pagination');
 const privileges = require('../privileges');
 const helpers = require('./helpers');
 const api = require('../api');
+const utils = require('../utils');
 
 const usersController = module.exports;
+
+const url = nconf.get('url');
 
 usersController.index = async function (req, res, next) {
 	const section = req.query.section || 'joindate';
@@ -19,12 +24,13 @@ usersController.index = async function (req, res, next) {
 		'sort-posts': usersController.getUsersSortedByPosts,
 		'sort-reputation': usersController.getUsersSortedByReputation,
 		banned: usersController.getBannedUsers,
+		muted: usersController.getMutedUsers,
 		flagged: usersController.getFlaggedUsers,
 	};
 
 	if (req.query.query) {
 		await usersController.search(req, res, next);
-	} else if (sectionToController[section]) {
+	} else if (sectionToController.hasOwnProperty(section) && sectionToController[section]) {
 		await sectionToController[section](req, res, next);
 	} else {
 		await usersController.getUsersSortedByJoinDate(req, res, next);
@@ -43,18 +49,20 @@ usersController.search = async function (req, res) {
 };
 
 usersController.getOnlineUsers = async function (req, res) {
-	const [userData, guests] = await Promise.all([
+	const [isAdminOrGlobalMod, userData, guests] = await Promise.all([
+		user.isAdminOrGlobalMod(req.uid),
 		usersController.getUsers('users:online', req.uid, req.query),
 		require('../socket.io/admin/rooms').getTotalGuestCount(),
 	]);
 
 	let hiddenCount = 0;
-	if (!userData.isAdminOrGlobalMod) {
+	if (!isAdminOrGlobalMod) {
 		userData.users = userData.users.filter((user) => {
-			if (user && user.status === 'offline') {
+			const showUser = user && (user.uid === req.uid || user.userStatus !== 'offline');
+			if (!showUser) {
 				hiddenCount += 1;
 			}
-			return user && user.status !== 'offline';
+			return showUser;
 		});
 	}
 
@@ -82,6 +90,10 @@ usersController.getBannedUsers = async function (req, res) {
 	await renderIfAdminOrGlobalMod('users:banned', req, res);
 };
 
+usersController.getMutedUsers = async function (req, res) {
+	await renderIfAdminOrGlobalMod('users:muted', req, res);
+};
+
 usersController.getFlaggedUsers = async function (req, res) {
 	await renderIfAdminOrGlobalMod('users:flags', req, res);
 };
@@ -101,12 +113,13 @@ usersController.renderUsersPage = async function (set, req, res) {
 
 usersController.getUsers = async function (set, uid, query) {
 	const setToData = {
-		'users:postcount': { title: '[[pages:users/sort-posts]]', crumb: '[[users:top_posters]]' },
-		'users:reputation': { title: '[[pages:users/sort-reputation]]', crumb: '[[users:most_reputation]]' },
+		'users:postcount': { title: '[[pages:users/sort-posts]]', crumb: '[[users:top-posters]]' },
+		'users:reputation': { title: '[[pages:users/sort-reputation]]', crumb: '[[users:most-reputation]]' },
 		'users:joindate': { title: '[[pages:users/latest]]', crumb: '[[global:users]]' },
 		'users:online': { title: '[[pages:users/online]]', crumb: '[[global:online]]' },
 		'users:banned': { title: '[[pages:users/banned]]', crumb: '[[user:banned]]' },
-		'users:flags': { title: '[[pages:users/most-flags]]', crumb: '[[users:most_flags]]' },
+		'users:muted': { title: '[[pages:users/muted]]', crumb: '[[user:muted]]' },
+		'users:flags': { title: '[[pages:users/most-flags]]', crumb: '[[users:most-flags]]' },
 	};
 
 	if (!setToData[set]) {
@@ -124,9 +137,7 @@ usersController.getUsers = async function (set, uid, query) {
 	const start = Math.max(0, page - 1) * resultsPerPage;
 	const stop = start + resultsPerPage - 1;
 
-	const [isAdmin, isGlobalMod, canSearch, usersData] = await Promise.all([
-		user.isAdministrator(uid),
-		user.isGlobalModerator(uid),
+	const [canSearch, usersData] = await Promise.all([
 		privileges.global.can('search:users', uid),
 		usersController.getUsersAndCount(set, uid, start, stop),
 	]);
@@ -134,12 +145,9 @@ usersController.getUsers = async function (set, uid, query) {
 	return {
 		users: usersData.users,
 		pagination: pagination.create(page, pageCount, query),
-		userCount: usersData.count,
+		userCount: parseInt(usersData.count, 10),
 		title: setToData[set].title || '[[pages:users/latest]]',
 		breadcrumbs: helpers.buildBreadcrumbs(breadcrumbs),
-		isAdminOrGlobalMod: isAdmin || isGlobalMod,
-		isAdmin: isAdmin,
-		isGlobalMod: isGlobalMod,
 		displayUserSearch: canSearch,
 		[`section_${query.section || 'joindate'}`]: true,
 	};
@@ -148,18 +156,40 @@ usersController.getUsers = async function (set, uid, query) {
 usersController.getUsersAndCount = async function (set, uid, start, stop) {
 	async function getCount() {
 		if (set === 'users:online') {
-			return await db.sortedSetCount('users:online', Date.now() - (meta.config.onlineCutoff * 60000), '+inf');
-		} else if (set === 'users:banned' || set === 'users:flags') {
+			return await db.sortedSetCount('users:online', Date.now() - 86400000, '+inf');
+		} else if (set === 'users:banned' || set === 'users:flags' || set === 'users:muted') {
 			return await db.sortedSetCard(set);
 		}
 		return await db.getObjectField('global', 'userCount');
 	}
+	async function getUsers() {
+		if (set === 'users:online') {
+			const count = parseInt(stop, 10) === -1 ? stop : stop - start + 1;
+			const data = await db.getSortedSetRevRangeByScoreWithScores(set, start, count, '+inf', Date.now() - 86400000);
+			const uids = data.map(d => d.value);
+			const scores = data.map(d => d.score);
+			const [userStatus, userData] = await Promise.all([
+				db.getObjectsFields(uids.map(uid => `user:${uid}`), ['status']),
+				user.getUsers(uids, uid),
+			]);
+
+			userData.forEach((user, i) => {
+				if (user) {
+					user.lastonline = scores[i];
+					user.lastonlineISO = utils.toISOString(user.lastonline);
+					user.userStatus = userStatus[i].status || 'online';
+				}
+			});
+			return userData;
+		}
+		return await user.getUsersFromSet(set, uid, start, stop);
+	}
 	const [usersData, count] = await Promise.all([
-		user.getUsersFromSet(set, uid, start, stop),
+		getUsers(),
 		getCount(),
 	]);
 	return {
-		users: usersData.filter(user => user && parseInt(user.uid, 10)),
+		users: usersData.filter(Boolean),
 		count: count,
 	};
 };
@@ -167,10 +197,19 @@ usersController.getUsersAndCount = async function (set, uid, start, stop) {
 async function render(req, res, data) {
 	const { registrationType } = meta.config;
 
+	const [isAdmin, isGlobalMod, invites] = await Promise.all([
+		user.isAdministrator(req.uid),
+		user.isGlobalModerator(req.uid),
+		user.getInvitesNumber(req.uid),
+	]);
+	data.isAdminOrGlobalMod = isAdmin || isGlobalMod;
+	data.isAdmin = isAdmin;
+	data.isGlobalMod = isGlobalMod;
+
 	data.maximumInvites = meta.config.maximumInvites;
 	data.inviteOnly = registrationType === 'invite-only' || registrationType === 'admin-invite-only';
 	data.adminInviteOnly = registrationType === 'admin-invite-only';
-	data.invites = await user.getInvitesNumber(req.uid);
+	data.invites = invites;
 
 	data.showInviteButton = false;
 	if (data.adminInviteOnly) {
@@ -181,6 +220,13 @@ async function render(req, res, data) {
 	}
 
 	data['reputation:disabled'] = meta.config['reputation:disabled'];
+
+	res.locals.linkTags = [
+		{
+			rel: 'canonical',
+			href: `${url}${req.url.replace(/^\/api/, '')}`,
+		},
+	];
 
 	res.append('X-Total-Count', data.userCount);
 	res.render('users', data);

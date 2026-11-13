@@ -15,6 +15,12 @@ get:
       schema:
         type: string
       example: 1
+    - name: index
+      in: path
+      required: true
+      schema:
+        type: string
+      example: 1
   responses:
     "200":
       description: ""
@@ -24,12 +30,34 @@ get:
             allOf:
               - type: object
                 properties:
-                  owner:
-                    type: number
                   roomId:
                     type: number
                   roomName:
                     type: string
+                  public:
+                    type: boolean
+                  userCount:
+                    type: number
+                  messageCount:
+                    type: number
+                  scrollToIndex:
+                    type: number
+                    nullable: true
+                  icon:
+                    type: string
+                  groups:
+                    type: array
+                  timestamp:
+                    type: number
+                    description: Timestamp of when room was created
+                  notificationSetting:
+                    type: number
+                  notificationOptions:
+                    type: array
+                  notificationOptionsIcon:
+                    type: string
+                  joinLeaveMessages:
+                    type: number
                   messages:
                     type: array
                     items:
@@ -44,9 +72,9 @@ get:
                         roomId:
                           type: string
                         deleted:
-                          type: boolean
+                          type: number
                         system:
-                          type: boolean
+                          type: number
                         edited:
                           type: number
                         timestampISO:
@@ -54,6 +82,8 @@ get:
                           description: An ISO 8601 formatted date string (complementing `timestamp`)
                         editedISO:
                           type: string
+                        mid:
+                          type: number
                         messageId:
                           type: number
                         fromUser:
@@ -62,6 +92,9 @@ get:
                             uid:
                               type: number
                               description: A user identifier
+                            isLocal:
+                              type: boolean
+                              description: Whether the user belongs to the local installation or not.
                             username:
                               type: string
                               description: A friendly name for a given user account
@@ -91,6 +124,8 @@ get:
                                 `icon:text` for the user's auto-generated
                                 icon
                               example: "#f44336"
+                            banned_until:
+                              type: number
                             banned_until_readable:
                               type: string
                             deleted:
@@ -101,8 +136,6 @@ get:
                           type: boolean
                         index:
                           type: number
-                        cleanedContent:
-                          type: string
                         isOwner:
                           type: boolean
                   isOwner:
@@ -115,6 +148,9 @@ get:
                         uid:
                           type: number
                           description: A user identifier
+                        isLocal:
+                          type: boolean
+                          description: Whether the user belongs to the local installation or not.
                         username:
                           type: string
                           description: A friendly name for a given user account
@@ -126,6 +162,8 @@ get:
                           nullable: true
                         status:
                           type: string
+                        online:
+                          type: boolean
                         icon:text:
                           type: string
                           description: A single-letter representation of a username. This is used in the
@@ -139,7 +177,11 @@ get:
                           example: "#f44336"
                         isOwner:
                           type: boolean
+                        index:
+                          type: number
                   canReply:
+                    type: boolean
+                  canUpload:
                     type: boolean
                   groupChat:
                     type: boolean
@@ -153,7 +195,178 @@ get:
                     type: boolean
                   isAdminOrGlobalMod:
                     type: boolean
+                  isAdmin:
+                    type: boolean
                   rooms:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        roomId:
+                          type: number
+                        roomName:
+                          type: string
+                        public:
+                          type: boolean
+                        userCount:
+                          type: number
+                        messageCount:
+                          type: number
+                        groups:
+                          type: array
+                        timestamp:
+                          type: number
+                          description: Timestamp of when room was created
+                        users:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              uid:
+                                type: number
+                                description: A user identifier
+                              isLocal:
+                                type: boolean
+                                description: Whether the user belongs to the local installation or not.
+                              username:
+                                type: string
+                                description: A friendly name for a given user account
+                              displayname:
+                                type: string
+                                description: This is either username or fullname depending on forum and user settings
+                              userslug:
+                                type: string
+                                description: An URL-safe variant of the username (i.e. lower-cased, spaces
+                                  removed, etc.)
+                              picture:
+                                nullable: true
+                                type: string
+                              status:
+                                type: string
+                              lastonline:
+                                type: number
+                              icon:text:
+                                type: string
+                                description: A single-letter representation of a username. This is used in the
+                                  auto-generated icon given to users without
+                                  an avatar
+                              icon:bgColor:
+                                type: string
+                                description: A six-character hexadecimal colour code assigned to the user. This
+                                  value is used in conjunction with
+                                  `icon:text` for the user's auto-generated
+                                  icon
+                                example: "#f44336"
+                              lastonlineISO:
+                                type: string
+                        groupChat:
+                          type: boolean
+                        unread:
+                          type: boolean
+                        teaser:
+                          type: object
+                          properties:
+                            roomId:
+                              type: number
+                            fromuid:
+                              type: number
+                            content:
+                              type: string
+                            timestamp:
+                              type: number
+                            timestampISO:
+                              type: string
+                              description: An ISO 8601 formatted date string (complementing `timestamp`)
+                            user:
+                              type: object
+                              properties:
+                                uid:
+                                  type: number
+                                  description: A user identifier
+                                isLocal:
+                                  type: boolean
+                                  description: Whether the user belongs to the local installation or not.
+                                username:
+                                  type: string
+                                  description: A friendly name for a given user account
+                                displayname:
+                                  type: string
+                                  description: This is either username or fullname depending on forum and user settings
+                                userslug:
+                                  type: string
+                                  description: An URL-safe variant of the username (i.e. lower-cased, spaces
+                                    removed, etc.)
+                                picture:
+                                  nullable: true
+                                  type: string
+                                status:
+                                  type: string
+                                lastonline:
+                                  type: number
+                                icon:text:
+                                  type: string
+                                  description: A single-letter representation of a username. This is used in the
+                                    auto-generated icon given to users
+                                    without an avatar
+                                icon:bgColor:
+                                  type: string
+                                  description: A six-character hexadecimal colour code assigned to the user. This
+                                    value is used in conjunction with
+                                    `icon:text` for the user's
+                                    auto-generated icon
+                                  example: "#f44336"
+                                lastonlineISO:
+                                  type: string
+                          nullable: true
+                        lastUser:
+                          type: object
+                          properties:
+                            uid:
+                              type: number
+                              description: A user identifier
+                            isLocal:
+                              type: boolean
+                              description: Whether the user belongs to the local installation or not.
+                            username:
+                              type: string
+                              description: A friendly name for a given user account
+                            displayname:
+                              type: string
+                              description: This is either username or fullname depending on forum and user settings
+                            userslug:
+                              type: string
+                              description: An URL-safe variant of the username (i.e. lower-cased, spaces
+                                removed, etc.)
+                            picture:
+                              nullable: true
+                              type: string
+                            status:
+                              type: string
+                            lastonline:
+                              type: number
+                            icon:text:
+                              type: string
+                              description: A single-letter representation of a username. This is used in the
+                                auto-generated icon given to users without
+                                an avatar
+                            icon:bgColor:
+                              type: string
+                              description: A six-character hexadecimal colour code assigned to the user. This
+                                value is used in conjunction with
+                                `icon:text` for the user's auto-generated
+                                icon
+                              example: "#f44336"
+                            lastonlineISO:
+                              type: string
+                        usernames:
+                          type: string
+                        chatWithMessage:
+                          type: string
+                        notificationSetting:
+                          type: number
+                        joinLeaveMessages:
+                          type: number
+                  publicRooms:
                     type: array
                     items:
                       type: object
@@ -166,6 +379,8 @@ get:
                           type: number
                         roomName:
                           type: string
+                        public:
+                          type: boolean
                         users:
                           type: array
                           items:
@@ -174,6 +389,9 @@ get:
                               uid:
                                 type: number
                                 description: A user identifier
+                              isLocal:
+                                type: boolean
+                                description: Whether the user belongs to the local installation or not.
                               username:
                                 type: string
                                 description: A friendly name for a given user account
@@ -227,6 +445,9 @@ get:
                                 uid:
                                   type: number
                                   description: A user identifier
+                                isLocal:
+                                  type: boolean
+                                  description: Whether the user belongs to the local installation or not.
                                 username:
                                   type: string
                                   description: A friendly name for a given user account
@@ -265,6 +486,9 @@ get:
                             uid:
                               type: number
                               description: A user identifier
+                            isLocal:
+                              type: boolean
+                              description: Whether the user belongs to the local installation or not.
                             username:
                               type: string
                               description: A friendly name for a given user account
@@ -298,6 +522,10 @@ get:
                               type: string
                         usernames:
                           type: string
+                        chatWithMessage:
+                          type: string
+                  privateRoomCount:
+                    type: number
                   nextStart:
                     type: number
                   title:
@@ -311,4 +539,11 @@ get:
                       removed, etc.)
                   canViewInfo:
                     type: boolean
+                  chatWithMessage:
+                    type: string
+                  bodyClasses:
+                    type: array
+                  composerActions:
+                    type: array
+                    description: A list of buttons that are added next to the send message button by plugins
               - $ref: ../../../../components/schemas/CommonProps.yaml#/CommonProps

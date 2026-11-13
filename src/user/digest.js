@@ -8,6 +8,7 @@ const batch = require('../batch');
 const meta = require('../meta');
 const user = require('./index');
 const topics = require('../topics');
+const messaging = require('../messaging');
 const plugins = require('../plugins');
 const emailer = require('../emailer');
 const utils = require('../utils');
@@ -20,14 +21,14 @@ Digest.execute = async function (payload) {
 	const digestsDisabled = meta.config.disableEmailSubscriptions === 1;
 	if (digestsDisabled) {
 		winston.info(`[user/jobs] Did not send digests (${payload.interval}) because subscription system is disabled.`);
-		return;
+		return false;
 	}
 	let { subscribers } = payload;
 	if (!subscribers) {
 		subscribers = await Digest.getSubscribers(payload.interval);
 	}
 	if (!subscribers.length) {
-		return;
+		return false;
 	}
 	try {
 		winston.info(`[user/jobs] Digest (${payload.interval}) scheduling completed (${subscribers.length} subscribers). Sending emails; this may take some time...`);
@@ -36,6 +37,7 @@ Digest.execute = async function (payload) {
 			subscribers: subscribers,
 		});
 		winston.info(`[user/jobs] Digest (${payload.interval}) complete.`);
+		return true;
 	} catch (err) {
 		winston.error(`[user/jobs] Could not send digests (${payload.interval})\n${err.stack}`);
 		throw err;
@@ -43,35 +45,20 @@ Digest.execute = async function (payload) {
 };
 
 Digest.getUsersInterval = async (uids) => {
-	// Checks whether user specifies digest setting, or null/false for system default setting
+	// Checks whether user specifies digest setting, or false for system default setting
 	let single = false;
 	if (!Array.isArray(uids) && !isNaN(parseInt(uids, 10))) {
 		uids = [uids];
 		single = true;
 	}
 
-	const settings = await Promise.all([
-		db.isSortedSetMembers('digest:day:uids', uids),
-		db.isSortedSetMembers('digest:week:uids', uids),
-		db.isSortedSetMembers('digest:month:uids', uids),
-	]);
-
-	const interval = uids.map((uid, index) => {
-		if (settings[0][index]) {
-			return 'day';
-		} else if (settings[1][index]) {
-			return 'week';
-		} else if (settings[2][index]) {
-			return 'month';
-		}
-		return false;
-	});
-
+	const settings = await db.getObjects(uids.map(uid => `user:${uid}:settings`));
+	const interval = uids.map((uid, index) => (settings[index] && settings[index].dailyDigestFreq) || false);
 	return single ? interval[0] : interval;
 };
 
 Digest.getSubscribers = async function (interval) {
-	let subscribers = [];
+	const subscribers = [];
 
 	await batch.processSortedSet('users:joindate', async (uids) => {
 		const settings = await user.getMultipleUserSettings(uids);
@@ -82,7 +69,7 @@ Digest.getSubscribers = async function (interval) {
 			}
 		});
 		subUids = await user.bans.filterBanned(subUids);
-		subscribers = subscribers.concat(subUids);
+		subscribers.push(...subUids);
 	}, {
 		interval: 1000,
 		batch: 500,
@@ -97,24 +84,36 @@ Digest.getSubscribers = async function (interval) {
 
 Digest.send = async function (data) {
 	let emailsSent = 0;
+	let emailsFailed = 0;
 	if (!data || !data.subscribers || !data.subscribers.length) {
 		return emailsSent;
 	}
 	let errorLogged = false;
+	const date = new Date();
 	await batch.processArray(data.subscribers, async (uids) => {
-		let userData = await user.getUsersFields(uids, ['uid', 'email', 'email:confirmed', 'username', 'userslug', 'lastonline']);
-		userData = userData.filter(u => u && u.email && (!meta.config.requireEmailConfirmation || u['email:confirmed']));
+		let userData = await user.getUsersFields(uids, [
+			'uid', 'email', 'email:confirmed', 'username', 'userslug', 'lastonline',
+		]);
+		userData = userData.filter(
+			u => u && u.email && (meta.config.includeUnverifiedEmails || u['email:confirmed'])
+		);
 		if (!userData.length) {
 			return;
 		}
-		await Promise.all(userData.map(async (userObj) => {
-			const [notifications, topics] = await Promise.all([
+		const userSettings = await user.getMultipleUserSettings(userData.map(u => u.uid));
+		const successfullUids = [];
+		await Promise.all(userData.map(async (userObj, index) => {
+			const userSetting = userSettings[index];
+			const [publicRooms, notifications, topics] = await Promise.all([
+				getUnreadPublicRooms(userObj.uid),
 				user.notifications.getUnreadInterval(userObj.uid, data.interval),
 				getTermTopics(data.interval, userObj.uid),
 			]);
 			const unreadNotifs = notifications.filter(Boolean);
-			// If there are no notifications and no new topics, don't bother sending a digest
-			if (!unreadNotifs.length && !topics.top.length && !topics.popular.length && !topics.recent.length) {
+			// If there are no notifications and no new topics and no unread chats, don't bother sending a digest
+			if (!unreadNotifs.length &&
+				!topics.top.length && !topics.popular.length && !topics.recent.length &&
+				!publicRooms.length) {
 				return;
 			}
 
@@ -127,55 +126,62 @@ Digest.send = async function (data) {
 				}
 			});
 
-			emailsSent += 1;
-			const now = new Date();
-			await emailer.send('digest', userObj.uid, {
-				subject: `[[email:digest.subject, ${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}]]`,
-				username: userObj.username,
-				userslug: userObj.userslug,
-				notifications: unreadNotifs,
-				recent: topics.recent,
-				topTopics: topics.top,
-				popularTopics: topics.popular,
-				interval: data.interval,
-				showUnsubscribe: true,
-			}).catch((err) => {
+			try {
+				await emailer.send('digest', userObj.uid, {
+					subject: `[[email:digest.subject, ${date.toLocaleDateString(userSetting.userLang)}]]`,
+					username: userObj.username,
+					userslug: userObj.userslug,
+					notifications: unreadNotifs,
+					publicRooms: publicRooms,
+					recent: topics.recent,
+					topTopics: topics.top,
+					popularTopics: topics.popular,
+					interval: data.interval,
+					showUnsubscribe: true,
+				});
+				emailsSent += 1;
+				successfullUids.push(userObj.uid);
+			} catch (err) {
+				emailsFailed += 1;
 				if (!errorLogged) {
 					winston.error(`[user/jobs] Could not send digest email\n[emailer.send] ${err.stack}`);
 					errorLogged = true;
 				}
-			});
+			}
 		}));
-		if (data.interval !== 'alltime') {
+
+		if (data.interval !== 'alltime' && successfullUids.length) {
 			const now = Date.now();
-			await db.sortedSetAdd('digest:delivery', userData.map(() => now), userData.map(u => u.uid));
+			await db.sortedSetAdd('digest:delivery', successfullUids.map(() => now), successfullUids);
 		}
 	}, {
 		interval: 1000,
 		batch: 100,
 	});
-	winston.info(`[user/jobs] Digest (${data.interval}) sending completed. ${emailsSent} emails sent.`);
+	winston.info(`[user/jobs] Digest (${data.interval}) sending completed. ${emailsSent} emails sent. ${emailsFailed} failures.`);
+	return emailsSent;
 };
 
 Digest.getDeliveryTimes = async (start, stop) => {
-	const count = await db.sortedSetCard('users:joindate');
-	const uids = await user.getUidsFromSet('users:joindate', start, stop);
-	if (!uids) {
-		return [];
+	const [count, uids] = await Promise.all([
+		db.sortedSetCard('users:joindate'),
+		user.getUidsFromSet('users:joindate', start, stop),
+	]);
+	if (!uids.length) {
+		return { users: [], count };
 	}
 
-	// Grab the last time a digest was successfully delivered to these uids
-	const scores = await db.sortedSetScores('digest:delivery', uids);
+	const [scores, settings, userData] = await Promise.all([
+		// Grab the last time a digest was successfully delivered to these uids
+		db.sortedSetScores('digest:delivery', uids),
+		// Get users' digest settings
+		Digest.getUsersInterval(uids),
+		user.getUsersFields(uids, ['username', 'picture']),
+	]);
 
-	// Get users' digest settings
-	const settings = await Digest.getUsersInterval(uids);
-
-	// Populate user data
-	let userData = await user.getUsersFields(uids, ['username', 'picture']);
-	userData = userData.map((user, idx) => {
+	userData.forEach((user, idx) => {
 		user.lastDelivery = scores[idx] ? new Date(scores[idx]).toISOString() : '[[admin/manage/digest:null]]';
 		user.setting = settings[idx];
-		return user;
 	});
 
 	return {
@@ -190,19 +196,22 @@ async function getTermTopics(term, uid) {
 		start: 0,
 		stop: 199,
 		term: term,
-		sort: 'votes',
+		sort: 'posts',
 		teaserPost: 'first',
 	});
 	data.topics = data.topics.filter(topic => topic && !topic.deleted);
 
-	const top = data.topics.filter(t => t.votes > 0).slice(0, 10);
-	const topTids = top.map(t => t.tid);
-
 	const popular = data.topics
-		.filter(t => t.postcount > 1 && !topTids.includes(t.tid))
+		.filter(t => t.postcount > 1)
 		.sort((a, b) => b.postcount - a.postcount)
 		.slice(0, 10);
 	const popularTids = popular.map(t => t.tid);
+
+	const top = data.topics
+		.filter(t => t.votes > 0 && !popularTids.includes(t.tid))
+		.sort((a, b) => b.votes - a.votes)
+		.slice(0, 10);
+	const topTids = top.map(t => t.tid);
 
 	const recent = data.topics
 		.filter(t => !topTids.includes(t.tid) && !popularTids.includes(t.tid))
@@ -223,4 +232,9 @@ async function getTermTopics(term, uid) {
 		}
 	});
 	return { top, popular, recent };
+}
+
+async function getUnreadPublicRooms(uid) {
+	const publicRooms = await messaging.getPublicRooms(uid, uid);
+	return publicRooms.filter(r => r && r.unread);
 }

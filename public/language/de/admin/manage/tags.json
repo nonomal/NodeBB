@@ -1,18 +1,20 @@
 {
+	"manage-tags": "Tags verwalten",
 	"none": "Das Forum hat bisher noch keine Themen mit Tags.",
 	"bg-color": "Hintergrundfarbe",
 	"text-color": "Textfarbe",
-	"description": "Select tags by clicking or dragging, use <code>CTRL</code> to select multiple tags.",
+	"description": "Wähle Tags durch Klicken oder Ziehen aus, verwende <code>STRG</code>, um mehrere Tags auszuwählen.",
 	"create": "Tag erstellen",
+	"add-tag": "Tag hinzufügen",
 	"modify": "Tag bearbeiten",
 	"rename": "Tags umbenennen",
 	"delete": "Ausgewählte Tags entfernen",
 	"search": "Nach Tags suchen",
-	"settings": "Tags Settings",
+	"settings": "Tag-Einstellungen",
 	"name": "Tagname",
 
-	"alerts.editing": "Editing tag(s)",
-	"alerts.confirm-delete": "Wollen Sie die ausgewählten Tags löschen?",
+	"alerts.editing": "Tag(s) bearbeiten",
+	"alerts.confirm-delete": "Willst du die ausgewählten Tags löschen?",
 	"alerts.update-success": "Tag aktualisiert!",
-	"reset-colors": "Reset colors"
+	"reset-colors": "Farben zurücksetzen"
 }

@@ -1,7 +1,5 @@
 'use strict';
 
-const validator = require('validator');
-
 const db = require('../database');
 const meta = require('../meta');
 const plugins = require('../plugins');
@@ -13,21 +11,52 @@ const intFields = [
 	'minTags', 'maxTags', 'postQueue', 'subCategoriesPerPage',
 ];
 
+const worldCategory = {
+	cid: -1,
+	name: '[[category:uncategorized]]',
+	description: '[[category:uncategorized.description]]',
+	descriptionParsed: '[[category:uncategorized.description]]',
+	icon: 'fa-globe',
+	imageClass: 'cover',
+	bgColor: '#eee',
+	color: '#333',
+	slug: '../world',
+	parentCid: 0,
+	disabled: 0,
+	handle: 'world',
+	link: '',
+	class: '',
+};
+
 module.exports = function (Categories) {
 	Categories.getCategoriesFields = async function (cids, fields) {
 		if (!Array.isArray(cids) || !cids.length) {
 			return [];
 		}
 
-		const keys = cids.map(cid => `category:${cid}`);
+		cids = cids.map(cid => (utils.isNumber(cid) ? parseInt(cid, 10) : cid));
+		const keys = cids.map(cid => (utils.isNumber(cid) ? `category:${cid}` : `categoryRemote:${cid}`));
 		const categories = await db.getObjects(keys, fields);
+
+		// Handle cid -1
+		if (cids.includes(-1)) {
+			let subset = null;
+			if (fields && fields.length) {
+				subset = fields.reduce((category, field) => {
+					category[field] = worldCategory[field] || undefined;
+					return category;
+				}, {});
+			}
+			categories.splice(cids.indexOf(-1), 1, subset || { ...worldCategory });
+		}
+
 		const result = await plugins.hooks.fire('filter:category.getFields', {
 			cids: cids,
 			categories: categories,
 			fields: fields,
 			keys: keys,
 		});
-		result.categories.forEach(category => modifyCategory(category, fields));
+		await modifyCategories(result.categories, result.fields);
 		return result.categories;
 	};
 
@@ -42,7 +71,7 @@ module.exports = function (Categories) {
 
 	Categories.getCategoryField = async function (cid, field) {
 		const category = await Categories.getCategoryFields(cid, [field]);
-		return category ? category[field] : null;
+		return category && category.hasOwnProperty(field) ? category[field] : null;
 	};
 
 	Categories.getCategoryFields = async function (cid, fields) {
@@ -56,16 +85,26 @@ module.exports = function (Categories) {
 	};
 
 	Categories.setCategoryField = async function (cid, field, value) {
-		await db.setObjectField(`category:${cid}`, field, value);
+		await db.setObjectField(
+			utils.isNumber(cid) ? `category:${cid}` : `categoryRemote:${cid}`,
+			field, value
+		);
+	};
+
+	Categories.setCategoryFields = async function (cid, fields) {
+		await db.setObject(
+			utils.isNumber(cid) ? `category:${cid}` : `categoryRemote:${cid}`,
+			fields
+		);
 	};
 
 	Categories.incrementCategoryFieldBy = async function (cid, field, value) {
-		await db.incrObjectFieldBy(`category:${cid}`, field, value);
+		await db.incrObjectFieldBy(utils.isNumber(cid) ? `category:${cid}` : `categoryRemote:${cid}`, field, value);
 	};
 };
 
-function defaultIntField(category, fields, fieldName, defaultField) {
-	if (!fields.length || fields.includes(fieldName)) {
+function defaultIntField(category, hasField, fieldName, defaultField) {
+	if (hasField(fieldName)) {
 		const useDefault = !category.hasOwnProperty(fieldName) ||
 			category[fieldName] === null ||
 			category[fieldName] === '' ||
@@ -75,38 +114,49 @@ function defaultIntField(category, fields, fieldName, defaultField) {
 	}
 }
 
-function modifyCategory(category, fields) {
-	if (!category) {
+async function modifyCategories(categories, fields) {
+	if (!categories || !categories.length) {
 		return;
 	}
+	const hasField = utils.createFieldChecker(fields);
 
-	defaultIntField(category, fields, 'minTags', 'minimumTagsPerTopic');
-	defaultIntField(category, fields, 'maxTags', 'maximumTagsPerTopic');
-	defaultIntField(category, fields, 'postQueue', 'postQueue');
+	await Promise.all(categories.map(async (category) => {
+		if (!category) return;
+		defaultIntField(category, hasField, 'minTags', 'minimumTagsPerTopic');
+		defaultIntField(category, hasField, 'maxTags', 'maximumTagsPerTopic');
+		defaultIntField(category, hasField, 'postQueue', 'postQueue');
 
-	db.parseIntFields(category, intFields, fields);
+		db.parseIntFields(category, intFields, fields);
 
-	const escapeFields = ['name', 'color', 'bgColor', 'imageClass', 'class', 'link'];
-	escapeFields.forEach((field) => {
-		if (category.hasOwnProperty(field)) {
-			category[field] = validator.escape(String(category[field] || ''));
+		if (hasField('icon')) {
+			category.icon = category.icon || 'hidden';
+			if (category.icon === 'fa-none') {
+				category.icon = 'fa-nbb-none';
+			}
 		}
-	});
 
-	if (category.hasOwnProperty('icon')) {
-		category.icon = category.icon || 'hidden';
-	}
+		if (hasField('post_count')) {
+			category.totalPostCount = category.post_count;
+		}
 
-	if (category.hasOwnProperty('post_count')) {
-		category.totalPostCount = category.post_count;
-	}
+		if (hasField('topic_count')) {
+			category.totalTopicCount = category.topic_count;
+		}
 
-	if (category.hasOwnProperty('topic_count')) {
-		category.totalTopicCount = category.topic_count;
-	}
+		if (hasField('nickname')) {
+			category.nickname = category.nickname || '';
+		}
 
-	if (category.description) {
-		category.description = validator.escape(String(category.description));
-		category.descriptionParsed = category.descriptionParsed || category.description;
-	}
+		if (hasField('name')) {
+			category.name = category.nickname || category.name;
+		}
+
+		if (hasField('url')) {
+			category.url = utils.isSafeHref(category.url) ? category.url : '';
+		}
+
+		if (hasField('description') && category.cid !== -1) {
+			category.descriptionParsed = await plugins.hooks.fire('filter:parse.raw', category.description || '');
+		}
+	}));
 }

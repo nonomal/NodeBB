@@ -5,15 +5,9 @@
     "month": "Mês",
     "year": "Ano",
     "alltime": "Todos os Tempos",
-    "no_recent_topics": "Não há tópicos recentes.",
-    "no_popular_topics": "Não há tópicos populares.",
-    "there-is-a-new-topic": "Há um novo tópico.",
-    "there-is-a-new-topic-and-a-new-post": "Há um novo tópico e um novo post.",
-    "there-is-a-new-topic-and-new-posts": "Há um novo tópico e %1 novos posts.",
-    "there-are-new-topics": "Há %1 novos tópicos.",
-    "there-are-new-topics-and-a-new-post": "Há %1 novos tópicos e um novo post.",
-    "there-are-new-topics-and-new-posts": "Há %1 novos tópicos e %2 novos posts.",
-    "there-is-a-new-post": "Há um novo post.",
-    "there-are-new-posts": "Há %1 novos posts.",
-    "click-here-to-reload": "Clique aqui para recarregar."
+    "no-recent-topics": "Não há tópicos recentes.",
+    "no-popular-topics": "Não há tópicos populares.",
+    "load-new-posts": "Load new posts",
+    "uncategorized.title": "All known topics",
+    "uncategorized.intro": "This page shows a chronological listing of every topic that this forum has received.<br />The views and opinions expressed in the topics below are not moderated and may not represent the views and opinions of this website."
 }

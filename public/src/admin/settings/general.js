@@ -2,9 +2,9 @@
 
 
 define('admin/settings/general', ['admin/settings'], function () {
-	var Module = {};
+	const General = {};
 
-	Module.init = function () {
+	General.init = function () {
 		$('button[data-action="removeLogo"]').on('click', function () {
 			$('input[data-field="brand:logo"]').val('');
 		});
@@ -18,9 +18,21 @@ define('admin/settings/general', ['admin/settings'], function () {
 			$('input[data-field="brand:maskableIcon"]').val('');
 		});
 		$('button[data-action="removeOgImage"]').on('click', function () {
-			$('input[data-field="removeOgImage"]').val('');
+			$('input[data-field="og:image"]').val('');
 		});
+
+		$('[data-field="homePageRoute"]').on('change', toggleCustomRoute);
+
+		toggleCustomRoute();
 	};
 
-	return Module;
+	function toggleCustomRoute() {
+		if ($('[data-field="homePageRoute"]').val() === 'custom') {
+			$('#homePageCustom').show();
+		} else {
+			$('#homePageCustom').hide();
+		}
+	}
+
+	return General;
 });

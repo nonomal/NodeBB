@@ -11,15 +11,25 @@ get:
           schema:
             type: object
             properties:
+              url:
+                type: string
               relative_path:
                 type: string
               upload_url:
                 type: string
               assetBaseUrl:
                 type: string
+              asset_base_url:
+                type: string
               siteTitle:
                 type: string
               browserTitle:
+                type: string
+              description:
+                type: string
+              keywords:
+                type: string
+              brand:logo:
                 type: string
               titleLayout:
                 type: string
@@ -27,6 +37,8 @@ get:
                 type: boolean
               maintenanceMode:
                 type: boolean
+              postQueue:
+                type: number
               minimumTitleLength:
                 type: number
               maximumTitleLength:
@@ -77,6 +89,8 @@ get:
                 type: number
               maximumFileSize:
                 type: number
+              convertPastedImageTo:
+                type: string
               theme:id:
                 type: string
               theme:src:
@@ -92,8 +106,6 @@ get:
                 description: A user identifier
               cache-buster:
                 type: string
-              requireEmailConfirmation:
-                type: boolean
               topicPostSort:
                 type: string
               categoryTopicSort:
@@ -102,8 +114,16 @@ get:
                 type: string
               searchEnabled:
                 type: boolean
+              searchDefaultInQuick:
+                type: string
+              disableCustomUserSkins:
+                type: boolean
               bootswatchSkin:
                 type: string
+              defaultBootswatchSkin:
+                type: string
+              composer:showHelpTab:
+                type: boolean
               enablePostHistory:
                 type: boolean
               timeagoCutoff:
@@ -132,6 +152,12 @@ get:
                     type: number
               acpLang:
                 type: string
+              hideReadNotifications:
+                type: boolean
+              notificationType_new-reply:
+                type: string
+              notificationType_new-topic-with-tag:
+                type: string
               openOutgoingLinksInNewTab:
                 type: boolean
               topicSearchEnabled:
@@ -142,9 +168,37 @@ get:
                 type: boolean
               enableQuickReply:
                 type: boolean
-              iconBackgrounds:
-                type: array
-                items:
-                  type: string
-                  description: A valid CSS colour code
-                  example: '#fff'
+              emailPrompt:
+                type: number
+              useragent:
+                type: object
+                properties:
+                  isSafari:
+                    type: boolean
+              composer-default:
+                type: object
+              fontawesome:
+                type: object
+                properties:
+                  pro:
+                    type: boolean
+                  styles:
+                    type: array
+                    items:
+                      type: string
+                  version:
+                    type: string
+              activitypub:
+                type: object
+                properties:
+                  probe:
+                    type: number
+                  worldDefaultCid:
+                    type: number
+              tinycon:
+                type: object
+                properties:
+                  color:
+                    type: string
+                  background:
+                    type: string

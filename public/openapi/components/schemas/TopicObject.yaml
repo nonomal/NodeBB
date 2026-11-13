@@ -35,6 +35,9 @@ TopicObject:
             uid:
               type: number
               description: A user identifier
+            isLocal:
+              type: boolean
+              description: Whether the user belongs to the local installation or not.
             username:
               type: string
               description: A friendly name for a given user account
@@ -54,11 +57,6 @@ TopicObject:
             picture:
               type: string
               nullable: true
-            signature:
-              type: string
-              nullable: true
-            banned:
-              type: number
             status:
               type: string
             icon:text:
@@ -73,6 +71,10 @@ TopicObject:
                 `icon:text` for the user's auto-generated
                 icon
               example: "#f44336"
+            banned:
+              type: boolean
+            banned_until:
+              type: number
             banned_until_readable:
               type: string
           required:
@@ -82,61 +84,13 @@ TopicObject:
             - reputation
             - postcount
             - picture
-            - signature
             - banned
             - status
             - icon:text
             - icon:bgColor
             - banned_until_readable
         teaser:
-          type: object
-          properties:
-            pid:
-              type: number
-            uid:
-              type: number
-              description: A user identifier
-            timestamp:
-              type: number
-            tid:
-              type: number
-              description: A topic identifier
-            content:
-              type: string
-            timestampISO:
-              type: string
-              description: An ISO 8601 formatted date string (complementing `timestamp`)
-            user:
-              type: object
-              properties:
-                uid:
-                  type: number
-                  description: A user identifier
-                username:
-                  type: string
-                  description: A friendly name for a given user account
-                userslug:
-                  type: string
-                  description: An URL-safe variant of the username (i.e. lower-cased, spaces
-                    removed, etc.)
-                picture:
-                  nullable: true
-                  type: string
-                icon:text:
-                  type: string
-                  description: A single-letter representation of a username. This is used in the
-                    auto-generated icon given to users
-                    without an avatar
-                icon:bgColor:
-                  type: string
-                  description: A six-character hexadecimal colour code assigned to the user. This
-                    value is used in conjunction with
-                    `icon:text` for the user's
-                    auto-generated icon
-                  example: "#f44336"
-            index:
-              type: number
-          nullable: true
+          $ref: './TeaserObject.yaml#/TeaserObject'
         tags:
           type: array
           items:
@@ -155,6 +109,8 @@ TopicObject:
         isOwner:
           type: boolean
         ignored:
+          type: boolean
+        followed:
           type: boolean
         unread:
           type: boolean
@@ -202,6 +158,8 @@ TopicObjectSlim:
           description: A category identifier
         title:
           type: string
+        generatedTitle:
+          type: number
         slug:
           type: string
         mainPid:
@@ -213,8 +171,10 @@ TopicObjectSlim:
           type: number
         postercount:
           type: number
-        scheduled:
+        followercount:
           type: number
+        scheduled:
+          type: boolean
         deleted:
           type: number
         deleterUid:
@@ -250,21 +210,29 @@ TopicObjectSlim:
         votes:
           type: number
         teaserPid:
-          oneOf:
+          anyOf:
             - type: number
             - type: string
-          nullable: true
+            - type: string
+              nullable: true
+              enum:
+                - null
         thumbs:
           type: array
           items:
             type: object
             properties:
               id:
-                type: number
+                oneOf:
+                  - type: number
+                  - type: string
                 description: The topic id
               name:
                 type: string
                 description: The topic thumbnail filename
+              path:
+                type: string
+                description: Path to topic thumbnail without upload_url prefix
               url:
                 type: string
                 description: Relative path to the topic thumbnail

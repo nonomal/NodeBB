@@ -1,4 +1,5 @@
 {
+	"navigation": "Navigation",
 	"icon": "Icon:",
 	"change-icon": "ändern",
 	"route": "Pfad:",
@@ -9,8 +10,10 @@
 	"id": "ID: <small>optional</small>",
 
 	"properties": "Eigenschaften:",
-	"groups": "Gruppen:",
+	"show-to-groups": "In Gruppen anzeigen:",
 	"open-new-window": "In neuem Fenster öffnen",
+	"dropdown": "Dropdown",
+	"dropdown-placeholder": "Platziere deine Dropdown-Menüpunkte unten, d. h.:<br/>&lt;li&gt;&lt;a class=&quot;dropdown-item&quot; href&#x3D;&quot;https://myforum.com&quot;&gt;Link 1&lt;/a&gt;&lt;/li&gt;",
 
 	"btn.delete": "Löschen",
 	"btn.disable": "Deaktivieren",

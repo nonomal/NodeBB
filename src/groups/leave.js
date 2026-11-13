@@ -1,9 +1,13 @@
 'use strict';
 
+const _ = require('lodash');
+
 const db = require('../database');
 const user = require('../user');
 const plugins = require('../plugins');
 const cache = require('../cache');
+const messaging = require('../messaging');
+const utils = require('../utils');
 
 module.exports = function (Groups) {
 	Groups.leave = async function (groupNames, uid) {
@@ -40,20 +44,23 @@ module.exports = function (Groups) {
 
 		const promises = [];
 		if (emptyPrivilegeGroups.length) {
-			promises.push(Groups.destroy, emptyPrivilegeGroups);
+			promises.push(Groups.destroy(emptyPrivilegeGroups));
 		}
 		if (visibleGroups.length) {
 			promises.push(
-				db.sortedSetAdd,
-				'groups:visible:memberCount',
-				visibleGroups.map(groupData => groupData.memberCount),
-				visibleGroups.map(groupData => groupData.name)
+				db.sortedSetAdd(
+					'groups:visible:memberCount',
+					visibleGroups.map(groupData => groupData.memberCount),
+					visibleGroups.map(groupData => groupData.name)
+				)
 			);
 		}
 
-		await Promise.all(promises);
-
-		await clearGroupTitleIfSet(groupsToLeave, uid);
+		await Promise.all([
+			...promises,
+			clearGroupTitleIfSet(groupsToLeave, uid),
+			leavePublicRooms(groupsToLeave, uid),
+		]);
 
 		plugins.hooks.fire('action:group.leave', {
 			groupNames: groupsToLeave,
@@ -61,8 +68,30 @@ module.exports = function (Groups) {
 		});
 	};
 
+	async function leavePublicRooms(groupNames, uid) {
+		const allRoomIds = await messaging.getPublicRoomIdsFromSet('chat:rooms:public:order');
+		const allRoomData = await messaging.getRoomsData(allRoomIds);
+		const roomData = allRoomData.filter(
+			room => room && room.groups.some(group => groupNames.includes(group))
+		);
+		const isMemberOfAny = _.zipObject(
+			roomData.map(r => r.roomId),
+			await Promise.all(roomData.map(r => Groups.isMemberOfAny(uid, r.groups)))
+		);
+		const roomIds = roomData.filter(r => !isMemberOfAny[r.roomId]).map(r => r.roomId);
+		await messaging.leaveRooms(uid, roomIds);
+	}
+
 	async function clearGroupTitleIfSet(groupNames, uid) {
-		groupNames = groupNames.filter(groupName => groupName !== 'registered-users' && !Groups.isPrivilegeGroup(groupName));
+		if (!utils.isNumber(uid)) {
+			return;
+		}
+		groupNames = groupNames.filter(
+			groupName => groupName !== 'registered-users' &&
+			groupName !== 'unverified-users' &&
+			groupName !== 'verified-users' &&
+			!Groups.isPrivilegeGroup(groupName)
+		);
 		if (!groupNames.length) {
 			return;
 		}
@@ -80,10 +109,12 @@ module.exports = function (Groups) {
 	}
 
 	Groups.leaveAllGroups = async function (uid) {
-		const groups = await db.getSortedSetRange('groups:createtime', 0, -1);
+		const groups = await Groups.getAllGroupNames('groups:createtime');
 		await Promise.all([
 			Groups.leave(groups, uid),
-			Groups.rejectMembership(groups, uid),
+			Groups.rejectMembership(
+				groups.filter(g => !Groups.isPrivilegeGroup(g)), uid
+			),
 		]);
 	};
 

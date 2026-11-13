@@ -10,7 +10,9 @@ module.exports = function (module) {
 			{ $match: { _key: { $in: keys } } },
 			{ $group: { _id: { value: '$value' } } },
 			{ $group: { _id: null, count: { $sum: 1 } } },
-		]).toArray();
+		], {
+			hint: { _key: 1, value: -1 },
+		}).toArray();
 		return Array.isArray(data) && data.length ? data[0].count : 0;
 	};
 
@@ -26,7 +28,7 @@ module.exports = function (module) {
 
 	async function getSortedSetUnion(params) {
 		if (!Array.isArray(params.sets) || !params.sets.length) {
-			return;
+			return [];
 		}
 		let limit = params.stop - params.start + 1;
 		if (limit <= 0) {
@@ -43,7 +45,7 @@ module.exports = function (module) {
 		const pipeline = [
 			{ $match: { _key: { $in: params.sets } } },
 			{ $group: { _id: { value: '$value' }, totalScore: aggregate } },
-			{ $sort: { totalScore: params.sort } },
+			{ $sort: { totalScore: params.sort, _id: 1 } },
 		];
 
 		if (params.start) {
@@ -58,9 +60,11 @@ module.exports = function (module) {
 		if (params.withScores) {
 			project.score = '$totalScore';
 		}
-		pipeline.push({	$project: project });
+		pipeline.push({ $project: project });
 
-		let data = await module.client.collection('objects').aggregate(pipeline).toArray();
+		let data = await module.client.collection('objects').aggregate(pipeline, {
+			hint: { _key: 1, value: -1 },
+		}).toArray();
 		if (!params.withScores) {
 			data = data.map(item => item.value);
 		}

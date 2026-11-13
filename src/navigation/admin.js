@@ -1,6 +1,6 @@
 'use strict';
 
-const validator = require('validator');
+const winston = require('winston');
 
 const plugins = require('../plugins');
 const db = require('../database');
@@ -15,15 +15,22 @@ pubsub.on('admin:navigation:save', () => {
 
 admin.save = async function (data) {
 	const order = Object.keys(data);
-	const items = data.map((item, index) => {
+	const bulkSet = [];
+	data.forEach((item, index) => {
 		item.order = order[index];
-		return JSON.stringify(item);
+		if (item.hasOwnProperty('groups')) {
+			item.groups = JSON.stringify(item.groups);
+		}
+		bulkSet.push([`navigation:enabled:${item.order}`, item]);
 	});
 
 	cache = null;
 	pubsub.publish('admin:navigation:save');
+	const ids = await db.getSortedSetRange('navigation:enabled', 0, -1);
+	await db.deleteAll(ids.map(id => `navigation:enabled:${id}`));
+	await db.setObjectBulk(bulkSet);
 	await db.delete('navigation:enabled');
-	await db.sortedSetAdd('navigation:enabled', order, items);
+	await db.sortedSetAdd('navigation:enabled', order, order);
 };
 
 admin.getAdmin = async function () {
@@ -34,51 +41,61 @@ admin.getAdmin = async function () {
 	return { enabled: enabled, available: available };
 };
 
-const fieldsToEscape = ['iconClass', 'class', 'route', 'id', 'text', 'textClass', 'title'];
-
-admin.escapeFields = navItems => toggleEscape(navItems, true);
-admin.unescapeFields = navItems => toggleEscape(navItems, false);
-
-function toggleEscape(navItems, flag) {
-	navItems.forEach((item) => {
-		if (item) {
-			fieldsToEscape.forEach((field) => {
-				if (item.hasOwnProperty(field)) {
-					item[field] = validator[flag ? 'escape' : 'unescape'](String(item[field]));
-				}
-			});
-		}
-	});
-}
-
 admin.get = async function () {
 	if (cache) {
 		return cache.map(item => ({ ...item }));
 	}
-	const data = await db.getSortedSetRange('navigation:enabled', 0, -1);
-	cache = data.map((item) => {
-		item = JSON.parse(item);
+	const ids = await db.getSortedSetRange('navigation:enabled', 0, -1);
+	const data = await db.getObjects(ids.map(id => `navigation:enabled:${id}`));
+	cache = data.filter(Boolean).map((item) => {
+		if (item.hasOwnProperty('groups')) {
+			try {
+				item.groups = JSON.parse(item.groups);
+			} catch (err) {
+				winston.error(err.stack);
+				item.groups = [];
+			}
+		}
 		item.groups = item.groups || [];
 		if (item.groups && !Array.isArray(item.groups)) {
 			item.groups = [item.groups];
 		}
+
+		item.enabled = String(item.enabled) === 'on' || String(item.enabled) === 'true';
+		item.order = parseInt(item.order, 10);
 		return item;
 	});
-	admin.escapeFields(cache);
 
 	return cache.map(item => ({ ...item }));
+};
+
+admin.update = async function (route, data) {
+	const ids = await db.getSortedSetRange('navigation:enabled', 0, -1);
+	const navItems = await db.getObjects(ids.map(id => `navigation:enabled:${id}`));
+	const matchedRoutes = navItems.filter(item => item && item.route === route);
+	if (matchedRoutes.length) {
+		await db.setObjectBulk(
+			matchedRoutes.map(item => [`navigation:enabled:${item.order}`, data])
+		);
+		cache = null;
+		pubsub.publish('admin:navigation:save');
+	}
 };
 
 async function getAvailable() {
 	const core = require('../../install/data/navigation.json').map((item) => {
 		item.core = true;
 		item.id = item.id || '';
-		item.properties = item.properties || { targetBlank: false };
-
 		return item;
 	});
 
-	return await plugins.hooks.fire('filter:navigation.available', core);
+	const navItems = await plugins.hooks.fire('filter:navigation.available', core);
+	navItems.forEach((item) => {
+		if (item && !item.hasOwnProperty('enabled')) {
+			item.enabled = true;
+		}
+	});
+	return navItems;
 }
 
 require('../promisify')(admin);

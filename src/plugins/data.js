@@ -3,22 +3,38 @@
 const fs = require('fs');
 const path = require('path');
 const winston = require('winston');
+const _ = require('lodash');
+const nconf = require('nconf');
 
 const db = require('../database');
 const file = require('../file');
-const { paths } = require('../constants');
+const { paths, pluginNamePattern } = require('../constants');
 
 const Data = module.exports;
 
 const basePath = path.join(__dirname, '../../');
 
-Data.getPluginPaths = async function () {
-	let plugins = await db.getSortedSetRange('plugins:active', 0, -1);
-	plugins = plugins.filter(plugin => plugin && typeof plugin === 'string')
-		.map(plugin => path.join(paths.nodeModules, plugin));
+// to get this functionality use `plugins.getActive()` from `src/plugins/install.js` instead
+// this method duplicates that one, because requiring that file here would have side effects
+async function getActiveIds() {
+	if (nconf.get('plugins:active')) {
+		return nconf.get('plugins:active');
+	}
+	return await db.getSortedSetRange('plugins:active', 0, -1);
+}
 
-	const exists = await Promise.all(plugins.map(p => file.exists(p)));
-	return plugins.filter((p, i) => exists[i]);
+Data.getPluginPaths = async function () {
+	const plugins = await getActiveIds();
+	const pluginPaths = plugins.filter(
+		p => typeof p === 'string' && pluginNamePattern.test(p)
+	).map(plugin => path.join(paths.nodeModules, plugin));
+	const exists = await Promise.all(pluginPaths.map(file.exists));
+	exists.forEach((exists, i) => {
+		if (!exists) {
+			winston.warn(`[plugins] "${plugins[i]}" is active but not installed.`);
+		}
+	});
+	return pluginPaths.filter((p, i) => exists[i]);
 };
 
 Data.loadPluginInfo = async function (pluginPath) {
@@ -40,6 +56,7 @@ Data.loadPluginInfo = async function (pluginPath) {
 		pluginData.description = packageData.description;
 		pluginData.version = packageData.version;
 		pluginData.repository = packageData.repository;
+		pluginData.url = pluginData.url || pluginData?.repository?.url || '';
 		pluginData.nbbpm = packageData.nbbpm;
 		pluginData.path = pluginPath;
 	} catch (err) {
@@ -90,8 +107,12 @@ Data.getStaticDirectories = async function (pluginData) {
 				route}. Path must adhere to: ${validMappedPath.toString()}`);
 			return;
 		}
-
-		const dirPath = path.join(pluginData.path, pluginData.staticDirs[route]);
+		const dirPath = await resolveModulePath(pluginData.path, pluginData.staticDirs[route]);
+		if (!dirPath) {
+			winston.warn(`[plugins/${pluginData.id}] Invalid mapped path specified: ${
+				route} => ${pluginData.staticDirs[route]}`);
+			return;
+		}
 		try {
 			const stats = await fs.promises.stat(dirPath);
 			if (!stats.isDirectory()) {
@@ -112,8 +133,7 @@ Data.getStaticDirectories = async function (pluginData) {
 	}
 
 	await Promise.all(dirs.map(route => processDir(route)));
-	winston.verbose(`[plugins] found ${Object.keys(staticDirs).length
-	} static directories for ${pluginData.id}`);
+	winston.verbose(`[plugins] found ${Object.keys(staticDirs).length} static directories for ${pluginData.id}`);
 	return staticDirs;
 };
 
@@ -240,9 +260,8 @@ Data.getLanguageData = async function getLanguageData(pluginData) {
 		languages.push(language);
 		namespaces.push(namespace);
 	});
-
 	return {
-		languages,
-		namespaces,
+		languages: _.uniq(languages),
+		namespaces: _.uniq(namespaces),
 	};
 };

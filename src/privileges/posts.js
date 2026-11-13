@@ -3,10 +3,14 @@
 
 const _ = require('lodash');
 
+const db = require('../database');
 const meta = require('../meta');
 const posts = require('../posts');
 const topics = require('../topics');
+const categories = require('../categories');
+const groups = require('../groups');
 const user = require('../user');
+const activitypub = require('../activitypub');
 const helpers = require('./helpers');
 const plugins = require('../plugins');
 const utils = require('../utils');
@@ -19,42 +23,58 @@ privsPosts.get = async function (pids, uid) {
 	if (!Array.isArray(pids) || !pids.length) {
 		return [];
 	}
-	const cids = await posts.getCidsByPids(pids);
-	const uniqueCids = _.uniq(cids);
+	const postData = await posts.getPostsFields(pids, ['tid', 'uid']);
+	const uniqTids = _.uniq(postData.map(p => p && p.tid).filter(Boolean));
+	const topicData = await topics.getTopicsFields(uniqTids, ['cid', 'uid', 'deleted', 'scheduled']);
+	const tidToTopic = _.zipObject(uniqTids, topicData);
+	const uniqueCids = _.uniq(topicData.map(t => t && t.cid).filter(Boolean));
 
 	const results = await utils.promiseParallel({
 		isAdmin: user.isAdministrator(uid),
 		isModerator: user.isModerator(uid, uniqueCids),
-		isOwner: posts.isOwner(pids, uid),
-		'topics:read': helpers.isAllowedTo('topics:read', uid, uniqueCids),
 		read: helpers.isAllowedTo('read', uid, uniqueCids),
+		'topics:read': helpers.isAllowedTo('topics:read', uid, uniqueCids),
+		'topics:schedule': helpers.isAllowedTo('topics:schedule', uid, uniqueCids),
 		'posts:edit': helpers.isAllowedTo('posts:edit', uid, uniqueCids),
 		'posts:history': helpers.isAllowedTo('posts:history', uid, uniqueCids),
 		'posts:view_deleted': helpers.isAllowedTo('posts:view_deleted', uid, uniqueCids),
+		categoryData: categories.getCategoriesFields(uniqueCids, ['disabled']),
 	});
 
 	const isModerator = _.zipObject(uniqueCids, results.isModerator);
 	const privData = {};
-	privData['topics:read'] = _.zipObject(uniqueCids, results['topics:read']);
 	privData.read = _.zipObject(uniqueCids, results.read);
+	privData['topics:read'] = _.zipObject(uniqueCids, results['topics:read']);
+	privData['topics:schedule'] = _.zipObject(uniqueCids, results['topics:schedule']);
 	privData['posts:edit'] = _.zipObject(uniqueCids, results['posts:edit']);
 	privData['posts:history'] = _.zipObject(uniqueCids, results['posts:history']);
 	privData['posts:view_deleted'] = _.zipObject(uniqueCids, results['posts:view_deleted']);
+	privData.disabled = _.zipObject(uniqueCids, results.categoryData.map(c => c && c.disabled));
 
-	const privileges = cids.map((cid, i) => {
+	const privileges = postData.map((post, i) => {
+		const topic = tidToTopic[post.tid] || {};
+		const { cid } = topic;
+		const isPostOwner = String(post.uid) === String(uid);
+		const isTopicOwner = String(topic.uid) === String(uid);
 		const isAdminOrMod = results.isAdmin || isModerator[cid];
-		const editable = (privData['posts:edit'][cid] && (results.isOwner[i] || results.isModerator)) || results.isAdmin;
-		const viewDeletedPosts = results.isOwner[i] || privData['posts:view_deleted'][cid] || results.isAdmin;
-		const viewHistory = results.isOwner[i] || privData['posts:history'][cid] || results.isAdmin;
+		const editable = (privData['posts:edit'][cid] && (isPostOwner || results.isModerator[i])) || results.isAdmin;
+		const viewDeletedPosts = isPostOwner || privData['posts:view_deleted'][cid] || results.isAdmin;
+		const viewHistory = isPostOwner || privData['posts:history'][cid] || results.isAdmin;
+
+		const canViewDeletedScheduled = privsTopics.canViewDeletedScheduled(topic, {
+			view_deleted: results.isAdmin || isTopicOwner || privData['posts:view_deleted'][cid],
+			view_scheduled: results.isAdmin || privData['topics:schedule'][cid],
+		});
 
 		return {
 			editable: editable,
 			move: isAdminOrMod,
 			isAdminOrMod: isAdminOrMod,
-			'topics:read': privData['topics:read'][cid] || results.isAdmin,
+			'topics:read': results.isAdmin || (privData['topics:read'][cid] && canViewDeletedScheduled),
 			read: privData.read[cid] || results.isAdmin,
 			'posts:history': viewHistory,
 			'posts:view_deleted': viewDeletedPosts,
+			disabled: privData.disabled[cid],
 		};
 	});
 
@@ -84,7 +104,7 @@ privsPosts.filter = async function (privilege, pids, uid) {
 			post.topic = tidToTopic[post.tid];
 		}
 		return tidToTopic[post.tid] && tidToTopic[post.tid].cid;
-	}).filter(cid => parseInt(cid, 10));
+	}).filter(cid => utils.isNumber(cid) ? parseInt(cid, 10) : cid);
 
 	cids = _.uniq(cids);
 
@@ -114,52 +134,76 @@ privsPosts.filter = async function (privilege, pids, uid) {
 	return data ? data.pids : null;
 };
 
+privsPosts.canRead = async function (pid, uid) {
+	const tid = await posts.getPostField(pid, 'tid');
+	return await privsTopics.canRead(tid, uid);
+};
+
 privsPosts.canEdit = async function (pid, uid) {
+	const isRemote = activitypub.helpers.isUri(pid);
 	const results = await utils.promiseParallel({
 		isAdmin: user.isAdministrator(uid),
 		isMod: posts.isModerator([pid], uid),
-		owner: posts.isOwner(pid, uid),
+		isOwner: posts.isOwner(pid, uid),
+		isEditor: db.isSetMember(`pid:${pid}:editors`, uid),
+		isGroupEditor: isGroupEditor(pid, uid),
 		edit: privsPosts.can('posts:edit', pid, uid),
 		postData: posts.getPostFields(pid, ['tid', 'timestamp', 'deleted', 'deleterUid']),
 		userData: user.getUserFields(uid, ['reputation']),
 	});
-
+	if (!results.postData.tid) {
+		return { flag: false, message: '[[error:no-post]]' };
+	}
 	results.isMod = results.isMod[0];
 	if (results.isAdmin) {
 		return { flag: true };
 	}
 
 	if (
-		!results.isMod &&
+		!isRemote && !results.isMod &&
 		meta.config.postEditDuration &&
 		(Date.now() - results.postData.timestamp > meta.config.postEditDuration * 1000)
 	) {
 		return { flag: false, message: `[[error:post-edit-duration-expired, ${meta.config.postEditDuration}]]` };
 	}
 	if (
-		!results.isMod &&
+		!isRemote && !results.isMod &&
 		meta.config.newbiePostEditDuration > 0 &&
-		meta.config.newbiePostDelayThreshold > results.userData.reputation &&
+		meta.config.newbieReputationThreshold > results.userData.reputation &&
 		Date.now() - results.postData.timestamp > meta.config.newbiePostEditDuration * 1000
 	) {
 		return { flag: false, message: `[[error:post-edit-duration-expired, ${meta.config.newbiePostEditDuration}]]` };
 	}
 
-	const isLocked = await topics.isLocked(results.postData.tid);
-	if (!results.isMod && isLocked) {
+	results.isLocked = await topics.isLocked(results.postData.tid);
+	results.pid = utils.isNumber(pid) ? parseInt(pid, 10) : pid;
+	results.uid = uid;
+
+	// Fired ahead of the lock and deleted-post gates, so that plugins can grant
+	// edit access inside a locked topic by unsetting `isLocked`.
+	const result = await plugins.hooks.fire('filter:privileges.posts.edit', results);
+
+	if (!result.isMod && result.isLocked) {
 		return { flag: false, message: '[[error:topic-locked]]' };
 	}
 
-	if (!results.isMod && results.postData.deleted && parseInt(uid, 10) !== parseInt(results.postData.deleterUid, 10)) {
+	if (!result.isMod && result.postData.deleted && parseInt(uid, 10) !== parseInt(result.postData.deleterUid, 10)) {
 		return { flag: false, message: '[[error:post-deleted]]' };
 	}
 
-	results.pid = parseInt(pid, 10);
-	results.uid = uid;
-
-	const result = await plugins.hooks.fire('filter:privileges.posts.edit', results);
-	return { flag: result.edit && (result.owner || result.isMod), message: '[[error:no-privileges]]' };
+	return {
+		flag: result.edit && (result.isOwner || result.isEditor || result.isGroupEditor || result.isMod),
+		message: '[[error:no-privileges]]',
+	};
 };
+
+async function isGroupEditor(pid, uid) {
+	const groupNames = await db.getSetMembers(`pid:${pid}:editors:groups`);
+	if (!groupNames.length) {
+		return false;
+	}
+	return await groups.isMemberOfAny(uid, groupNames);
+}
 
 privsPosts.canDelete = async function (pid, uid) {
 	const postData = await posts.getPostFields(pid, ['uid', 'tid', 'timestamp', 'deleterUid']);
@@ -175,16 +219,24 @@ privsPosts.canDelete = async function (pid, uid) {
 		return { flag: true };
 	}
 
-	if (!results.isMod && results.isLocked) {
+	results.pid = utils.isNumber(pid) ? parseInt(pid, 10) : pid;
+	results.uid = uid;
+	results.postData = postData;
+
+	// Fired ahead of the lock and delete-duration gates, so that plugins can
+	// grant delete access inside a locked topic by unsetting `isLocked`.
+	const result = await plugins.hooks.fire('filter:privileges.posts.delete', results);
+
+	if (!result.isMod && result.isLocked) {
 		return { flag: false, message: '[[error:topic-locked]]' };
 	}
 
 	const { postDeleteDuration } = meta.config;
-	if (!results.isMod && postDeleteDuration && (Date.now() - postData.timestamp > postDeleteDuration * 1000)) {
+	if (!result.isMod && postDeleteDuration && (Date.now() - postData.timestamp > postDeleteDuration * 1000)) {
 		return { flag: false, message: `[[error:post-delete-duration-expired, ${meta.config.postDeleteDuration}]]` };
 	}
 	const { deleterUid } = postData;
-	const flag = results['posts:delete'] && ((results.isOwner && (deleterUid === 0 || deleterUid === postData.uid)) || results.isMod);
+	const flag = result['posts:delete'] && ((result.isOwner && (deleterUid === 0 || deleterUid === postData.uid)) || result.isMod);
 	return { flag: flag, message: '[[error:no-privileges]]' };
 };
 
@@ -222,6 +274,12 @@ privsPosts.canPurge = async function (pid, uid) {
 		isAdmin: user.isAdministrator(uid),
 		isModerator: user.isModerator(uid, cid),
 	});
+
+	// Allow remote posts to purge themselves (as:Delete received)
+	if (activitypub.helpers.isUri(pid) && results.owner) {
+		results.purge = true;
+	}
+
 	return (results.purge && (results.owner || results.isModerator)) || results.isAdmin;
 };
 

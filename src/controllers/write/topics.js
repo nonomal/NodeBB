@@ -1,10 +1,9 @@
 'use strict';
 
-const validator = require('validator');
-
+const db = require('../../database');
 const api = require('../../api');
 const topics = require('../../topics');
-const privileges = require('../../privileges');
+const activitypub = require('../../activitypub');
 
 const helpers = require('../helpers');
 const middleware = require('../../middleware');
@@ -13,22 +12,46 @@ const uploadsController = require('../uploads');
 const Topics = module.exports;
 
 Topics.get = async (req, res) => {
-	helpers.formatApiResponse(200, res, await api.topics.get(req, req.params));
+	const topicData = await api.topics.get(req, req.params);
+	if (!topicData) {
+		return helpers.formatApiResponse(404, res, new Error('[[error:no-topic]]'));
+	}
+	helpers.formatApiResponse(200, res, topicData);
 };
 
 Topics.create = async (req, res) => {
-	const payload = await api.topics.create(req, req.body);
-	if (payload.queued) {
-		helpers.formatApiResponse(202, res, payload);
-	} else {
-		helpers.formatApiResponse(200, res, payload);
+	const id = await lockPosting(req, '[[error:already-posting]]');
+	try {
+		const payload = await api.topics.create(req, req.body);
+		if (payload.queued) {
+			helpers.formatApiResponse(202, res, payload);
+		} else {
+			helpers.formatApiResponse(200, res, payload);
+		}
+	} finally {
+		await db.deleteObjectField('locks', id);
 	}
 };
 
 Topics.reply = async (req, res) => {
-	const payload = await api.topics.reply(req, { ...req.body, tid: req.params.tid });
-	helpers.formatApiResponse(200, res, payload);
+	const id = await lockPosting(req, '[[error:already-posting]]');
+	try {
+		const payload = await api.topics.reply(req, { ...req.body, tid: req.params.tid });
+		helpers.formatApiResponse(200, res, payload);
+	} finally {
+		await db.deleteObjectField('locks', id);
+	}
 };
+
+async function lockPosting(req, error) {
+	const id = req.uid > 0 ? req.uid : req.sessionID;
+	const value = `posting${id}`;
+	const count = await db.incrObjectField('locks', value);
+	if (count > 1) {
+		throw new Error(error);
+	}
+	return value;
+}
 
 Topics.delete = async (req, res) => {
 	await api.topics.delete(req, { tids: [req.params.tid] });
@@ -46,11 +69,8 @@ Topics.purge = async (req, res) => {
 };
 
 Topics.pin = async (req, res) => {
-	// Pin expiry was not available w/ sockets hence not included in api lib method
-	if (req.body.expiry) {
-		await topics.tools.setPinExpiry(req.params.tid, req.body.expiry, req.uid);
-	}
-	await api.topics.pin(req, {	tids: [req.params.tid] });
+	const { expiry } = req.body;
+	await api.topics.pin(req, { tids: [req.params.tid], expiry });
 
 	helpers.formatApiResponse(200, res);
 };
@@ -85,129 +105,139 @@ Topics.unfollow = async (req, res) => {
 	helpers.formatApiResponse(200, res);
 };
 
-Topics.addTags = async (req, res) => {
-	if (!await privileges.topics.canEdit(req.params.tid, req.user.uid)) {
-		return helpers.formatApiResponse(403, res);
-	}
-	const cid = await topics.getTopicField(req.params.tid, 'cid');
-	await topics.validateTags(req.body.tags, cid, req.user.uid, req.params.tid);
-	const tags = await topics.filterTags(req.body.tags);
+Topics.updateTags = async (req, res) => {
+	const payload = await api.topics.updateTags(req, {
+		tid: req.params.tid,
+		tags: req.body.tags,
+	});
+	helpers.formatApiResponse(200, res, payload);
+};
 
-	await topics.addTags(tags, [req.params.tid]);
-	helpers.formatApiResponse(200, res);
+Topics.addTags = async (req, res) => {
+	const payload = await api.topics.addTags(req, {
+		tid: req.params.tid,
+		tags: req.body.tags,
+	});
+
+	helpers.formatApiResponse(200, res, payload);
 };
 
 Topics.deleteTags = async (req, res) => {
-	if (!await privileges.topics.canEdit(req.params.tid, req.user.uid)) {
-		return helpers.formatApiResponse(403, res);
-	}
-
-	await topics.deleteTopicTags(req.params.tid);
+	await api.topics.deleteTags(req, { tid: req.params.tid });
 	helpers.formatApiResponse(200, res);
 };
 
 Topics.getThumbs = async (req, res) => {
-	if (isFinite(req.params.tid)) {	// post_uuids can be passed in occasionally, in that case no checks are necessary
-		const [exists, canRead] = await Promise.all([
-			topics.exists(req.params.tid),
-			privileges.topics.can('topics:read', req.params.tid, req.uid),
-		]);
-		if (!exists || !canRead) {
-			return helpers.formatApiResponse(403, res);
-		}
-	}
-
-	helpers.formatApiResponse(200, res, await topics.thumbs.get(req.params.tid));
+	let { thumbsOnly } = req.query;
+	thumbsOnly = thumbsOnly ? !!parseInt(thumbsOnly, 10) : false;
+	helpers.formatApiResponse(200, res, await api.topics.getThumbs(req, { ...req.params, thumbsOnly }));
 };
 
 Topics.addThumb = async (req, res) => {
-	await checkThumbPrivileges({ tid: req.params.tid, uid: req.user.uid, res });
-	if (res.headersSent) {
-		return;
-	}
+	// todo: move controller logic to src/api/topics.js
+	await api.topics._checkThumbPrivileges({ tid: req.params.tid, uid: req.uid });
 
-	const files = await uploadsController.uploadThumb(req, res);	// response is handled here
+	const files = await uploadsController.uploadThumb(req, res); // response is handled here
 
-	// Add uploaded files to topic zset
+	// Add uploaded files to topic hash
 	if (files && files.length) {
-		await Promise.all(files.map(async (fileObj) => {
+		for (const fileObj of files) {
+			// eslint-disable-next-line no-await-in-loop
 			await topics.thumbs.associate({
 				id: req.params.tid,
-				path: fileObj.path || fileObj.url,
+				path: fileObj.url,
 			});
-		}));
+		}
 	}
 };
 
-Topics.migrateThumbs = async (req, res) => {
-	await Promise.all([
-		checkThumbPrivileges({ tid: req.params.tid, uid: req.user.uid, res }),
-		checkThumbPrivileges({ tid: req.body.tid, uid: req.user.uid, res }),
-	]);
-	if (res.headersSent) {
-		return;
-	}
-
-	await topics.thumbs.migrate(req.params.tid, req.body.tid);
-	helpers.formatApiResponse(200, res);
-};
 
 Topics.deleteThumb = async (req, res) => {
-	if (!req.body.path.startsWith('http')) {
+	if (!req.body.path && !req.query.path) {
+		return helpers.formatApiResponse(400, res, new Error('[[error:invalid-data]]'));
+	}
+
+	const path = req.body.path || req.query.path;
+
+	if (!path.startsWith('http')) {
 		await middleware.assert.path(req, res, () => {});
 		if (res.headersSent) {
 			return;
 		}
 	}
 
-	await checkThumbPrivileges({ tid: req.params.tid, uid: req.user.uid, res });
-	if (res.headersSent) {
-		return;
-	}
-
-	await topics.thumbs.delete(req.params.tid, req.body.path);
+	await api.topics.deleteThumb(req, {
+		tid: req.params.tid,
+		path: path,
+	});
 	helpers.formatApiResponse(200, res, await topics.thumbs.get(req.params.tid));
 };
 
 Topics.reorderThumbs = async (req, res) => {
-	await checkThumbPrivileges({ tid: req.params.tid, uid: req.user.uid, res });
-	if (res.headersSent) {
-		return;
-	}
-
-	const exists = await topics.thumbs.exists(req.params.tid, req.body.path);
-	if (!exists) {
-		return helpers.formatApiResponse(404, res);
-	}
-
-	await topics.thumbs.associate({
-		id: req.params.tid,
-		path: req.body.path,
-		score: req.body.order,
+	const { path, order } = req.body;
+	await api.topics.reorderThumbs(req, {
+		path,
+		order,
+		...req.params,
 	});
+
+	helpers.formatApiResponse(200, res, await topics.thumbs.get(req.params.tid));
+};
+
+Topics.getEvents = async (req, res) => {
+	const events = await api.topics.getEvents(req, { ...req.params });
+
+	helpers.formatApiResponse(200, res, { events });
+};
+
+Topics.deleteEvent = async (req, res) => {
+	await api.topics.deleteEvent(req, { ...req.params });
+
 	helpers.formatApiResponse(200, res);
 };
 
-async function checkThumbPrivileges({ tid, uid, res }) {
-	// req.params.tid could be either a tid (pushing a new thumb to an existing topic)
-	// or a post UUID (a new topic being composed)
-	const isUUID = validator.isUUID(tid);
+Topics.markRead = async (req, res) => {
+	await api.topics.markRead(req, { ...req.params });
 
-	// Sanity-check the tid if it's strictly not a uuid
-	if (!isUUID && (isNaN(parseInt(tid, 10)) || !await topics.exists(tid))) {
-		return helpers.formatApiResponse(404, res, new Error('[[error:no-topic]]'));
-	}
+	helpers.formatApiResponse(200, res);
+};
 
-	// While drafts are not protected, tids are
-	if (!isUUID && !await privileges.topics.canEdit(tid, uid)) {
-		return helpers.formatApiResponse(403, res, new Error('[[error:no-privileges]]'));
-	}
-}
+Topics.markUnread = async (req, res) => {
+	await api.topics.markUnread(req, { ...req.params });
 
-Topics.getEvents = async (req, res) => {
-	if (!await privileges.topics.can('topics:read', req.params.tid, req.uid)) {
-		return helpers.formatApiResponse(403, res);
-	}
+	helpers.formatApiResponse(200, res);
+};
 
-	helpers.formatApiResponse(200, res, await topics.events.get(req.params.tid));
+Topics.bump = async (req, res) => {
+	await api.topics.bump(req, { ...req.params });
+
+	helpers.formatApiResponse(200, res);
+};
+
+Topics.move = async (req, res) => {
+	const { cid } = req.body;
+	await api.topics.move(req, { cid, ...req.params });
+
+	helpers.formatApiResponse(200, res);
+};
+
+Topics.getCrossposts = async (req, res) => {
+	const crossposts = await topics.crossposts.get(req.params.tid, req.uid);
+	helpers.formatApiResponse(200, res, { crossposts });
+};
+
+Topics.crosspost = async (req, res) => {
+	const cid = String(req.body.cid);
+	const crossposts = await topics.crossposts.add(req.params.tid, cid, req.uid);
+	await activitypub.out.announce.topic(req.params.tid, req.uid, cid);
+
+	helpers.formatApiResponse(200, res, { crossposts });
+};
+
+Topics.uncrosspost = async (req, res) => {
+	const cid = String(req.body.cid || req.query.cid);
+	const crossposts = await topics.crossposts.remove(req.params.tid, cid, req.uid);
+
+	await activitypub.out.undo.announce('uid', req.uid, req.params.tid);
+	helpers.formatApiResponse(200, res, { crossposts });
 };

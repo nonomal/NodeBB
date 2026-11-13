@@ -9,28 +9,18 @@ module.exports = function (module) {
 		}
 
 		await module.transaction(async (client) => {
-			async function doPrepend(value) {
-				await client.query({
-					name: 'listPrepend',
-					text: `
-	INSERT INTO "legacy_list" ("_key", "array")
-	VALUES ($1::TEXT, ARRAY[$2::TEXT])
-	ON CONFLICT ("_key")
-	DO UPDATE SET "array" = ARRAY[$2::TEXT] || "legacy_list"."array"`,
-					values: [key, value],
-				});
-			}
-
 			await helpers.ensureLegacyObjectType(client, key, 'list');
-			if (Array.isArray(value)) {
-				// TODO: perf make single query
-				for (const v of value) {
-					// eslint-disable-next-line
-					await doPrepend(v);
-				}
-				return;
-			}
-			await doPrepend(value);
+			value = Array.isArray(value) ? value : [value];
+			value.reverse();
+			await client.query({
+				name: 'listPrependValues',
+				text: `
+INSERT INTO "legacy_list" ("_key", "array")
+VALUES ($1::TEXT, $2::TEXT[])
+ON CONFLICT ("_key")
+DO UPDATE SET "array" = EXCLUDED.array || "legacy_list"."array"`,
+				values: [key, value],
+			});
 		});
 	};
 
@@ -39,27 +29,18 @@ module.exports = function (module) {
 			return;
 		}
 		await module.transaction(async (client) => {
-			async function doAppend(value) {
-				await client.query({
-					name: 'listAppend',
-					text: `
-	INSERT INTO "legacy_list" ("_key", "array")
-	VALUES ($1::TEXT, ARRAY[$2::TEXT])
-	ON CONFLICT ("_key")
-	DO UPDATE SET "array" = "legacy_list"."array" || ARRAY[$2::TEXT]`,
-					values: [key, value],
-				});
-			}
+			value = Array.isArray(value) ? value : [value];
+
 			await helpers.ensureLegacyObjectType(client, key, 'list');
-			if (Array.isArray(value)) {
-				// TODO: perf make single query
-				for (const v of value) {
-					// eslint-disable-next-line
-					await doAppend(v);
-				}
-				return;
-			}
-			await doAppend(value);
+			await client.query({
+				name: 'listAppend',
+				text: `
+INSERT INTO "legacy_list" ("_key", "array")
+VALUES ($1::TEXT, $2::TEXT[])
+ON CONFLICT ("_key")
+DO UPDATE SET "array" = "legacy_list"."array" || EXCLUDED.array`,
+				values: [key, value],
+			});
 		});
 	};
 
@@ -95,6 +76,27 @@ RETURNING A."array"[array_length(A."array", 1)] v`,
 			return;
 		}
 
+		if (Array.isArray(value)) {
+			await module.pool.query({
+				name: 'listRemoveAllMultiple',
+				text: `
+		UPDATE "legacy_list" l
+		   SET "array" = (
+			   SELECT ARRAY(
+				   SELECT elem
+				   FROM unnest(l."array") WITH ORDINALITY AS u(elem, ord)
+				   WHERE elem NOT IN (SELECT unnest($2::TEXT[]))
+				   ORDER BY ord
+			   )
+		   )
+		  FROM "legacy_object_live" o
+		 WHERE o."_key" = l."_key"
+		   AND o."type" = l."type"
+		   AND o."_key" = $1::TEXT;`,
+				values: [key, value],
+			});
+			return;
+		}
 		await module.pool.query({
 			name: 'listRemoveAll',
 			text: `
@@ -149,6 +151,26 @@ UPDATE "legacy_list" l
 	module.getListRange = async function (key, start, stop) {
 		if (!key) {
 			return;
+		}
+
+		if (start < 0 && stop < 0) {
+			const res = await module.pool.query({
+				name: 'getListRangeReverse',
+				text: `
+	SELECT ARRAY(SELECT m.m
+				   FROM UNNEST(l."array") WITH ORDINALITY m(m, i)
+				  ORDER BY m.i ASC
+				  LIMIT ($3::INTEGER - $2::INTEGER + 1)
+				 OFFSET (array_length(l."array", 1) + $2::INTEGER)) l
+	  FROM "legacy_object_live" o
+	 INNER JOIN "legacy_list" l
+			 ON o."_key" = l."_key"
+			AND o."type" = l."type"
+	 WHERE o."_key" = $1::TEXT`,
+				values: [key, start, stop],
+			});
+
+			return res.rows.length ? res.rows[0].l : [];
 		}
 
 		stop += 1;

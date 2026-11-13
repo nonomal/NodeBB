@@ -1,18 +1,13 @@
 'use strict';
 
+define('admin/settings/cookies', ['alerts'], function (alerts) {
+	const Cookies = {};
 
-define('admin/settings/cookies', [
-	'admin/modules/colorpicker',
-], function (colorpicker) {
-	var Module = {};
-
-	Module.init = function () {
-		colorpicker.enable($('[data-colorpicker="1"]'));
-
+	Cookies.init = function () {
 		$('#delete-all-sessions').on('click', function () {
 			socket.emit('admin.deleteAllSessions', function (err) {
 				if (err) {
-					return app.alertError(err.message);
+					return alerts.error(err);
 				}
 				window.location.href = config.relative_path + '/login';
 			});
@@ -20,5 +15,5 @@ define('admin/settings/cookies', [
 		});
 	};
 
-	return Module;
+	return Cookies;
 });

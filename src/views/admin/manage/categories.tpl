@@ -1,25 +1,32 @@
-<!-- IMPORT partials/breadcrumbs.tpl -->
-<div class="row">
-    <div class="col-lg-12">
-        <div class="category btn-group">
-            <!-- IMPORT partials/category-selector.tpl -->
-        </div>
-        <div class="btn-group">
-            <button id="collapse-all" class="btn btn-default">[[admin/manage/categories:collapse-all]]</button>
-        </div>
-        <div class="btn-group">
-            <button id="expand-all" class="btn btn-default">[[admin/manage/categories:expand-all]]</button>
-        </div>
-    </div>
-</div>
+<div class="acp-page-container">
+	<div class="d-flex border-bottom py-2 m-0 sticky-top acp-page-main-header align-items-center justify-content-between flex-wrap gap-2">
+		<div class="">
+			<h4 class="fw-bold tracking-tight mb-0">{{tx("admin/manage/categories:manage-categories")}}</h4>
+		</div>
+		<div class="d-flex gap-1">
+			<button id="toggle-collapse-all" class="btn btn-ghost btn-sm text-nowrap" data-collapsed="0">{{tx("admin/manage/categories:collapse-all")}}</button>
 
+			<!-- IMPORT admin/partials/category/selector-dropdown-right.tpl -->
 
-<hr/>
-<div component="category/no-matches" class="hidden">[[admin/manage/categories:no-matches]]</div>
-<div class="categories"></div>
-<div>
-    <!-- IMPORT partials/paginator.tpl -->
+			<div class="dropdown" role="group">
+				<button class="btn btn-primary btn-sm btn btn-primary btn-sm fw-semibold ff-secondary text-center text-nowrap dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">
+					{{tx("admin/manage/categories:add-category")}}
+					<i class="fa fa-caret-down"></i>
+				</button>
+				<ul class="dropdown-menu dropdown-menu-end p-1">
+					<li><a class="dropdown-item rounded-1" href="#" data-action="create">{{tx("admin/manage/categories:add-local-category")}}</a></li>
+					<li><a class="dropdown-item rounded-1" href="#" data-action="add">{{tx("admin/manage/categories:add-remote-category")}}</a></li>
+				</ul>
+			</div>
+		</div>
+	</div>
+	<div class="text-sm {{{if !breadcrumbs.length }}}hidden{{{ end }}}"><!-- IMPORT admin/partials/breadcrumbs.tpl --></div>
+
+	<div component="category/no-matches" class="hidden">{{tx("admin/manage/categories:no-matches")}}</div>
+
+	<div class="categories"></div>
+
+	<div>
+		<!-- IMPORT admin/partials/paginator.tpl -->
+	</div>
 </div>
-<button data-action="create" class="floating-button mdl-button mdl-js-button mdl-button--fab mdl-js-ripple-effect mdl-button--colored">
-    <i class="material-icons">add</i>
-</button>

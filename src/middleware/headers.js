@@ -57,12 +57,16 @@ module.exports = function (middleware) {
 			});
 		}
 
+		if (meta.config['permissions-policy']) {
+			headers['Permissions-Policy'] = meta.config['permissions-policy'];
+		}
+
 		if (meta.config['access-control-allow-credentials']) {
 			headers['Access-Control-Allow-Credentials'] = meta.config['access-control-allow-credentials'];
 		}
 
 		if (process.env.NODE_ENV === 'development') {
-			headers['X-Upstream-Hostname'] = os.hostname();
+			headers['X-Upstream-Hostname'] = os.hostname().replace(/[^0-9A-Za-z-.]/g, '');
 		}
 
 		for (const [key, value] of Object.entries(headers)) {
@@ -86,15 +90,16 @@ module.exports = function (middleware) {
 			}
 			return next();
 		}
-		if (parseInt(req.uid, 10) > 0 || !meta.config.autoDetectLang) {
-			return next();
+
+		if (meta.config.autoDetectLang && req.uid === 0) {
+			const langs = await listCodes();
+			const lang = req.acceptsLanguages(langs);
+			if (!lang) {
+				return next();
+			}
+			req.query.lang = lang;
 		}
-		const langs = await listCodes();
-		const lang = req.acceptsLanguages(langs);
-		if (!lang) {
-			return next();
-		}
-		req.query.lang = lang;
+
 		next();
 	});
 

@@ -2,27 +2,28 @@
 
 
 define('forum/topic/change-owner', [
-	'components',
 	'postSelect',
 	'autocomplete',
-], function (components, postSelect, autocomplete) {
-	var ChangeOwner = {};
+	'alerts',
+	'api',
+], function (postSelect, autocomplete, alerts, api) {
+	const ChangeOwner = {};
 
-	var modal;
-	var commit;
-	var toUid = 0;
+	let modal;
+	let commit;
+	let toUid = 0;
 	ChangeOwner.init = function (postEl) {
 		if (modal) {
 			return;
 		}
-		app.parseAndTranslate('partials/change_owner_modal', {}, function (html) {
+		app.parseAndTranslate('modals/change-owner', {}, function (html) {
 			modal = html;
 
 			commit = modal.find('#change_owner_commit');
 
 			$('body').append(modal);
 
-			modal.find('.close,#change_owner_cancel').on('click', closeModal);
+			modal.find('#change_owner_cancel').on('click', closeModal);
 			modal.find('#username').on('keyup', checkButtonEnable);
 			postSelect.init(onPostToggled, {
 				allowMainPostSelect: true,
@@ -46,9 +47,9 @@ define('forum/topic/change-owner', [
 
 	function showPostsSelected() {
 		if (postSelect.pids.length) {
-			modal.find('#pids').translateHtml('[[topic:fork_pid_count, ' + postSelect.pids.length + ']]');
+			modal.find('#pids').translateText('[[topic:fork-pid-count, ' + postSelect.pids.length + ']]');
 		} else {
-			modal.find('#pids').translateHtml('[[topic:fork_no_pids]]');
+			modal.find('#pids').translateText('[[topic:fork-no-pids]]');
 		}
 	}
 
@@ -69,14 +70,12 @@ define('forum/topic/change-owner', [
 		if (!toUid) {
 			return;
 		}
-		socket.emit('posts.changeOwner', { pids: postSelect.pids, toUid: toUid }, function (err) {
-			if (err) {
-				return app.alertError(err.message);
-			}
-			ajaxify.refresh();
+
+		api.post('/posts/owner', { pids: postSelect.pids, uid: toUid}).then(() => {
+			ajaxify.go(`/post/${postSelect.pids[0]}`);
 
 			closeModal();
-		});
+		}).catch(alerts.error);
 	}
 
 	function closeModal() {

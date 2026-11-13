@@ -49,6 +49,9 @@ get:
                             uid:
                               type: number
                               description: A user identifier
+                            isLocal:
+                              type: boolean
+                              description: Whether the user belongs to the local installation or not.
                             icon:text:
                               type: string
                               description: A single-letter representation of a username. This is used in the
@@ -68,43 +71,19 @@ get:
                           type: boolean
                         readClass:
                           type: string
+                  unreadNids:
+                    type: array
+                    description: An array of notification ids that are unread.
+                    items:
+                      type: string
                   filters:
-                    type: array
-                    items:
-                      type: object
-                      additionalProperties: {}
+                    $ref: ../components/schemas/NotificationFilters.yaml#/FiltersArray
                   regularFilters:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        name:
-                          type: string
-                        filter:
-                          type: string
-                        selected:
-                          type: boolean
-                      required:
-                        - name
-                        - filter
+                    $ref: ../components/schemas/NotificationFilters.yaml#/FiltersArray
                   moderatorFilters:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        name:
-                          type: string
-                        filter:
-                          type: string
+                    $ref: ../components/schemas/NotificationFilters.yaml#/FiltersArray
                   selectedFilter:
-                    type: object
-                    properties:
-                      name:
-                        type: string
-                      filter:
-                        type: string
-                      selected:
-                        type: boolean
+                    $ref: ../components/schemas/NotificationFilters.yaml#/FiltersObject
                   title:
                     type: string
               - $ref: ../components/schemas/Pagination.yaml#/Pagination

@@ -1,42 +1,90 @@
 'use strict';
 
-const cronJob = require('cron').CronJob;
 const winston = require('winston');
 const nconf = require('nconf');
-const crypto = require('crypto');
-const LRU = require('lru-cache');
+const util = require('util');
+const _ = require('lodash');
 
+const sleep = util.promisify(setTimeout);
 
 const db = require('./database');
+const meta = require('./meta');
 const utils = require('./utils');
 const plugins = require('./plugins');
-const meta = require('./meta');
+const pubsub = require('./pubsub');
+const cron = require('./cron');
 
 const Analytics = module.exports;
 
-const secret = nconf.get('secret');
+let local = {
+	counters: {},
+	pageViews: 0,
+	pageViewsRegistered: 0,
+	pageViewsGuest: 0,
+	pageViewsBot: 0,
+	apPageViews: 0,
+	uniquevisitors: 0,
+};
+const empty = _.cloneDeep(local);
+const total = _.cloneDeep(local);
 
-const counters = {};
+const runJobs = nconf.get('runJobs');
 
-let pageViews = 0;
-let pageViewsRegistered = 0;
-let pageViewsGuest = 0;
-let pageViewsBot = 0;
-let uniqueIPCount = 0;
-let uniquevisitors = 0;
-let ipCache;
+Analytics.pause = false;
 
 Analytics.init = async function () {
-	ipCache = new LRU({
-		max: parseInt(meta.config['analytics:maxCache'], 10) || 500,
-		length: function () { return 1; },
-		maxAge: 0,
+	await cron.addJob({
+		name: 'analytics:publish',
+		cronTime: '*/10 * * * * *',
+		runOnAllNodes: true,
+		onTick: async () => {
+			if (Analytics.pause) return;
+			await Analytics.writeLocalData();
+		},
 	});
 
-	new cronJob('*/10 * * * * *', (() => {
-		Analytics.writeData();
-	}), null, true);
+	if (runJobs) {
+		await cron.addJob({
+			name: 'prune:ip:recent',
+			cronTime: '*/30 * * * *',
+			onTick: async () => {
+				await db.sortedSetsRemoveRangeByScore(['ip:recent'], '-inf', Date.now() - 172800000);
+			},
+		});
+	}
+
+	if (runJobs) {
+		pubsub.on('analytics:publish', (data) => {
+			incrementProperties(total, data.local);
+		});
+	}
 };
+
+Analytics.writeLocalData = async function () {
+	publishLocalAnalytics();
+	if (runJobs) {
+		await sleep(2000);
+		await Analytics.writeData();
+	}
+};
+
+function publishLocalAnalytics() {
+	pubsub.publish('analytics:publish', {
+		local: local,
+	});
+	local = _.cloneDeep(empty);
+}
+
+function incrementProperties(obj1, obj2) {
+	for (const [key, value] of Object.entries(obj2)) {
+		if (typeof value === 'object') {
+			incrementProperties(obj1[key], value);
+		} else if (utils.isNumber(value)) {
+			obj1[key] = obj1[key] || 0;
+			obj1[key] += obj2[key];
+		}
+	}
+}
 
 Analytics.increment = function (keys, callback) {
 	keys = Array.isArray(keys) ? keys : [keys];
@@ -44,8 +92,8 @@ Analytics.increment = function (keys, callback) {
 	plugins.hooks.fire('action:analytics.increment', { keys: keys });
 
 	keys.forEach((key) => {
-		counters[key] = counters[key] || 0;
-		counters[key] += 1;
+		local.counters[key] = local.counters[key] || 0;
+		local.counters[key] += 1;
 	});
 
 	if (typeof callback === 'function') {
@@ -53,90 +101,125 @@ Analytics.increment = function (keys, callback) {
 	}
 };
 
+Analytics.peek = () => local;
+
+Analytics.getKeys = async () => db.getSortedSetRange('analyticsKeys', 0, -1);
+
 Analytics.pageView = async function (payload) {
-	pageViews += 1;
+	local.pageViews += 1;
 
 	if (payload.uid > 0) {
-		pageViewsRegistered += 1;
+		local.pageViewsRegistered += 1;
 	} else if (payload.uid < 0) {
-		pageViewsBot += 1;
+		local.pageViewsBot += 1;
 	} else {
-		pageViewsGuest += 1;
+		local.pageViewsGuest += 1;
 	}
 
-	if (payload.ip) {
-		// Retrieve hash or calculate if not present
-		let hash = ipCache.get(payload.ip + secret);
-		if (!hash) {
-			hash = crypto.createHash('sha1').update(payload.ip + secret).digest('hex');
-			ipCache.set(payload.ip + secret, hash);
-		}
-
-		const score = await db.sortedSetScore('ip:recent', hash);
-		if (!score) {
-			uniqueIPCount += 1;
-		}
-		const today = new Date();
-		today.setHours(today.getHours(), 0, 0, 0);
-		if (!score || score < today.getTime()) {
-			uniquevisitors += 1;
-			await db.sortedSetAdd('ip:recent', Date.now(), hash);
-		}
-	}
+	await incrementUniqueVisitors(payload.ip);
 };
+
+Analytics.apPageView = async function ({ ip }) {
+	local.apPageViews += 1;
+	await incrementUniqueVisitors(ip);
+};
+
+async function incrementUniqueVisitors(ip) {
+	if (ip && meta.config.logIPs !== 0) {
+		const score = await db.sortedSetScore('ip:recent', ip);
+		let record = !score;
+		if (score) {
+			const today = new Date();
+			today.setHours(today.getHours(), 0, 0, 0);
+			record = score < today.getTime();
+		}
+
+		if (record) {
+			local.uniquevisitors += 1;
+			await db.sortedSetAdd('ip:recent', Date.now(), ip);
+		}
+	}
+}
 
 Analytics.writeData = async function () {
 	const today = new Date();
 	const month = new Date();
 	const dbQueue = [];
+	const incrByBulk = [];
+
+	// Build list of metrics that were updated
+	let metrics = [
+		'pageviews',
+		'pageviews:month',
+	];
+	metrics.forEach((metric) => {
+		const toAdd = ['registered', 'guest', 'bot'].map(type => `${metric}:${type}`);
+		metrics = [...metrics, ...toAdd];
+	});
+	metrics.push('uniquevisitors');
 
 	today.setHours(today.getHours(), 0, 0, 0);
 	month.setMonth(month.getMonth(), 1);
 	month.setHours(0, 0, 0, 0);
 
-	if (pageViews > 0) {
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews', pageViews, today.getTime()));
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews:month', pageViews, month.getTime()));
-		pageViews = 0;
+	if (total.pageViews > 0) {
+		incrByBulk.push(['analytics:pageviews', total.pageViews, today.getTime()]);
+		incrByBulk.push(['analytics:pageviews:month', total.pageViews, month.getTime()]);
+		total.pageViews = 0;
 	}
 
-	if (pageViewsRegistered > 0) {
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews:registered', pageViewsRegistered, today.getTime()));
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews:month:registered', pageViewsRegistered, month.getTime()));
-		pageViewsRegistered = 0;
+	if (total.pageViewsRegistered > 0) {
+		incrByBulk.push(['analytics:pageviews:registered', total.pageViewsRegistered, today.getTime()]);
+		incrByBulk.push(['analytics:pageviews:month:registered', total.pageViewsRegistered, month.getTime()]);
+		total.pageViewsRegistered = 0;
 	}
 
-	if (pageViewsGuest > 0) {
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews:guest', pageViewsGuest, today.getTime()));
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews:month:guest', pageViewsGuest, month.getTime()));
-		pageViewsGuest = 0;
+	if (total.pageViewsGuest > 0) {
+		incrByBulk.push(['analytics:pageviews:guest', total.pageViewsGuest, today.getTime()]);
+		incrByBulk.push(['analytics:pageviews:month:guest', total.pageViewsGuest, month.getTime()]);
+		total.pageViewsGuest = 0;
 	}
 
-	if (pageViewsBot > 0) {
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews:bot', pageViewsBot, today.getTime()));
-		dbQueue.push(db.sortedSetIncrBy('analytics:pageviews:month:bot', pageViewsBot, month.getTime()));
-		pageViewsBot = 0;
+	if (total.pageViewsBot > 0) {
+		incrByBulk.push(['analytics:pageviews:bot', total.pageViewsBot, today.getTime()]);
+		incrByBulk.push(['analytics:pageviews:month:bot', total.pageViewsBot, month.getTime()]);
+		total.pageViewsBot = 0;
 	}
 
-	if (uniquevisitors > 0) {
-		dbQueue.push(db.sortedSetIncrBy('analytics:uniquevisitors', uniquevisitors, today.getTime()));
-		uniquevisitors = 0;
+	if (total.apPageViews > 0) {
+		incrByBulk.push(['analytics:pageviews:ap', total.apPageViews, today.getTime()]);
+		incrByBulk.push(['analytics:pageviews:ap:month', total.apPageViews, month.getTime()]);
+		total.apPageViews = 0;
+		if (!metrics.includes('pageviews:ap')) {
+			metrics.push('pageviews:ap');
+		}
+		if (!metrics.includes('pageviews:ap:month')) {
+			metrics.push('pageviews:ap:month');
+		}
 	}
 
-	if (uniqueIPCount > 0) {
-		dbQueue.push(db.incrObjectFieldBy('global', 'uniqueIPCount', uniqueIPCount));
-		uniqueIPCount = 0;
+	if (total.uniquevisitors > 0) {
+		incrByBulk.push(['analytics:uniquevisitors', total.uniquevisitors, today.getTime()]);
+		total.uniquevisitors = 0;
 	}
 
-	for (const [key, value] of Object.entries(counters)) {
-		dbQueue.push(db.sortedSetIncrBy(`analytics:${key}`, value, today.getTime()));
-		delete counters[key];
+	for (const [key, value] of Object.entries(total.counters)) {
+		incrByBulk.push([`analytics:${key}`, value, today.getTime()]);
+		metrics.push(key);
+		delete total.counters[key];
 	}
+
+	if (incrByBulk.length) {
+		dbQueue.push(db.sortedSetIncrByBulk(incrByBulk));
+	}
+
+	// Update list of tracked metrics
+	dbQueue.push(db.sortedSetAdd('analyticsKeys', metrics.map(() => +Date.now()), metrics));
+
 	try {
 		await Promise.all(dbQueue);
 	} catch (err) {
 		winston.error(`[analytics] Encountered error while writing analytics to data store\n${err.stack}`);
-		throw err;
 	}
 };
 
@@ -146,31 +229,18 @@ Analytics.getHourlyStatsForSet = async function (set, hour, numHours) {
 		set = `analytics:${set}`;
 	}
 
-	const terms = {};
 	const hoursArr = [];
 
 	hour = new Date(hour);
 	hour.setHours(hour.getHours(), 0, 0, 0);
 
 	for (let i = 0, ii = numHours; i < ii; i += 1) {
-		hoursArr.push(hour.getTime());
-		hour.setHours(hour.getHours() - 1, 0, 0, 0);
+		const d = new Date(hour);
+		d.setHours(d.getHours() - i);
+		hoursArr.push(d.getTime());
 	}
-
 	const counts = await db.sortedSetScores(set, hoursArr);
-
-	hoursArr.forEach((term, index) => {
-		terms[term] = parseInt(counts[index], 10) || 0;
-	});
-
-	const termsArr = [];
-
-	hoursArr.reverse();
-	hoursArr.forEach((hour) => {
-		termsArr.push(terms[hour]);
-	});
-
-	return termsArr;
+	return counts.map(count => parseInt(count, 10) || 0).reverse();
 };
 
 Analytics.getDailyStatsForSet = async function (set, day, numDays) {
@@ -179,27 +249,54 @@ Analytics.getDailyStatsForSet = async function (set, day, numDays) {
 		set = `analytics:${set}`;
 	}
 
-	const daysArr = [];
 	day = new Date(day);
-	// set the date to tomorrow, because getHourlyStatsForSet steps *backwards* 24 hours to sum up the values
-	day.setDate(day.getDate() + 1);
-	day.setHours(0, 0, 0, 0);
+	day.setHours(day.getHours(), 0, 0, 0);
 
-	while (numDays > 0) {
-		/* eslint-disable no-await-in-loop */
-		const dayData = await Analytics.getHourlyStatsForSet(
-			set,
-			day.getTime() - (1000 * 60 * 60 * 24 * (numDays - 1)),
-			24
-		);
-		daysArr.push(dayData.reduce((cur, next) => cur + next));
-		numDays -= 1;
+	const hours = [];
+	const numHours = numDays * 24;
+	for (let i = numHours - 1; i >= 0; i -= 1) {
+		const d = new Date(day);
+		d.setHours(d.getHours() - i);
+		hours.push(d.getTime());
 	}
-	return daysArr;
+
+	const dayData = await Analytics.getHourlyStatsForSet(
+		set,
+		day,
+		numHours,
+	);
+
+	const dailyBuckets = [];
+	let bucketDay = null;
+	let bucketSum = 0;
+
+	for (let i = 0; i < hours.length; i += 1) {
+		const date = new Date(hours[i]);
+		date.setHours(0, 0, 0, 0);
+		const dayTimestamp = date.getTime();
+
+		if (bucketDay === null) {
+			bucketDay = dayTimestamp;
+		}
+
+		if (dayTimestamp !== bucketDay) {
+			dailyBuckets.push(bucketSum);
+			bucketDay = dayTimestamp;
+			bucketSum = 0;
+		}
+
+		bucketSum += dayData[i] || 0;
+	}
+
+	if (bucketDay !== null) {
+		dailyBuckets.push(bucketSum);
+	}
+
+	return dailyBuckets.slice(-numDays);
 };
 
 Analytics.getUnwrittenPageviews = function () {
-	return pageViews;
+	return local.pageViews;
 };
 
 Analytics.getSummary = async function () {
@@ -218,25 +315,28 @@ Analytics.getSummary = async function () {
 };
 
 Analytics.getCategoryAnalytics = async function (cid) {
+	const now = Date.now();
 	return await utils.promiseParallel({
-		'pageviews:hourly': Analytics.getHourlyStatsForSet(`analytics:pageviews:byCid:${cid}`, Date.now(), 24),
-		'pageviews:daily': Analytics.getDailyStatsForSet(`analytics:pageviews:byCid:${cid}`, Date.now(), 30),
-		'topics:daily': Analytics.getDailyStatsForSet(`analytics:topics:byCid:${cid}`, Date.now(), 7),
-		'posts:daily': Analytics.getDailyStatsForSet(`analytics:posts:byCid:${cid}`, Date.now(), 7),
+		'pageviews:hourly': Analytics.getHourlyStatsForSet(`analytics:pageviews:byCid:${cid}`, now, 24),
+		'pageviews:daily': Analytics.getDailyStatsForSet(`analytics:pageviews:byCid:${cid}`, now, 30),
+		'topics:daily': Analytics.getDailyStatsForSet(`analytics:topics:byCid:${cid}`, now, 7),
+		'posts:daily': Analytics.getDailyStatsForSet(`analytics:posts:byCid:${cid}`, now, 7),
 	});
 };
 
 Analytics.getErrorAnalytics = async function () {
+	const now = Date.now();
 	return await utils.promiseParallel({
-		'not-found': Analytics.getDailyStatsForSet('analytics:errors:404', Date.now(), 7),
-		toobusy: Analytics.getDailyStatsForSet('analytics:errors:503', Date.now(), 7),
+		'not-found': Analytics.getDailyStatsForSet('analytics:errors:404', now, 7),
+		toobusy: Analytics.getDailyStatsForSet('analytics:errors:503', now, 7),
 	});
 };
 
 Analytics.getBlacklistAnalytics = async function () {
+	const now = Date.now();
 	return await utils.promiseParallel({
-		daily: Analytics.getDailyStatsForSet('analytics:blacklist', Date.now(), 7),
-		hourly: Analytics.getHourlyStatsForSet('analytics:blacklist', Date.now(), 24),
+		daily: Analytics.getDailyStatsForSet('analytics:blacklist', now, 7),
+		hourly: Analytics.getHourlyStatsForSet('analytics:blacklist', now, 24),
 	});
 };
 

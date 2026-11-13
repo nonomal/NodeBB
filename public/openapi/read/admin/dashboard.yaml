@@ -11,6 +11,8 @@ get:
             allOf:
               - type: object
                 properties:
+                  graphTitle:
+                    type: string
                   version:
                     type: string
                   lookupFailed:
@@ -18,6 +20,8 @@ get:
                   latestVersion:
                     type: string
                     nullable: true
+                  hideAllTime:
+                    type: boolean
                   upgradeAvailable:
                     type: boolean
                     nullable: true
@@ -60,5 +64,16 @@ get:
                         description: An ISO 8601 formatted date string (complementing `timestamp`)
                   showSystemControls:
                     type: boolean
+                  popularSearches:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        value:
+                          type: string
+                          description: The search term
+                        score:
+                          type: number
+                          description: How many times it has been queried
               - $ref: ../../components/schemas/admin/dashboard.yaml#/Stats
               - $ref: ../../components/schemas/CommonProps.yaml#/CommonProps
